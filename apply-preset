@@ -1,0 +1,202 @@
+#!/usr/bin/bash
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+readonly OPENRGB_BIN="/usr/bin/openrgb"
+readonly RAM_DEVICE="Corsair Dominator Platinum RGB DDR5"
+readonly GPU_DEVICE="ASUS TUF GeForce RTX 4090 Gaming OG OC"
+readonly ST100_DEVICE="Corsair ST100 RGB"
+readonly MAINBOARD_DEVICE="ASUS ROG STRIX Z790-F GAMING WIFI"
+
+readonly STATE_ROOT="${XDG_STATE_HOME:-${HOME}/.local/state}/omarchy-plus/openrgb-presets"
+readonly STATE_FILE="${STATE_ROOT}/active-preset"
+readonly LAST_LOG="${STATE_ROOT}/last-openrgb.log"
+readonly LOCK_DIR="${STATE_ROOT}/apply.lock"
+
+dry_run=false
+
+usage() {
+  /usr/bin/printf '%s\n' \
+    'Usage: apply-preset PRESET' \
+    '       apply-preset --restore' \
+    '       apply-preset --current' \
+    '       apply-preset --list' \
+    '       apply-preset --dry-run PRESET' \
+    '' \
+    'Presets:' \
+    '  tokyo-night-purple' \
+    '  deep-red' \
+    '  bright-white' \
+    '  animated-rainbow'
+}
+
+list_presets() {
+  /usr/bin/printf '%s\n' \
+    'tokyo-night-purple' \
+    'deep-red' \
+    'bright-white' \
+    'animated-rainbow'
+}
+
+is_preset() {
+  case "${1}" in
+    tokyo-night-purple|deep-red|bright-white|animated-rainbow) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+preset_label() {
+  case "${1}" in
+    tokyo-night-purple) /usr/bin/printf '%s' 'Tokyo Night Purple' ;;
+    deep-red) /usr/bin/printf '%s' 'Deep Red' ;;
+    bright-white) /usr/bin/printf '%s' 'Bright White' ;;
+    animated-rainbow) /usr/bin/printf '%s' 'Animated Rainbow' ;;
+  esac
+}
+
+print_command() {
+  /usr/bin/printf 'DRY RUN:'
+  /usr/bin/printf ' %q' "${OPENRGB_BIN}" --noautoconnect "$@"
+  /usr/bin/printf '\n'
+}
+
+run_openrgb() {
+  if [[ "${dry_run}" == true ]]; then
+    print_command "$@"
+    return 0
+  fi
+
+  if ! "${OPENRGB_BIN}" --noautoconnect "$@" >"${LAST_LOG}" 2>&1; then
+    /usr/bin/printf '%s\n' "OpenRGB failed. Report: ${LAST_LOG}" >&2
+    /usr/bin/tail -n 20 "${LAST_LOG}" >&2
+    return 1
+  fi
+}
+
+apply_static() {
+  local main_color="${1}"
+  local st100_base="${2}"
+  local st100_logo="${3}"
+  local mainboard_colors="${4}"
+
+  run_openrgb \
+    --device "${RAM_DEVICE}" --mode direct --color "${main_color}" \
+    --device "${GPU_DEVICE}" --mode static --color "${main_color}" \
+    --device "${ST100_DEVICE}" --zone 0 --mode direct --color "${st100_base}" \
+    --device "${ST100_DEVICE}" --zone 1 --mode direct --color "${st100_logo}" \
+    --device "${MAINBOARD_DEVICE}" --mode direct --color "${mainboard_colors}"
+}
+
+apply_rainbow() {
+  run_openrgb \
+    --device "${RAM_DEVICE}" --mode rainbow --speed 50 \
+    --device "${GPU_DEVICE}" --mode rainbow --speed 50 \
+    --device "${ST100_DEVICE}" --zone 0 --mode direct \
+      --color FF0000,FF7F00,FFFF00,00FF00,00FFFF,0000FF,8B00FF,FF00FF \
+    --device "${ST100_DEVICE}" --zone 1 --mode direct --color 2020FF \
+    --device "${MAINBOARD_DEVICE}" --mode rainbow --speed 50
+}
+
+apply_preset() {
+  local preset="${1}"
+
+  case "${preset}" in
+    tokyo-night-purple)
+      apply_static BB9AF7 D060FF 2020FF A000FF,BB9AF7
+      ;;
+    deep-red)
+      apply_static 8B0000 A00000 A00000 8B0000
+      ;;
+    bright-white)
+      apply_static FFFFFF FFFFFF 2020FF FFFFFF
+      ;;
+    animated-rainbow)
+      apply_rainbow
+      ;;
+  esac
+
+  if [[ "${dry_run}" == false ]]; then
+    /usr/bin/printf '%s\n' "${preset}" >"${STATE_FILE}"
+  fi
+
+  /usr/bin/printf 'Preset: %s\nApplied: %s\n' "${preset}" "$(preset_label "${preset}")"
+}
+
+main() {
+  umask 077
+
+  if [[ "${#}" -eq 0 ]]; then
+    usage >&2
+    return 64
+  fi
+
+  case "${1}" in
+    --help|-h)
+      usage
+      return 0
+      ;;
+    --list)
+      list_presets
+      return 0
+      ;;
+    --current)
+      if [[ -r "${STATE_FILE}" ]]; then
+        /usr/bin/cat "${STATE_FILE}"
+      else
+        /usr/bin/printf '%s\n' 'tokyo-night-purple'
+      fi
+      return 0
+      ;;
+    --dry-run)
+      if [[ "${#}" -ne 2 ]] || ! is_preset "${2}"; then
+        usage >&2
+        return 64
+      fi
+      dry_run=true
+      apply_preset "${2}"
+      return 0
+      ;;
+    --restore)
+      /usr/bin/mkdir -p "${STATE_ROOT}"
+      if [[ -r "${STATE_FILE}" ]]; then
+        preset="$(/usr/bin/head -n 1 "${STATE_FILE}")"
+      else
+        preset='tokyo-night-purple'
+      fi
+      ;;
+    *)
+      if [[ "${#}" -ne 1 ]]; then
+        usage >&2
+        return 64
+      fi
+      preset="${1}"
+      ;;
+  esac
+
+  if ! is_preset "${preset}"; then
+    /usr/bin/printf 'Unknown preset: %s\n' "${preset}" >&2
+    return 64
+  fi
+
+  if [[ ! -x "${OPENRGB_BIN}" ]]; then
+    /usr/bin/printf 'OpenRGB is unavailable: %s\n' "${OPENRGB_BIN}" >&2
+    return 69
+  fi
+
+  /usr/bin/mkdir -p "${STATE_ROOT}"
+
+  if ! /usr/bin/mkdir "${LOCK_DIR}" 2>/dev/null; then
+    /usr/bin/printf '%s\n' 'Another OpenRGB preset operation is already running.' >&2
+    return 75
+  fi
+  cleanup() {
+    /usr/bin/rmdir "${LOCK_DIR}" 2>/dev/null || true
+  }
+  trap cleanup EXIT
+
+  apply_preset "${preset}"
+}
+
+main "$@"
