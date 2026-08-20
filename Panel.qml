@@ -21,6 +21,7 @@ Panel {
   property string pendingPreset: ""
   property int selectedIndex: 0
   property string statusText: "Purple baseline active"
+  property bool statusError: false
   property string processOutput: ""
   property string processError: ""
 
@@ -28,25 +29,21 @@ Panel {
     {
       id: "tokyo-night-purple",
       label: "Tokyo Night Purple",
-      description: "Calibrated Hugin baseline",
       swatches: ["#BB9AF7", "#A000FF", "#D060FF"]
     },
     {
       id: "deep-red",
       label: "Deep Red",
-      description: "Dark, saturated static red",
       swatches: ["#8B0000", "#A00000", "#5C0000"]
     },
     {
       id: "bright-white",
       label: "Bright White",
-      description: "Clean static white",
       swatches: ["#FFFFFF", "#E8E8FF", "#D8D8E8"]
     },
     {
       id: "animated-rainbow",
       label: "Animated Rainbow",
-      description: "Hardware animation with ST100 fallback",
       swatches: ["#FF4D6D", "#FFD166", "#06D6A0", "#4CC9F0", "#9B5DE5"]
     }
   ]
@@ -92,6 +89,7 @@ Panel {
     pendingPreset = presetId
     processOutput = ""
     processError = ""
+    statusError = false
     statusText = "Applying " + labelForPreset(presetId) + "…"
     actionProc.command = [helperPath, presetId]
     actionProc.running = true
@@ -132,10 +130,15 @@ Panel {
     onExited: function(exitCode) {
       var restored = root.presetFromOutput(root.processOutput)
       if (exitCode === 0 && restored !== "") {
+        root.statusError = false
         root.activePreset = restored
         root.selectedIndex = root.presetIndex(restored)
         root.statusText = root.labelForPreset(restored) + " restored"
+      } else if (exitCode === 75) {
+        root.statusError = false
+        root.statusText = ""
       } else {
+        root.statusError = true
         root.statusText = root.processError !== ""
           ? root.processError
           : "Preset restore failed"
@@ -155,10 +158,12 @@ Panel {
     }
     onExited: function(exitCode) {
       if (exitCode === 0) {
+        root.statusError = false
         root.activePreset = root.pendingPreset
         root.selectedIndex = root.presetIndex(root.pendingPreset)
         root.statusText = root.labelForPreset(root.pendingPreset) + " active"
       } else {
+        root.statusError = true
         root.statusText = root.processError !== ""
           ? root.processError
           : "Preset application failed"
@@ -206,7 +211,7 @@ Panel {
 
         Text {
           width: parent.width
-          text: "Choose a reviewed lighting state for Hugin."
+          text: "Choose a RGB lighting preset:"
           color: Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.72)
           font.family: root.contentFontFamily
           font.pixelSize: Style.font.body
@@ -222,7 +227,7 @@ Panel {
             required property int index
 
             width: content.width
-            height: Style.space(62)
+            height: Style.space(44)
             radius: Style.cornerRadius
             color: mouse.containsMouse || root.selectedIndex === index
               ? Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.14)
@@ -235,47 +240,39 @@ Panel {
               anchors.margins: Style.space(10)
               spacing: Style.space(12)
 
-              Row {
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: Style.space(3)
+              Item {
+                width: Style.space(62)
+                height: parent.height
 
-                Repeater {
-                  model: presetRow.modelData.swatches
-                  Rectangle {
-                    required property string modelData
-                    width: Style.space(10)
-                    height: width
-                    radius: width / 2
-                    color: modelData
-                    border.width: 1
-                    border.color: Qt.rgba(1, 1, 1, 0.28)
+                Row {
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: Style.space(3)
+
+                  Repeater {
+                    model: presetRow.modelData.swatches
+                    Rectangle {
+                      required property string modelData
+                      width: Style.space(10)
+                      height: width
+                      radius: width / 2
+                      color: modelData
+                      border.width: 1
+                      border.color: Qt.rgba(1, 1, 1, 0.28)
+                    }
                   }
                 }
               }
 
-              Column {
-                anchors.verticalCenter: parent.verticalCenter
+              Text {
                 width: parent.width - x
-                spacing: Style.space(2)
-
-                Text {
-                  width: parent.width
-                  text: presetRow.modelData.label
-                  color: root.contentForeground
-                  font.family: root.contentFontFamily
-                  font.pixelSize: Style.font.body
-                  font.bold: root.activePreset === presetRow.modelData.id
-                  elide: Text.ElideRight
-                }
-
-                Text {
-                  width: parent.width
-                  text: presetRow.modelData.description
-                  color: Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.64)
-                  font.family: root.contentFontFamily
-                  font.pixelSize: Style.font.caption
-                  elide: Text.ElideRight
-                }
+                anchors.verticalCenter: parent.verticalCenter
+                text: presetRow.modelData.label
+                color: root.contentForeground
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.body
+                font.bold: root.activePreset === presetRow.modelData.id
+                elide: Text.ElideRight
               }
             }
 
@@ -292,6 +289,8 @@ Panel {
         }
 
         Text {
+          visible: root.statusError
+          height: visible ? implicitHeight : 0
           width: parent.width
           text: root.statusText
           color: Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.7)
