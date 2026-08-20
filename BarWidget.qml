@@ -56,6 +56,7 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
+    horizontalMargin: 3
     text: "󱩒"
     tooltipText: "OpenRGB Presets"
     onPressed: function(buttonCode) {
