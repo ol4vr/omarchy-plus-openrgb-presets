@@ -17,20 +17,15 @@ Panel {
   readonly property color contentForeground: bar ? bar.foreground : Color.foreground
   readonly property string contentFontFamily: bar ? bar.fontFamily : Style.font.family
 
-  property string activePreset: "tokyo-night-purple"
+  property string activePreset: "bright-white"
   property string pendingPreset: ""
   property int selectedIndex: 0
-  property string statusText: "Purple baseline active"
+  property string statusText: "Bright White active"
   property bool statusError: false
   property string processOutput: ""
   property string processError: ""
 
   readonly property var presets: [
-    {
-      id: "tokyo-night-purple",
-      label: "Tokyo Night Purple",
-      swatches: ["#BB9AF7", "#A000FF", "#D060FF"]
-    },
     {
       id: "deep-red",
       label: "Deep Red",
@@ -45,6 +40,31 @@ Panel {
       id: "animated-rainbow",
       label: "Animated Rainbow",
       swatches: ["#FF4D6D", "#FFD166", "#06D6A0", "#4CC9F0", "#9B5DE5"]
+    },
+    {
+      id: "neon-rain",
+      label: "Neon Rain",
+      swatches: ["#FF0055", "#8CFF00", "#00D4FF"]
+    },
+    {
+      id: "aurora-comet",
+      label: "Aurora Comet",
+      swatches: ["#95FF00", "#00D4FF", "#8A2BE2"]
+    },
+    {
+      id: "spectrum-wave",
+      label: "Spectrum Wave",
+      swatches: ["#FF4D6D", "#FFD166", "#06D6A0", "#4CC9F0", "#9B5DE5"]
+    },
+    {
+      id: "electric-sunrise",
+      label: "Electric Sunrise",
+      swatches: ["#4000FF", "#FF003C", "#FF4400"]
+    },
+    {
+      id: "black",
+      label: "Black (Turn Off RGB)",
+      swatches: ["#000000", "#101018", "#20202A"]
     }
   ]
 
@@ -91,7 +111,6 @@ Panel {
     processError = ""
     statusError = false
     statusText = "Applying " + labelForPreset(presetId) + "…"
-    actionProc.command = [helperPath, presetId]
     actionProc.running = true
   }
 
@@ -148,6 +167,7 @@ Panel {
 
   Process {
     id: actionProc
+    command: [root.helperPath, root.pendingPreset]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.processOutput = text.trim()

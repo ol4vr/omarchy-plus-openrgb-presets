@@ -1,0 +1,281 @@
+#!/usr/bin/python3
+
+"""Minimal loopback SDK client for the OpenRGB Effects Plugin."""
+
+from __future__ import annotations
+
+import argparse
+import socket
+import struct
+import sys
+import time
+from dataclasses import dataclass
+
+
+HOST = "127.0.0.1"
+PORT = 6742
+MAGIC = b"ORGB"
+HEADER = struct.Struct("<4sIII")
+
+REQUEST_PLUGIN_LIST = 200
+PLUGIN_SPECIFIC = 201
+
+REQUEST_EFFECT_LIST = 0
+STOP_EFFECT = 21
+REQUEST_PROFILE_LIST = 22
+LOAD_PROFILE = 23
+
+EFFECTS_PLUGIN_NAME = "OpenRGB Effects Plugin"
+MAX_PACKET_SIZE = 16 * 1024 * 1024
+
+
+class SDKError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class Plugin:
+    name: str
+    description: str
+    version: str
+    index: int
+    protocol: int
+
+
+@dataclass(frozen=True)
+class Effect:
+    name: str
+    description: str
+    enabled: bool
+
+
+def read_exact(connection: socket.socket, size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = connection.recv(remaining)
+        if not chunk:
+            raise SDKError("OpenRGB closed the SDK connection unexpectedly")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def send_packet(
+    connection: socket.socket,
+    device_index: int,
+    packet_id: int,
+    payload: bytes = b"",
+) -> None:
+    connection.sendall(HEADER.pack(MAGIC, device_index, packet_id, len(payload)) + payload)
+
+
+def receive_packet(connection: socket.socket) -> tuple[int, int, bytes]:
+    magic, device_index, packet_id, packet_size = HEADER.unpack(
+        read_exact(connection, HEADER.size)
+    )
+    if magic != MAGIC:
+        raise SDKError("OpenRGB returned an invalid SDK packet")
+    if packet_size > MAX_PACKET_SIZE:
+        raise SDKError(f"OpenRGB returned an oversized SDK packet: {packet_size} bytes")
+    return device_index, packet_id, read_exact(connection, packet_size)
+
+
+def unpack_u16(data: bytes, offset: int) -> tuple[int, int]:
+    if offset + 2 > len(data):
+        raise SDKError("OpenRGB returned a truncated SDK data block")
+    return struct.unpack_from("<H", data, offset)[0], offset + 2
+
+
+def unpack_u32(data: bytes, offset: int) -> tuple[int, int]:
+    if offset + 4 > len(data):
+        raise SDKError("OpenRGB returned a truncated SDK data block")
+    return struct.unpack_from("<I", data, offset)[0], offset + 4
+
+
+def unpack_string(data: bytes, offset: int) -> tuple[str, int]:
+    length, offset = unpack_u16(data, offset)
+    if length == 0 or offset + length > len(data):
+        raise SDKError("OpenRGB returned an invalid SDK string")
+    raw = data[offset : offset + length]
+    if raw[-1] != 0:
+        raise SDKError("OpenRGB returned a non-terminated SDK string")
+    return raw[:-1].decode("utf-8", errors="replace"), offset + length
+
+
+def pack_string(value: str) -> bytes:
+    encoded = value.encode("utf-8") + b"\0"
+    if len(encoded) > 0xFFFF:
+        raise SDKError("SDK string is too long")
+    return struct.pack("<H", len(encoded)) + encoded
+
+
+class EffectsClient:
+    def __init__(self) -> None:
+        self.connection = socket.create_connection((HOST, PORT), timeout=2.0)
+        self.connection.settimeout(2.0)
+        self.plugin = self._find_effects_plugin()
+
+    def close(self) -> None:
+        self.connection.close()
+
+    def __enter__(self) -> "EffectsClient":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def _find_effects_plugin(self) -> Plugin:
+        send_packet(self.connection, 0, REQUEST_PLUGIN_LIST)
+        _, packet_id, data = receive_packet(self.connection)
+        if packet_id != REQUEST_PLUGIN_LIST:
+            raise SDKError(f"Expected plugin list packet, received {packet_id}")
+
+        _, offset = unpack_u32(data, 0)
+        count, offset = unpack_u16(data, offset)
+        plugins: list[Plugin] = []
+        for _ in range(count):
+            name, offset = unpack_string(data, offset)
+            description, offset = unpack_string(data, offset)
+            version, offset = unpack_string(data, offset)
+            index, offset = unpack_u32(data, offset)
+            protocol, offset = unpack_u32(data, offset)
+            plugins.append(Plugin(name, description, version, index, protocol))
+
+        for plugin in plugins:
+            if plugin.name == EFFECTS_PLUGIN_NAME:
+                return plugin
+        raise SDKError("OpenRGB Effects Plugin is not loaded")
+
+    def _request(self, effects_packet_id: int) -> bytes:
+        send_packet(
+            self.connection,
+            self.plugin.index,
+            PLUGIN_SPECIFIC,
+            struct.pack("<I", effects_packet_id),
+        )
+        _, packet_id, data = receive_packet(self.connection)
+        if packet_id != PLUGIN_SPECIFIC:
+            raise SDKError(f"Expected plugin-specific packet, received {packet_id}")
+        returned_id, offset = unpack_u32(data, 0)
+        if returned_id != effects_packet_id:
+            raise SDKError(
+                f"Expected Effects packet {effects_packet_id}, received {returned_id}"
+            )
+        return data[offset:]
+
+    def _send(self, effects_packet_id: int, payload: bytes = b"") -> None:
+        send_packet(
+            self.connection,
+            self.plugin.index,
+            PLUGIN_SPECIFIC,
+            struct.pack("<I", effects_packet_id) + payload,
+        )
+
+    def effects(self) -> list[Effect]:
+        data = self._request(REQUEST_EFFECT_LIST)
+        _, offset = unpack_u32(data, 0)
+        count, offset = unpack_u16(data, offset)
+        effects: list[Effect] = []
+        for _ in range(count):
+            name, offset = unpack_string(data, offset)
+            description, offset = unpack_string(data, offset)
+            if offset >= len(data):
+                raise SDKError("OpenRGB returned a truncated effect state")
+            enabled = data[offset] != 0
+            offset += 1
+            effects.append(Effect(name, description, enabled))
+        return effects
+
+    def profiles(self) -> list[str]:
+        data = self._request(REQUEST_PROFILE_LIST)
+
+        # Effects Plugin 1.0rc2 reserves four bytes for a size field but writes
+        # the profile count at byte zero. Accept that layout and the corrected
+        # layout so the helper remains compatible with a future plugin update.
+        if len(data) >= 6 and struct.unpack_from("<I", data, 0)[0] == len(data):
+            count, offset = unpack_u16(data, 4)
+        else:
+            count, offset = unpack_u16(data, 0)
+
+        profiles: list[str] = []
+        for _ in range(count):
+            profile, offset = unpack_string(data, offset)
+            profiles.append(profile)
+        return profiles
+
+    def stop_all(self) -> list[str]:
+        active = [effect.name for effect in self.effects() if effect.enabled]
+        for name in active:
+            self._send(STOP_EFFECT, pack_string(name))
+
+        if active:
+            for _ in range(30):
+                if not any(effect.enabled for effect in self.effects()):
+                    break
+                time.sleep(0.1)
+            else:
+                raise SDKError("Effects Plugin did not stop every active effect")
+        return active
+
+    def load_profile(self, profile: str, expected_effect: str) -> None:
+        if profile not in self.profiles():
+            raise SDKError(f"Effects profile is unavailable: {profile}")
+
+        self._send(LOAD_PROFILE, pack_string(profile))
+        for _ in range(50):
+            effects = self.effects()
+            if any(effect.name == expected_effect and effect.enabled for effect in effects):
+                return
+            time.sleep(0.1)
+        raise SDKError(
+            f"Effects profile loaded without activating {expected_effect}: {profile}"
+        )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("ready", help="verify that the Effects Plugin is available")
+    subparsers.add_parser("list-effects", help="list instantiated effects")
+    subparsers.add_parser("list-profiles", help="list saved Effects profiles")
+    subparsers.add_parser("stop-all", help="stop every running effect")
+    load_parser = subparsers.add_parser("load-profile", help="load an Effects profile")
+    load_parser.add_argument("profile")
+    load_parser.add_argument("expected_effect")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        with EffectsClient() as client:
+            if args.command == "ready":
+                print(
+                    f"Effects Plugin ready: {client.plugin.version} "
+                    f"(protocol {client.plugin.protocol})"
+                )
+            elif args.command == "list-effects":
+                for effect in client.effects():
+                    state = "active" if effect.enabled else "inactive"
+                    print(f"{effect.name}\t{state}")
+            elif args.command == "list-profiles":
+                for profile in client.profiles():
+                    print(profile)
+            elif args.command == "stop-all":
+                stopped = client.stop_all()
+                if stopped:
+                    print("Stopped effects: " + ", ".join(stopped))
+                else:
+                    print("No active effects")
+            elif args.command == "load-profile":
+                client.load_profile(args.profile, args.expected_effect)
+                print(f"Effects profile active: {args.profile}")
+    except (OSError, SDKError) as error:
+        print(f"Effects SDK failed: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

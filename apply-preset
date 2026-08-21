@@ -5,6 +5,8 @@ set -o nounset
 set -o pipefail
 
 readonly OPENRGB_BIN="/usr/bin/openrgb"
+readonly SCRIPT_DIR="$(/usr/bin/readlink -f "$(/usr/bin/dirname "${BASH_SOURCE[0]}")")"
+readonly EFFECTS_SDK="${SCRIPT_DIR}/effects-sdk"
 readonly RAM_DEVICE="Corsair Dominator Platinum RGB DDR5"
 readonly GPU_DEVICE="ASUS TUF GeForce RTX 4090 Gaming OG OC"
 readonly ST100_DEVICE="Corsair ST100 RGB"
@@ -13,7 +15,7 @@ readonly MAINBOARD_DEVICE="ASUS ROG STRIX Z790-F GAMING WIFI"
 readonly STATE_ROOT="${XDG_STATE_HOME:-${HOME}/.local/state}/omarchy-plus/openrgb-presets"
 readonly STATE_FILE="${STATE_ROOT}/active-preset"
 readonly LAST_LOG="${STATE_ROOT}/last-openrgb.log"
-readonly LOCK_DIR="${STATE_ROOT}/apply.lock"
+readonly LOCK_FILE="${STATE_ROOT}/apply.flock"
 
 dry_run=false
 
@@ -26,40 +28,145 @@ usage() {
     '       apply-preset --dry-run PRESET' \
     '' \
     'Presets:' \
-    '  tokyo-night-purple' \
     '  deep-red' \
     '  bright-white' \
-    '  animated-rainbow'
+    '  animated-rainbow' \
+    '  neon-rain' \
+    '  aurora-comet' \
+    '  spectrum-wave' \
+    '  electric-sunrise' \
+    '  black'
 }
 
 list_presets() {
   /usr/bin/printf '%s\n' \
-    'tokyo-night-purple' \
     'deep-red' \
     'bright-white' \
-    'animated-rainbow'
+    'animated-rainbow' \
+    'neon-rain' \
+    'aurora-comet' \
+    'spectrum-wave' \
+    'electric-sunrise' \
+    'black'
 }
 
 is_preset() {
   case "${1}" in
-    tokyo-night-purple|deep-red|bright-white|animated-rainbow) return 0 ;;
+    deep-red|bright-white|animated-rainbow|neon-rain|aurora-comet|spectrum-wave|electric-sunrise|black) return 0 ;;
     *) return 1 ;;
   esac
 }
 
 preset_label() {
   case "${1}" in
-    tokyo-night-purple) /usr/bin/printf '%s' 'Tokyo Night Purple' ;;
     deep-red) /usr/bin/printf '%s' 'Deep Red' ;;
     bright-white) /usr/bin/printf '%s' 'Bright White' ;;
     animated-rainbow) /usr/bin/printf '%s' 'Animated Rainbow' ;;
+    neon-rain) /usr/bin/printf '%s' 'Neon Rain' ;;
+    aurora-comet) /usr/bin/printf '%s' 'Aurora Comet' ;;
+    spectrum-wave) /usr/bin/printf '%s' 'Spectrum Wave' ;;
+    electric-sunrise) /usr/bin/printf '%s' 'Electric Sunrise' ;;
+    black) /usr/bin/printf '%s' 'Black (Turn Off RGB)' ;;
+  esac
+}
+
+print_effects_command() {
+  /usr/bin/printf 'DRY RUN:'
+  /usr/bin/printf ' %q' "${EFFECTS_SDK}" "$@"
+  /usr/bin/printf '\n'
+}
+
+normalize_preset() {
+  case "${1}" in
+    tokyo-night-purple) /usr/bin/printf '%s' 'bright-white' ;;
+    *) /usr/bin/printf '%s' "${1}" ;;
   esac
 }
 
 print_command() {
   /usr/bin/printf 'DRY RUN:'
-  /usr/bin/printf ' %q' "${OPENRGB_BIN}" --noautoconnect "$@"
+  /usr/bin/printf ' %q' "${OPENRGB_BIN}" --nodetect "$@"
   /usr/bin/printf '\n'
+}
+
+wait_for_server() {
+  local inventory=''
+  local controller_count=0
+  local ram_count=0
+  local gpu_count=0
+  local st100_count=0
+  local mainboard_count=0
+  local attempt
+
+  for attempt in {1..30}; do
+    inventory="$("${OPENRGB_BIN}" --nodetect --list-devices 2>&1 || true)"
+    controller_count="$(/usr/bin/printf '%s\n' "${inventory}" | /usr/bin/grep -Ec '^[0-9]+: ' || true)"
+    ram_count="$(/usr/bin/printf '%s\n' "${inventory}" | /usr/bin/grep -Ec '^[0-9]+: Corsair Dominator Platinum RGB DDR5$' || true)"
+    gpu_count="$(/usr/bin/printf '%s\n' "${inventory}" | /usr/bin/grep -Ec '^[0-9]+: ASUS TUF GeForce RTX 4090 Gaming OG OC$' || true)"
+    st100_count="$(/usr/bin/printf '%s\n' "${inventory}" | /usr/bin/grep -Ec '^[0-9]+: Corsair ST100 RGB$' || true)"
+    mainboard_count="$(/usr/bin/printf '%s\n' "${inventory}" | /usr/bin/grep -Ec '^[0-9]+: ASUS ROG STRIX Z790-F GAMING WIFI$' || true)"
+
+    if [[ "${controller_count}" -eq 7 && "${ram_count}" -eq 4 \
+      && "${gpu_count}" -eq 1 && "${st100_count}" -eq 1 \
+      && "${mainboard_count}" -eq 1 ]]; then
+      return 0
+    fi
+
+    /usr/bin/sleep 1
+  done
+
+  /usr/bin/printf '%s\n' "${inventory}" >"${LAST_LOG}"
+  /usr/bin/printf '%s\n' "OpenRGB SDK server did not expose the seven accepted Hugin controllers. Report: ${LAST_LOG}" >&2
+  return 1
+}
+
+wait_for_effects() {
+  local output=''
+  local attempt
+
+  for attempt in {1..30}; do
+    if output="$("${EFFECTS_SDK}" ready 2>&1)"; then
+      return 0
+    fi
+    /usr/bin/sleep 1
+  done
+
+  /usr/bin/printf '%s\n' "${output}" >"${LAST_LOG}"
+  /usr/bin/printf '%s\n' "OpenRGB Effects Plugin did not become ready. Report: ${LAST_LOG}" >&2
+  return 1
+}
+
+stop_effects() {
+  if [[ "${dry_run}" == true ]]; then
+    print_effects_command stop-all
+    return 0
+  fi
+
+  wait_for_server || return 1
+  wait_for_effects || return 1
+  if ! "${EFFECTS_SDK}" stop-all >"${LAST_LOG}" 2>&1; then
+    /usr/bin/printf '%s\n' "OpenRGB Effects Plugin failed to stop active effects. Report: ${LAST_LOG}" >&2
+    /usr/bin/tail -n 20 "${LAST_LOG}" >&2
+    return 1
+  fi
+}
+
+apply_effects_profile() {
+  local profile="${1}"
+  local expected_effect="${2}"
+
+  if [[ "${dry_run}" == true ]]; then
+    print_effects_command load-profile "${profile}" "${expected_effect}"
+    return 0
+  fi
+
+  wait_for_server || return 1
+  wait_for_effects || return 1
+  if ! "${EFFECTS_SDK}" load-profile "${profile}" "${expected_effect}" >"${LAST_LOG}" 2>&1; then
+    /usr/bin/printf '%s\n' "OpenRGB Effects profile failed. Report: ${LAST_LOG}" >&2
+    /usr/bin/tail -n 20 "${LAST_LOG}" >&2
+    return 1
+  fi
 }
 
 run_openrgb() {
@@ -68,7 +175,9 @@ run_openrgb() {
     return 0
   fi
 
-  if ! "${OPENRGB_BIN}" --noautoconnect "$@" >"${LAST_LOG}" 2>&1; then
+  wait_for_server || return 1
+
+  if ! "${OPENRGB_BIN}" --nodetect "$@" >"${LAST_LOG}" 2>&1; then
     /usr/bin/printf '%s\n' "OpenRGB failed. Report: ${LAST_LOG}" >&2
     /usr/bin/tail -n 20 "${LAST_LOG}" >&2
     return 1
@@ -103,17 +212,33 @@ apply_preset() {
   local preset="${1}"
 
   case "${preset}" in
-    tokyo-night-purple)
-      apply_static BB9AF7 D060FF 2020FF A000FF,BB9AF7
-      ;;
     deep-red)
+      stop_effects
       apply_static 8B0000 A00000 A00000 8B0000
       ;;
     bright-white)
+      stop_effects
       apply_static FFFFFF FFFFFF 2020FF FFFFFF
       ;;
     animated-rainbow)
+      stop_effects
       apply_rainbow
+      ;;
+    neon-rain)
+      apply_effects_profile hugin-rain 'Rain'
+      ;;
+    aurora-comet)
+      apply_effects_profile hugin-rainbow-comet 'Comet'
+      ;;
+    spectrum-wave)
+      apply_effects_profile hugin-rainbow-wave 'Rainbow Wave'
+      ;;
+    electric-sunrise)
+      apply_effects_profile hugin-sunrise-blue-red 'Sunrise'
+      ;;
+    black)
+      stop_effects
+      apply_static 000000 000000 000000 000000
       ;;
   esac
 
@@ -143,9 +268,10 @@ main() {
       ;;
     --current)
       if [[ -r "${STATE_FILE}" ]]; then
-        /usr/bin/cat "${STATE_FILE}"
+        normalize_preset "$(/usr/bin/head -n 1 "${STATE_FILE}")"
+        /usr/bin/printf '\n'
       else
-        /usr/bin/printf '%s\n' 'tokyo-night-purple'
+        /usr/bin/printf '%s\n' 'bright-white'
       fi
       return 0
       ;;
@@ -161,9 +287,9 @@ main() {
     --restore)
       /usr/bin/mkdir -p "${STATE_ROOT}"
       if [[ -r "${STATE_FILE}" ]]; then
-        preset="$(/usr/bin/head -n 1 "${STATE_FILE}")"
+        preset="$(normalize_preset "$(/usr/bin/head -n 1 "${STATE_FILE}")")"
       else
-        preset='tokyo-night-purple'
+        preset='bright-white'
       fi
       ;;
     *)
@@ -185,16 +311,18 @@ main() {
     return 69
   fi
 
+  if [[ ! -x "${EFFECTS_SDK}" ]]; then
+    /usr/bin/printf 'Effects SDK helper is unavailable: %s\n' "${EFFECTS_SDK}" >&2
+    return 69
+  fi
+
   /usr/bin/mkdir -p "${STATE_ROOT}"
 
-  if ! /usr/bin/mkdir "${LOCK_DIR}" 2>/dev/null; then
+  exec 9>"${LOCK_FILE}"
+  if ! /usr/bin/flock --nonblock 9; then
     /usr/bin/printf '%s\n' 'Another OpenRGB preset operation is already running.' >&2
     return 75
   fi
-  cleanup() {
-    /usr/bin/rmdir "${LOCK_DIR}" 2>/dev/null || true
-  }
-  trap cleanup EXIT
 
   apply_preset "${preset}"
 }

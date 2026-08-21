@@ -1,0 +1,160 @@
+{
+    "Effects": [
+        {
+            "AllowOnlyFirst": false,
+            "AutoStart": true,
+            "Brightness": 100,
+            "ControllerZones": [
+                {
+                    "description": "Corsair DRAM RGB Device",
+                    "is_segment": false,
+                    "location": "I2C: SMBus I801 adapter at 0000:00:1f.4 (/dev/i2c-10), address 0x18",
+                    "name": "Corsair Dominator Platinum RGB DDR5",
+                    "reverse": false,
+                    "segment_idx": -1,
+                    "self_brightness": 100,
+                    "serial": "",
+                    "vendor": "Corsair",
+                    "version": "1.5.9",
+                    "zone_idx": 0
+                },
+                {
+                    "description": "Corsair DRAM RGB Device",
+                    "is_segment": false,
+                    "location": "I2C: SMBus I801 adapter at 0000:00:1f.4 (/dev/i2c-10), address 0x19",
+                    "name": "Corsair Dominator Platinum RGB DDR5",
+                    "reverse": false,
+                    "segment_idx": -1,
+                    "self_brightness": 100,
+                    "serial": "",
+                    "vendor": "Corsair",
+                    "version": "1.5.9",
+                    "zone_idx": 0
+                },
+                {
+                    "description": "Corsair DRAM RGB Device",
+                    "is_segment": false,
+                    "location": "I2C: SMBus I801 adapter at 0000:00:1f.4 (/dev/i2c-10), address 0x1A",
+                    "name": "Corsair Dominator Platinum RGB DDR5",
+                    "reverse": false,
+                    "segment_idx": -1,
+                    "self_brightness": 100,
+                    "serial": "",
+                    "vendor": "Corsair",
+                    "version": "1.5.9",
+                    "zone_idx": 0
+                },
+                {
+                    "description": "Corsair DRAM RGB Device",
+                    "is_segment": false,
+                    "location": "I2C: SMBus I801 adapter at 0000:00:1f.4 (/dev/i2c-10), address 0x1B",
+                    "name": "Corsair Dominator Platinum RGB DDR5",
+                    "reverse": false,
+                    "segment_idx": -1,
+                    "self_brightness": 100,
+                    "serial": "",
+                    "vendor": "Corsair",
+                    "version": "1.5.9",
+                    "zone_idx": 0
+                },
+                {
+                    "description": "ENE SMBus Device",
+                    "is_segment": false,
+                    "location": "I2C: NVIDIA i2c adapter 1 at 1:00.0\n (/dev/i2c-0), address 0x67",
+                    "name": "ASUS TUF GeForce RTX 4090 Gaming OG OC",
+                    "reverse": false,
+                    "segment_idx": -1,
+                    "self_brightness": 100,
+                    "serial": "",
+                    "vendor": "ASUS",
+                    "version": "AUMA0-E6K5-1107",
+                    "zone_idx": 0
+                },
+                {
+                    "description": "Corsair RGB Peripheral Device",
+                    "is_segment": false,
+                    "location": "HID: /dev/hidraw14",
+                    "name": "Corsair ST100 RGB",
+                    "reverse": false,
+                    "segment_idx": -1,
+                    "self_brightness": 100,
+                    "serial": "27B0020FE0902BAF5413F35AC41B00F5",
+                    "vendor": "Corsair",
+                    "version": "0.4",
+                    "zone_idx": 0
+                },
+                {
+                    "description": "Corsair RGB Peripheral Device",
+                    "is_segment": false,
+                    "location": "HID: /dev/hidraw14",
+                    "name": "Corsair ST100 RGB",
+                    "reverse": false,
+                    "segment_idx": -1,
+                    "self_brightness": 100,
+                    "serial": "27B0020FE0902BAF5413F35AC41B00F5",
+                    "vendor": "Corsair",
+                    "version": "0.4",
+                    "zone_idx": 1
+                },
+                {
+                    "description": "ASUS Aura USB Mainboard Device",
+                    "is_segment": false,
+                    "location": "HID: /dev/hidraw1",
+                    "name": "ASUS ROG STRIX Z790-F GAMING WIFI",
+                    "reverse": false,
+                    "segment_idx": -1,
+                    "self_brightness": 100,
+                    "serial": "9876543210",
+                    "vendor": "ASUS",
+                    "version": "AULA3-AR32-0309",
+                    "zone_idx": 0
+                },
+                {
+                    "description": "ASUS Aura USB Mainboard Device",
+                    "is_segment": false,
+                    "location": "HID: /dev/hidraw1",
+                    "name": "ASUS ROG STRIX Z790-F GAMING WIFI",
+                    "reverse": false,
+                    "segment_idx": -1,
+                    "self_brightness": 100,
+                    "serial": "9876543210",
+                    "vendor": "ASUS",
+                    "version": "AULA3-AR32-0309",
+                    "zone_idx": 1
+                },
+                {
+                    "description": "ASUS Aura USB Mainboard Device",
+                    "is_segment": false,
+                    "location": "HID: /dev/hidraw1",
+                    "name": "ASUS ROG STRIX Z790-F GAMING WIFI",
+                    "reverse": false,
+                    "segment_idx": -1,
+                    "self_brightness": 100,
+                    "serial": "9876543210",
+                    "vendor": "ASUS",
+                    "version": "AULA3-AR32-0309",
+                    "zone_idx": 2
+                }
+            ],
+            "CustomName": "",
+            "CustomSettings": {
+                "size": 5
+            },
+            "EffectClassName": "Rain",
+            "FPS": 60,
+            "RandomColors": false,
+            "Slider2Val": 50,
+            "Speed": 30,
+            "Temperature": 0,
+            "Tint": 0,
+            "UserColors": [
+                16711765,
+                65297,
+                9240320,
+                16122111,
+                54527
+            ]
+        }
+    ],
+    "version": 2
+}

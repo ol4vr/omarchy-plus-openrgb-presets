@@ -2,15 +2,17 @@
   "schemaVersion": 1,
   "id": "io.github.ol4vr.openrgb-presets",
   "name": "OpenRGB Presets",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "author": "Olav Rorvik",
   "license": "MIT",
-  "description": "Choose reviewed OpenRGB lighting presets for Hugin from the Omarchy bar.",
+  "description": "Choose static and synchronized OpenRGB lighting presets for Hugin from the Omarchy bar.",
   "kinds": [
-    "bar-widget"
+    "bar-widget",
+    "service"
   ],
   "entryPoints": {
-    "barWidget": "BarWidget.qml"
+    "barWidget": "BarWidget.qml",
+    "service": "Service.qml"
   },
   "barWidget": {
     "displayName": "OpenRGB Presets",

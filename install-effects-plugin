@@ -1,0 +1,91 @@
+#!/usr/bin/bash
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+readonly EXPECTED_SHA256="2f3c2b3c2c850e7148b4aa459bd41ccf9c56bd26fd00809fa19126ac5ad8dbc0"
+readonly DEFAULT_BINARY="${HOME}/Downloads/OpenRGBEffectsPlugin_1.0rc2_Linux_amd64_415dc20.so"
+readonly SCRIPT_DIR="$(/usr/bin/readlink -f "$(/usr/bin/dirname "${BASH_SOURCE[0]}")")"
+readonly OPENRGB_CONFIG="${XDG_CONFIG_HOME:-${HOME}/.config}/OpenRGB"
+readonly PLUGIN_TARGET="${OPENRGB_CONFIG}/plugins/OpenRGBEffectsPlugin.so"
+readonly PROFILE_TARGET="${OPENRGB_CONFIG}/plugins/settings/effect-profiles"
+
+readonly -a PROFILE_NAMES=(
+  hugin-rain
+  hugin-rainbow-comet
+  hugin-rainbow-wave
+  hugin-sunrise-blue-red
+)
+
+declare -Ar PROFILE_SHA256=(
+  [hugin-rain]="d730f06b7c90d7051ac94e48de674829ed87bbac107a43981c8f84b93d955ebe"
+  [hugin-rainbow-comet]="4f3b61a63086f5d98c07354d912cb82c987dde178c28ad95a54010e807f3f84f"
+  [hugin-rainbow-wave]="fe977da32d9f8dbb9babd4d8dfc146b7d586aa00d477a56a635118a7b5c64cc9"
+  [hugin-sunrise-blue-red]="dc42def0e003f7e24993584d4db7f50f021922a0574b6b722ffa16dfa931cb06"
+)
+
+usage() {
+  /usr/bin/printf '%s\n' \
+    'Usage: install-effects-plugin [PLUGIN_BINARY]' \
+    '' \
+    "Default binary: ${DEFAULT_BINARY}"
+}
+
+main() {
+  if [[ "${#}" -gt 1 ]]; then
+    usage >&2
+    return 64
+  fi
+
+  local binary="${1:-${DEFAULT_BINARY}}"
+  local observed_sha256=''
+  local profile=''
+
+  if [[ ! -x /usr/bin/openrgb ]]; then
+    /usr/bin/printf '%s\n' 'REFUSED: /usr/bin/openrgb is unavailable.' >&2
+    return 69
+  fi
+
+  if [[ ! -f "${binary}" ]]; then
+    /usr/bin/printf 'REFUSED: Effects Plugin binary is missing: %s\n' "${binary}" >&2
+    return 66
+  fi
+
+  observed_sha256="$(/usr/bin/sha256sum "${binary}" | /usr/bin/cut -d ' ' -f 1)"
+  if [[ "${observed_sha256}" != "${EXPECTED_SHA256}" ]]; then
+    /usr/bin/printf '%s\n' 'REFUSED: Effects Plugin checksum mismatch.' >&2
+    /usr/bin/printf 'Expected: %s\nObserved: %s\n' "${EXPECTED_SHA256}" "${observed_sha256}" >&2
+    return 65
+  fi
+
+  for profile in "${PROFILE_NAMES[@]}"; do
+    if [[ ! -s "${SCRIPT_DIR}/effects-profiles/${profile}" ]]; then
+      /usr/bin/printf 'REFUSED: bundled profile is missing: %s\n' "${profile}" >&2
+      return 66
+    fi
+
+    observed_sha256="$(/usr/bin/sha256sum "${SCRIPT_DIR}/effects-profiles/${profile}" | /usr/bin/cut -d ' ' -f 1)"
+    if [[ "${observed_sha256}" != "${PROFILE_SHA256[${profile}]}" ]]; then
+      /usr/bin/printf 'REFUSED: reviewed profile checksum mismatch: %s\n' "${profile}" >&2
+      return 65
+    fi
+  done
+
+  /usr/bin/install -d -m 0755 "$(/usr/bin/dirname "${PLUGIN_TARGET}")" "${PROFILE_TARGET}"
+  /usr/bin/install -m 0644 "${binary}" "${PLUGIN_TARGET}"
+
+  for profile in "${PROFILE_NAMES[@]}"; do
+    /usr/bin/install -m 0644 \
+      "${SCRIPT_DIR}/effects-profiles/${profile}" \
+      "${PROFILE_TARGET}/${profile}"
+  done
+
+  /usr/bin/printf '%s\n' \
+    'OpenRGB Effects Plugin installation PASS' \
+    "Plugin: ${PLUGIN_TARGET}" \
+    "SHA256: ${EXPECTED_SHA256}" \
+    "Profiles: ${#PROFILE_NAMES[@]} installed into ${PROFILE_TARGET}"
+}
+
+main "$@"
