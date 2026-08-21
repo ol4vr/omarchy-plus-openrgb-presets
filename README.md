@@ -41,8 +41,13 @@ RAM modules and one each of the GPU, ST100, and motherboard.
 
 The Omarchy service starts one GUI-capable OpenRGB process minimized in the
 background. It performs the slow hardware scan once, loads the Effects Plugin,
-and exposes the SDK only on `127.0.0.1:6742`. Preset changes then normally take
-about one second rather than repeating the hardware scan.
+and exposes the SDK only on `127.0.0.1:6742`. The service then restores the last
+successful preset after the SDK and accepted controllers become ready. Preset
+changes normally take about one second rather than repeating the hardware scan.
+
+`Panel.qml` only reads the saved preset to initialize its selection state. It
+does not change hardware when the panel is constructed, so boot persistence is
+independent of whether the bar panel has been opened.
 
 `effects-sdk` is a small Python standard-library client. It discovers the
 Effects Plugin by name, verifies saved profiles, stops running effect threads,
@@ -118,9 +123,9 @@ The plugin uses the `nf-md-lightbulb_on_50` Nerd Font icon and defaults to the
 left bar section. Hugin's bar configuration places it immediately after Screen
 Time, with the panel opening below the widget.
 
-When enabled, the service performs one background scan and `Panel.qml` restores
-the last successful preset. The fallback for a missing state file is Bright
-White. The removed Tokyo Night Purple identifier migrates to Bright White.
+When enabled, the service performs one background scan and restores the last
+successful preset. The fallback for a missing state file is Bright White. The
+removed Tokyo Night Purple identifier migrates to Bright White.
 
 ## Remove
 
