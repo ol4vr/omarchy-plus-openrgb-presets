@@ -39,11 +39,23 @@ RAM modules and one each of the GPU, ST100, and motherboard.
 
 ## Runtime architecture
 
-The Omarchy service starts one GUI-capable OpenRGB process minimized in the
-background. It performs the slow hardware scan once, loads the Effects Plugin,
-and exposes the SDK only on `127.0.0.1:6742`. The service then restores the last
-successful preset after the SDK and accepted controllers become ready. Preset
-changes normally take about one second rather than repeating the hardware scan.
+The Omarchy service starts `openrgb-lifecycle`, which owns one GUI-capable
+OpenRGB process minimized in the background. It performs the slow hardware scan
+once, loads the Effects Plugin, and exposes the SDK only on `127.0.0.1:6742`.
+The service then restores the last successful preset after the SDK and accepted
+controllers become ready. Preset changes normally take about one second rather
+than repeating the hardware scan.
+
+`openrgb-lifecycle` monitors logind's `PrepareForSleep` signal and holds a
+standard delay inhibitor while Hugin is awake. Before suspend or hibernation it
+terminates OpenRGB, waiting briefly and using SIGKILL only if a clean shutdown
+does not complete, then releases the inhibitor. After resume it reacquires the
+inhibitor, waits three seconds for SMBus devices to settle, starts OpenRGB, and
+restores the saved preset. This prevents the running OpenRGB process from
+leaving the four Corsair DDR5 controllers inaccessible across sleep.
+
+Every OpenRGB CLI and Effects SDK operation has a hard timeout. A stalled SDK
+connection therefore produces a bounded error instead of freezing the panel.
 
 `Panel.qml` only reads the saved preset to initialize its selection state. It
 does not change hardware when the panel is constructed, so boot persistence is
@@ -83,8 +95,9 @@ and profiles under `~/.config/OpenRGB/plugins/`.
 
 The plugin runs as the graphical-session user. It never invokes `sudo`,
 `pkexec`, a shell through QML, USB resets, firmware operations, or arbitrary
-user-provided commands. The SDK server accepts connections only from Hugin's
-loopback interface.
+user-provided commands. Its standard logind delay inhibitor only delays sleep
+long enough to terminate its own OpenRGB child. The SDK server accepts
+connections only from Hugin's loopback interface.
 
 `apply-preset` accepts only the eight fixed identifiers listed by
 `apply-preset --list`. It serializes changes with a private advisory lock and
@@ -104,8 +117,10 @@ qmllint -I "$OMARCHY_PATH/shell" \
   "$PLUGIN_DIR/Panel.qml" \
   "$PLUGIN_DIR/Service.qml"
 /usr/bin/bash -n "$PLUGIN_DIR/apply-preset"
+/usr/bin/bash -n "$PLUGIN_DIR/openrgb-lifecycle"
 /usr/bin/bash -n "$PLUGIN_DIR/install-effects-plugin"
 /usr/bin/python3 -m py_compile "$PLUGIN_DIR/effects-sdk"
+"$PLUGIN_DIR/openrgb-lifecycle" --check
 "$PLUGIN_DIR/apply-preset" --list
 "$PLUGIN_DIR/apply-preset" --dry-run black
 "$PLUGIN_DIR/apply-preset" --dry-run spectrum-wave

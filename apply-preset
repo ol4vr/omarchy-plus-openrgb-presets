@@ -16,6 +16,9 @@ readonly STATE_ROOT="${XDG_STATE_HOME:-${HOME}/.local/state}/omarchy-plus/openrg
 readonly STATE_FILE="${STATE_ROOT}/active-preset"
 readonly LAST_LOG="${STATE_ROOT}/last-openrgb.log"
 readonly LOCK_FILE="${STATE_ROOT}/apply.flock"
+readonly PROBE_TIMEOUT="2s"
+readonly COMMAND_TIMEOUT="15s"
+readonly PROBE_ATTEMPTS=15
 
 dry_run=false
 
@@ -98,8 +101,9 @@ wait_for_server() {
   local mainboard_count=0
   local attempt
 
-  for attempt in {1..30}; do
-    inventory="$("${OPENRGB_BIN}" --nodetect --list-devices 2>&1 || true)"
+  for ((attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++)); do
+    inventory="$(/usr/bin/timeout --signal=TERM --kill-after=1s "${PROBE_TIMEOUT}" \
+      "${OPENRGB_BIN}" --nodetect --list-devices 2>&1 || true)"
     controller_count="$(/usr/bin/printf '%s\n' "${inventory}" | /usr/bin/grep -Ec '^[0-9]+: ' || true)"
     ram_count="$(/usr/bin/printf '%s\n' "${inventory}" | /usr/bin/grep -Ec '^[0-9]+: Corsair Dominator Platinum RGB DDR5$' || true)"
     gpu_count="$(/usr/bin/printf '%s\n' "${inventory}" | /usr/bin/grep -Ec '^[0-9]+: ASUS TUF GeForce RTX 4090 Gaming OG OC$' || true)"
@@ -124,8 +128,9 @@ wait_for_effects() {
   local output=''
   local attempt
 
-  for attempt in {1..30}; do
-    if output="$("${EFFECTS_SDK}" ready 2>&1)"; then
+  for ((attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++)); do
+    if output="$(/usr/bin/timeout --signal=TERM --kill-after=1s "${PROBE_TIMEOUT}" \
+      "${EFFECTS_SDK}" ready 2>&1)"; then
       return 0
     fi
     /usr/bin/sleep 1
@@ -144,7 +149,8 @@ stop_effects() {
 
   wait_for_server || return 1
   wait_for_effects || return 1
-  if ! "${EFFECTS_SDK}" stop-all >"${LAST_LOG}" 2>&1; then
+  if ! /usr/bin/timeout --signal=TERM --kill-after=1s "${COMMAND_TIMEOUT}" \
+    "${EFFECTS_SDK}" stop-all >"${LAST_LOG}" 2>&1; then
     /usr/bin/printf '%s\n' "OpenRGB Effects Plugin failed to stop active effects. Report: ${LAST_LOG}" >&2
     /usr/bin/tail -n 20 "${LAST_LOG}" >&2
     return 1
@@ -162,7 +168,8 @@ apply_effects_profile() {
 
   wait_for_server || return 1
   wait_for_effects || return 1
-  if ! "${EFFECTS_SDK}" load-profile "${profile}" "${expected_effect}" >"${LAST_LOG}" 2>&1; then
+  if ! /usr/bin/timeout --signal=TERM --kill-after=1s "${COMMAND_TIMEOUT}" \
+    "${EFFECTS_SDK}" load-profile "${profile}" "${expected_effect}" >"${LAST_LOG}" 2>&1; then
     /usr/bin/printf '%s\n' "OpenRGB Effects profile failed. Report: ${LAST_LOG}" >&2
     /usr/bin/tail -n 20 "${LAST_LOG}" >&2
     return 1
@@ -177,7 +184,8 @@ run_openrgb() {
 
   wait_for_server || return 1
 
-  if ! "${OPENRGB_BIN}" --nodetect "$@" >"${LAST_LOG}" 2>&1; then
+  if ! /usr/bin/timeout --signal=TERM --kill-after=1s "${COMMAND_TIMEOUT}" \
+    "${OPENRGB_BIN}" --nodetect "$@" >"${LAST_LOG}" 2>&1; then
     /usr/bin/printf '%s\n' "OpenRGB failed. Report: ${LAST_LOG}" >&2
     /usr/bin/tail -n 20 "${LAST_LOG}" >&2
     return 1

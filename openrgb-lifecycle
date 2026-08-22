@@ -1,0 +1,242 @@
+#!/usr/bin/bash
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+readonly OPENRGB_BIN="/usr/bin/openrgb"
+readonly GDBUS_BIN="/usr/bin/gdbus"
+readonly STDBUF_BIN="/usr/bin/stdbuf"
+readonly INHIBIT_BIN="/usr/bin/systemd-inhibit"
+readonly SETSID_BIN="/usr/bin/setsid"
+readonly TIMEOUT_BIN="/usr/bin/timeout"
+readonly SLEEP_BIN="/usr/bin/sleep"
+readonly SCRIPT_PATH="$(/usr/bin/readlink -f "${BASH_SOURCE[0]}")"
+readonly SCRIPT_DIR="$(/usr/bin/dirname "${SCRIPT_PATH}")"
+readonly APPLY_PRESET="${SCRIPT_DIR}/apply-preset"
+readonly RESTORE_TIMEOUT="75s"
+readonly RESUME_DELAY="3"
+
+server_pid=''
+restore_pid=''
+inhibitor_pid=''
+monitor_pid=''
+monitor_fd=''
+suspended=false
+shutting_down=false
+
+log() {
+  /usr/bin/printf '%s\n' "$*"
+}
+
+is_running() {
+  local pid="${1:-}"
+  [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null
+}
+
+stop_process() {
+  local pid="${1:-}"
+  local name="${2}"
+  local attempt
+
+  if ! is_running "${pid}"; then
+    return 0
+  fi
+
+  kill -TERM "${pid}" 2>/dev/null || true
+  for attempt in {1..20}; do
+    if ! is_running "${pid}"; then
+      wait "${pid}" 2>/dev/null || true
+      log "${name} stopped"
+      return 0
+    fi
+    "${SLEEP_BIN}" 0.1
+  done
+
+  kill -KILL "${pid}" 2>/dev/null || true
+  wait "${pid}" 2>/dev/null || true
+  log "${name} required SIGKILL"
+}
+
+stop_restore() {
+  if is_running "${restore_pid}"; then
+    stop_process "${restore_pid}" "Preset restore"
+  fi
+  restore_pid=''
+}
+
+start_server() {
+  if is_running "${server_pid}"; then
+    return 0
+  fi
+
+  "${OPENRGB_BIN}" \
+    --noautoconnect \
+    --startminimized \
+    --server \
+    --server-host 127.0.0.1 \
+    --server-port 6742 &
+  server_pid=$!
+  log "OpenRGB server started as PID ${server_pid}"
+
+  "${TIMEOUT_BIN}" --signal=TERM --kill-after=2s "${RESTORE_TIMEOUT}" \
+    "${APPLY_PRESET}" --restore &
+  restore_pid=$!
+}
+
+stop_server() {
+  stop_restore
+  if is_running "${server_pid}"; then
+    stop_process "${server_pid}" "OpenRGB server"
+  fi
+  server_pid=''
+}
+
+start_inhibitor() {
+  if is_running "${inhibitor_pid}"; then
+    return 0
+  fi
+
+  "${SETSID_BIN}" "${INHIBIT_BIN}" \
+    --what=sleep \
+    --who='OpenRGB Presets' \
+    --why='Stop OpenRGB before system sleep' \
+    --mode=delay \
+    "${SLEEP_BIN}" infinity &
+  inhibitor_pid=$!
+  log "Sleep delay inhibitor started as process group ${inhibitor_pid}"
+}
+
+release_inhibitor() {
+  if ! is_running "${inhibitor_pid}"; then
+    inhibitor_pid=''
+    return 0
+  fi
+
+  kill -TERM -- "-${inhibitor_pid}" 2>/dev/null || true
+  wait "${inhibitor_pid}" 2>/dev/null || true
+  log "Sleep delay inhibitor released"
+  inhibitor_pid=''
+}
+
+handle_sleep_signal() {
+  local sleeping="${1}"
+
+  if [[ "${sleeping}" == true ]]; then
+    if [[ "${suspended}" == true ]]; then
+      return 0
+    fi
+    suspended=true
+    log "PrepareForSleep(true): stopping OpenRGB"
+    stop_server
+    release_inhibitor
+    return 0
+  fi
+
+  if [[ "${suspended}" == false ]]; then
+    return 0
+  fi
+  suspended=false
+  log "PrepareForSleep(false): scheduling OpenRGB restart"
+  start_inhibitor
+  "${SLEEP_BIN}" "${RESUME_DELAY}"
+  start_server
+}
+
+cleanup() {
+  if [[ "${shutting_down}" == true ]]; then
+    return 0
+  fi
+  shutting_down=true
+
+  stop_server
+  release_inhibitor
+  if is_running "${monitor_pid}"; then
+    kill -TERM "${monitor_pid}" 2>/dev/null || true
+    wait "${monitor_pid}" 2>/dev/null || true
+  fi
+}
+
+request_shutdown() {
+  cleanup
+  exit 0
+}
+
+check_dependencies() {
+  local dependency
+  local failed=false
+
+  for dependency in \
+    "${OPENRGB_BIN}" "${GDBUS_BIN}" "${STDBUF_BIN}" "${INHIBIT_BIN}" \
+    "${SETSID_BIN}" "${TIMEOUT_BIN}" "${SLEEP_BIN}" "${APPLY_PRESET}"; do
+    if [[ ! -x "${dependency}" ]]; then
+      /usr/bin/printf 'Missing executable: %s\n' "${dependency}" >&2
+      failed=true
+    fi
+  done
+
+  if [[ "${failed}" == true ]]; then
+    return 69
+  fi
+  log 'OpenRGB lifecycle dependencies: ready'
+}
+
+main() {
+  if [[ "${1:-}" == '--check' ]]; then
+    check_dependencies
+    return 0
+  fi
+  if [[ "${#}" -ne 0 ]]; then
+    /usr/bin/printf '%s\n' 'Usage: openrgb-lifecycle [--check]' >&2
+    return 64
+  fi
+
+  check_dependencies >/dev/null
+  trap cleanup EXIT
+  trap request_shutdown INT TERM HUP
+
+  start_inhibitor
+  start_server
+
+  coproc SLEEP_MONITOR {
+    exec "${STDBUF_BIN}" -oL "${GDBUS_BIN}" monitor \
+      --system \
+      --dest org.freedesktop.login1 \
+      --object-path /org/freedesktop/login1
+  }
+  monitor_pid="${SLEEP_MONITOR_PID}"
+  monitor_fd="${SLEEP_MONITOR[0]}"
+  log "logind sleep monitor started as PID ${monitor_pid}"
+
+  while true; do
+    line=''
+    if IFS= read -r -t 1 line <&"${monitor_fd}"; then
+      case "${line}" in
+        *'org.freedesktop.login1.Manager.PrepareForSleep (true,)'*)
+          handle_sleep_signal true
+          ;;
+        *'org.freedesktop.login1.Manager.PrepareForSleep (false,)'*)
+          handle_sleep_signal false
+          ;;
+      esac
+    elif ! is_running "${monitor_pid}"; then
+      /usr/bin/printf '%s\n' 'logind sleep monitor exited unexpectedly' >&2
+      return 1
+    fi
+
+    if [[ -n "${restore_pid}" ]] && ! is_running "${restore_pid}"; then
+      wait "${restore_pid}" 2>/dev/null || true
+      restore_pid=''
+    fi
+
+    if [[ "${suspended}" == false ]] && ! is_running "${server_pid}"; then
+      /usr/bin/printf '%s\n' 'OpenRGB server exited unexpectedly; restarting' >&2
+      server_pid=''
+      stop_restore
+      "${SLEEP_BIN}" 2
+      start_server
+    fi
+  done
+}
+
+main "$@"

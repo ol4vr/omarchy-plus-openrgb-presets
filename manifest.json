@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.ol4vr.openrgb-presets",
   "name": "OpenRGB Presets",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "author": "Olav Rorvik",
   "license": "MIT",
   "description": "Choose static and synchronized OpenRGB lighting presets for Hugin from the Omarchy bar.",

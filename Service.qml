@@ -5,62 +5,49 @@ import Quickshell.Io
 Item {
   id: root
 
-  readonly property string helperPath: Quickshell.env("HOME")
-    + "/.config/omarchy/plugins/io.github.ol4vr.openrgb-presets/apply-preset"
-  property string restoreOutput: ""
-  property string restoreError: ""
+  readonly property string lifecyclePath: Quickshell.env("HOME")
+    + "/.config/omarchy/plugins/io.github.ol4vr.openrgb-presets/openrgb-lifecycle"
+  property bool shuttingDown: false
 
   Process {
-    id: serverProc
-    command: [
-      "/usr/bin/openrgb",
-      "--noautoconnect",
-      "--startminimized",
-      "--server",
-      "--server-host", "127.0.0.1",
-      "--server-port", "6742"
-    ]
+    id: lifecycleProc
+    command: [root.lifecyclePath]
     running: false
 
-    // Keep one GUI-capable OpenRGB host alive so the Effects Plugin and SDK
-    // remain ready after the one-time hardware scan. Consume its output so
-    // the process pipes cannot fill.
     stdout: SplitParser {
-      onRead: function() {}
+      onRead: function(line) {
+        console.info("OpenRGB lifecycle: " + line)
+      }
     }
     stderr: SplitParser {
-      onRead: function() {}
-    }
-  }
-
-  Process {
-    id: restoreProc
-    command: [root.helperPath, "--restore"]
-    running: false
-
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.restoreOutput = text.trim()
-    }
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.restoreError = text.trim()
+      onRead: function(line) {
+        console.warn("OpenRGB lifecycle: " + line)
+      }
     }
     onExited: function(exitCode) {
-      if (exitCode === 0) {
-        console.info("OpenRGB preset restored: " + root.restoreOutput)
-      } else if (exitCode === 75) {
-        console.info("OpenRGB preset restore skipped because another operation is active")
-      } else {
-        console.error("OpenRGB preset restore failed: "
-          + (root.restoreError !== "" ? root.restoreError : "exit " + exitCode))
+      if (!root.shuttingDown) {
+        console.error("OpenRGB lifecycle exited with code " + exitCode
+          + "; restarting in two seconds")
+        restartTimer.start()
       }
     }
   }
 
-  Component.onCompleted: {
-    serverProc.running = true
-    restoreProc.running = true
+  Timer {
+    id: restartTimer
+    interval: 2000
+    repeat: false
+    onTriggered: {
+      if (!root.shuttingDown && !lifecycleProc.running) {
+        lifecycleProc.running = true
+      }
+    }
   }
-  Component.onDestruction: serverProc.running = false
+
+  Component.onCompleted: lifecycleProc.running = true
+  Component.onDestruction: {
+    root.shuttingDown = true
+    restartTimer.stop()
+    lifecycleProc.running = false
+  }
 }
