@@ -6,7 +6,7 @@ hardware-animated, and synchronized OpenRGB Effects presets.
 ## Presets
 
 - **Deep Red** — calibrated static red.
-- **Deep Blue** — static tuned blue (`#0033AA`) on every controller.
+- **Deep Blue** — static darkest Alliance blue (`#000B22`) on every controller.
 - **Bright White** — static white with ST100 logo compensation.
 - **Animated Rainbow** — controller-native animation with an ST100 fallback.
 - **Neon Rain** — synchronized five-color Rain effect.
@@ -248,6 +248,14 @@ installer. This restores only the prior fourth color in each experimental
 Sunrise profile and its release metadata without changing the first three
 colors, animation settings, controller assignments, panel layout, lifecycle
 behavior, or saved preset.
+
+## Roll back the 0.4.6 final Deep Blue color
+
+Redeploy exact 0.4.5 commit
+`f5cee512e9eebcd29d1f75e3411e670bb7169692`. This restores only the static
+Deep Blue CLI color, its panel indicator, focused assertions, documentation,
+and release metadata. Effects profiles, animation settings, controller
+assignments, panel layout, lifecycle behavior, and saved preset are unchanged.
 
 ## Remove
 

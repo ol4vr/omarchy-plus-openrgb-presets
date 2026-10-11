@@ -39,8 +39,8 @@ Panel {
       label: "Deep Blue",
       kind: "STATIC",
       detail: "DEEP BLUE",
-      accent: "#0033AA",
-      swatches: ["#0033AA"]
+      accent: "#000B22",
+      swatches: ["#000B22"]
     },
     {
       id: "bright-white",

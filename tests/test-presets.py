@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused source-only validation for OpenRGB Presets 0.4.5."""
+"""Focused source-only validation for OpenRGB Presets 0.4.6."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -47,7 +48,7 @@ NEW_PROFILES = {
     },
 }
 PANEL_INDICATORS = {
-    "deep-blue": ("STATIC", "DEEP BLUE", "#0033AA", ["#0033AA"]),
+    "deep-blue": ("STATIC", "DEEP BLUE", "#000B22", ["#000B22"]),
     "matte-black-orange": (
         "EFFECTS",
         "ORANGE · RED · BURNT",
@@ -169,7 +170,7 @@ class PresetTests(unittest.TestCase):
 
     def test_manifest_and_panel_order(self) -> None:
         manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.4.5")
+        self.assertEqual(manifest["version"], "0.4.6")
 
         panel = PANEL.read_text(encoding="utf-8")
         library = panel.split(
@@ -256,8 +257,23 @@ class PresetTests(unittest.TestCase):
                 env=environment,
             ).stdout
             self.assertIn("stop-all", deep_blue)
-            self.assertEqual(set(re.findall(r"--color ([0-9A-F,]+)", deep_blue)), {"0033AA"})
+            self.assertEqual(set(re.findall(r"--color ([0-9A-F,]+)", deep_blue)), {"000B22"})
             self.assertNotIn("000000", deep_blue)
+            command = shlex.split(deep_blue.split("DRY RUN: ", 2)[2].splitlines()[0])
+            self.assertEqual(
+                [command[index + 1] for index, value in enumerate(command) if value == "--device"],
+                [
+                    "Corsair Dominator Platinum RGB DDR5",
+                    "ASUS TUF GeForce RTX 4090 Gaming OG OC",
+                    "Corsair ST100 RGB",
+                    "Corsair ST100 RGB",
+                    "ASUS ROG STRIX Z790-F GAMING WIFI",
+                ],
+            )
+            self.assertEqual(
+                [command[index + 1] for index, value in enumerate(command) if value == "--zone"],
+                ["0", "1"],
+            )
 
             for preset, profile in expected_profiles.items():
                 output = subprocess.run(
