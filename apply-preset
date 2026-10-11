@@ -242,7 +242,7 @@ apply_preset() {
       ;;
     deep-blue)
       stop_effects
-      apply_static 4000FF 4000FF 4000FF 4000FF
+      apply_static 0033AA 0033AA 0033AA 0033AA
       ;;
     animated-rainbow)
       stop_effects

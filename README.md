@@ -6,16 +6,16 @@ hardware-animated, and synchronized OpenRGB Effects presets.
 ## Presets
 
 - **Deep Red** — calibrated static red.
-- **Deep Blue** — static Electric Sunrise blue (`#4000FF`) on every controller.
+- **Deep Blue** — static tuned blue (`#0033AA`) on every controller.
 - **Bright White** — static white with ST100 logo compensation.
 - **Animated Rainbow** — controller-native animation with an ST100 fallback.
 - **Neon Rain** — synchronized five-color Rain effect.
 - **Aurora Comet** — synchronized green Comet effect.
 - **Spectrum Wave** — synchronized Rainbow Wave effect.
-- **Matte Black Orange** — Electric Sunrise motion using `#FF4400` and off.
+- **Matte Black Orange** — Electric Sunrise motion using `#FF4400` and `#FF8800`.
 - **Electric Sunrise** — synchronized blue, violet, red, and orange Sunrise effect.
-- **Horde Red** — Electric Sunrise motion using Deep Red `#8B0000` and off.
-- **Alliance Blue** — Electric Sunrise motion using `#4000FF` and off.
+- **Horde Red** — Electric Sunrise motion using `#8B0000` and `#4A0000`.
+- **Alliance Blue** — Electric Sunrise motion using `#0033AA` and off.
 - **Black (Turn Off RGB)** — stops active effects and sends black to every controller.
 
 The seven synchronized presets are stored as reviewed Hugin Effects profiles in
@@ -24,9 +24,9 @@ effect before changing controller modes, preventing an old effect thread from
 overwriting the selected state.
 
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
-`UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order;
-the orange, blue, and red Sunrise palettes are therefore stored as `17663`,
-`16711744`, and `139`, respectively.
+`UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
+The tuned orange, blue, and red Sunrise palettes are therefore stored as
+`[17663, 35071]`, `[11154176, 0]`, and `[139, 74]`, respectively.
 
 The panel library uses six complete two-column rows: Deep Red / Deep Blue,
 Bright White / Animated Rainbow, Neon Rain / Aurora Comet, Spectrum Wave /
@@ -214,6 +214,14 @@ Redeploy exact 0.4.1 commit
 installer. This restores only the previous stored color values and release
 metadata; it does not change the accepted panel layout, lifecycle behavior,
 controller assignments, or saved active-preset state.
+
+## Roll back the 0.4.3 color tuning
+
+Redeploy exact 0.4.2 commit
+`02fb0eaecd69ac944866283c41b5971f11745eb3` and run its reviewed Effects
+installer. This restores the prior Deep Blue command, the three prior animated
+palettes, their panel indicators, and release metadata without changing the
+accepted layout, lifecycle behavior, controller assignments, or saved preset.
 
 ## Remove
 

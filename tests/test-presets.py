@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused source-only validation for OpenRGB Presets 0.4.2."""
+"""Focused source-only validation for OpenRGB Presets 0.4.3."""
 
 from __future__ import annotations
 
@@ -28,20 +28,41 @@ ORIGINAL_PROFILE_HASHES = {
 }
 NEW_PROFILES = {
     "hugin-sunrise-orange-black": {
-        "human_rgb": ["#FF4400", "#000000"],
-        "packed_rgbcolor": [17663, 0],
-        "sha256": "cb4cba768dfb838407f31adcfc29c48fcac9f9174bd71d66894d71f881d6eecf",
+        "human_rgb": ["#FF4400", "#FF8800"],
+        "packed_rgbcolor": [17663, 35071],
+        "sha256": "1b1f366e6a5327711eb92ba6965fc8064417883295e2f0aadca1c21fd7827915",
     },
     "hugin-sunrise-blue-black": {
-        "human_rgb": ["#4000FF", "#000000"],
-        "packed_rgbcolor": [16711744, 0],
-        "sha256": "b157ec0dd7646d2bdd90f6f2a7f4819d83bf4b293c9753543b859c691235a38b",
+        "human_rgb": ["#0033AA", "#000000"],
+        "packed_rgbcolor": [11154176, 0],
+        "sha256": "2b74a9f096630ca6b68a893de6658bfbdec77d2b94a19eedb3becc0c2bf88317",
     },
     "hugin-sunrise-red-black": {
-        "human_rgb": ["#8B0000", "#000000"],
-        "packed_rgbcolor": [139, 0],
-        "sha256": "acb22e80bd049e654b6879a9e3d95e288aac5869556575e9cc1c2b105db1d425",
+        "human_rgb": ["#8B0000", "#4A0000"],
+        "packed_rgbcolor": [139, 74],
+        "sha256": "86fe0ce00eafe0ad3786c86b8418f6f36eddd1e818cd34f762d2a357a576f9ac",
     },
+}
+PANEL_INDICATORS = {
+    "deep-blue": ("STATIC", "DEEP BLUE", "#0033AA", ["#0033AA"]),
+    "matte-black-orange": (
+        "EFFECTS",
+        "ORANGE · AMBER",
+        "#FF4400",
+        ["#FF4400", "#FF8800"],
+    ),
+    "horde-red": (
+        "EFFECTS",
+        "DEEP RED · DARK RED",
+        "#8B0000",
+        ["#8B0000", "#4A0000"],
+    ),
+    "alliance-blue": (
+        "EFFECTS",
+        "BLUE · BLACK",
+        "#0033AA",
+        ["#0033AA", "#000000"],
+    ),
 }
 VISIBLE_ORDER = [
     "deep-red",
@@ -89,6 +110,14 @@ def pack_rgbcolor(human_rgb: str) -> int:
     return red | (green << 8) | (blue << 16)
 
 
+def unpack_rgbcolor(packed_rgbcolor: int) -> str:
+    """Decode OpenRGB's packed 0x00BBGGRR integer to human #RRGGBB."""
+    red = packed_rgbcolor & 0xFF
+    green = (packed_rgbcolor >> 8) & 0xFF
+    blue = (packed_rgbcolor >> 16) & 0xFF
+    return f"#{red:02X}{green:02X}{blue:02X}"
+
+
 class PresetTests(unittest.TestCase):
     def test_original_effects_profiles_are_byte_identical(self) -> None:
         for name, expected_hash in ORIGINAL_PROFILE_HASHES.items():
@@ -96,9 +125,17 @@ class PresetTests(unittest.TestCase):
 
     def test_human_rgb_is_packed_as_openrgb_rgbcolor(self) -> None:
         for name, specification in NEW_PROFILES.items():
+            human_rgb = specification["human_rgb"]
+            packed_rgbcolor = load_profile(name)["Effects"][0]["UserColors"]
+            self.assertEqual(packed_rgbcolor, specification["packed_rgbcolor"], name)
             self.assertEqual(
-                [pack_rgbcolor(color) for color in specification["human_rgb"]],
-                specification["packed_rgbcolor"],
+                [pack_rgbcolor(color) for color in human_rgb],
+                packed_rgbcolor,
+                name,
+            )
+            self.assertEqual(
+                [unpack_rgbcolor(color) for color in packed_rgbcolor],
+                human_rgb,
                 name,
             )
 
@@ -124,7 +161,7 @@ class PresetTests(unittest.TestCase):
 
     def test_manifest_and_panel_order(self) -> None:
         manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.4.2")
+        self.assertEqual(manifest["version"], "0.4.3")
 
         panel = PANEL.read_text(encoding="utf-8")
         library = panel.split(
@@ -138,6 +175,13 @@ class PresetTests(unittest.TestCase):
         self.assertIn("root.moveSelection(dx, dy)", panel)
         self.assertIn('id: "bright-white"', panel)
         self.assertNotIn("brightWhitePreset", panel)
+
+        for preset, (kind, detail, accent, swatches) in PANEL_INDICATORS.items():
+            block = library.split(f'id: "{preset}"', 1)[1].split("\n    }", 1)[0]
+            self.assertIn(f'kind: "{kind}"', block, preset)
+            self.assertIn(f'detail: "{detail}"', block, preset)
+            self.assertIn(f'accent: "{accent}"', block, preset)
+            self.assertIn(f"swatches: {json.dumps(swatches)}", block, preset)
 
         def move(index: int, dx: int, dy: int) -> int:
             if dy == 0:
@@ -204,7 +248,7 @@ class PresetTests(unittest.TestCase):
                 env=environment,
             ).stdout
             self.assertIn("stop-all", deep_blue)
-            self.assertEqual(set(re.findall(r"--color ([0-9A-F,]+)", deep_blue)), {"4000FF"})
+            self.assertEqual(set(re.findall(r"--color ([0-9A-F,]+)", deep_blue)), {"0033AA"})
             self.assertNotIn("000000", deep_blue)
 
             for preset, profile in expected_profiles.items():

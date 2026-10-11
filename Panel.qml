@@ -38,9 +38,9 @@ Panel {
       id: "deep-blue",
       label: "Deep Blue",
       kind: "STATIC",
-      detail: "ELECTRIC BLUE",
-      accent: "#4000FF",
-      swatches: ["#4000FF"]
+      detail: "DEEP BLUE",
+      accent: "#0033AA",
+      swatches: ["#0033AA"]
     },
     {
       id: "bright-white",
@@ -94,9 +94,9 @@ Panel {
       id: "matte-black-orange",
       label: "Matte Black Orange",
       kind: "EFFECTS",
-      detail: "ORANGE · BLACK",
+      detail: "ORANGE · AMBER",
       accent: "#FF4400",
-      swatches: ["#FF4400", "#000000"]
+      swatches: ["#FF4400", "#FF8800"]
     },
     {
       id: "black",
@@ -110,17 +110,17 @@ Panel {
       id: "horde-red",
       label: "Horde Red",
       kind: "EFFECTS",
-      detail: "RED · BLACK",
+      detail: "DEEP RED · DARK RED",
       accent: "#8B0000",
-      swatches: ["#8B0000", "#000000"]
+      swatches: ["#8B0000", "#4A0000"]
     },
     {
       id: "alliance-blue",
       label: "Alliance Blue",
       kind: "EFFECTS",
       detail: "BLUE · BLACK",
-      accent: "#4000FF",
-      swatches: ["#4000FF", "#000000"]
+      accent: "#0033AA",
+      swatches: ["#0033AA", "#000000"]
     }
   ]
 

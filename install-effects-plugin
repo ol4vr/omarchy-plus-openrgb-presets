@@ -25,10 +25,10 @@ declare -Ar PROFILE_SHA256=(
   [hugin-rain]="d730f06b7c90d7051ac94e48de674829ed87bbac107a43981c8f84b93d955ebe"
   [hugin-rainbow-comet]="4f3b61a63086f5d98c07354d912cb82c987dde178c28ad95a54010e807f3f84f"
   [hugin-rainbow-wave]="fe977da32d9f8dbb9babd4d8dfc146b7d586aa00d477a56a635118a7b5c64cc9"
-  [hugin-sunrise-blue-black]="b157ec0dd7646d2bdd90f6f2a7f4819d83bf4b293c9753543b859c691235a38b"
+  [hugin-sunrise-blue-black]="2b74a9f096630ca6b68a893de6658bfbdec77d2b94a19eedb3becc0c2bf88317"
   [hugin-sunrise-blue-red]="dc42def0e003f7e24993584d4db7f50f021922a0574b6b722ffa16dfa931cb06"
-  [hugin-sunrise-orange-black]="cb4cba768dfb838407f31adcfc29c48fcac9f9174bd71d66894d71f881d6eecf"
-  [hugin-sunrise-red-black]="acb22e80bd049e654b6879a9e3d95e288aac5869556575e9cc1c2b105db1d425"
+  [hugin-sunrise-orange-black]="1b1f366e6a5327711eb92ba6965fc8064417883295e2f0aadca1c21fd7827915"
+  [hugin-sunrise-red-black]="86fe0ce00eafe0ad3786c86b8418f6f36eddd1e818cd34f762d2a357a576f9ac"
 )
 
 usage() {
