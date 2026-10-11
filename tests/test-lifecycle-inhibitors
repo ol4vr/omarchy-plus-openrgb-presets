@@ -1,0 +1,334 @@
+#!/usr/bin/bash
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+readonly REPOSITORY_ROOT="$(/usr/bin/readlink -f "$(/usr/bin/dirname "${BASH_SOURCE[0]}")/..")"
+
+if [[ "${1:-}" == owner ]]; then
+  readonly OWNER_MARKER="${2}"
+  readonly OWNER_MODE="${3}"
+  # shellcheck source=../openrgb-lifecycle
+  source "${REPOSITORY_ROOT}/openrgb-lifecycle"
+  acquire_lifecycle_lock || exit 75
+  if [[ "${OWNER_MODE}" == graceful ]]; then
+    trap 'cleanup; exit 0' INT TERM HUP
+    trap cleanup EXIT
+  fi
+  start_inhibitor >/dev/null
+  start_monitor >/dev/null
+  /usr/bin/printf '%s %s %s\n' "$$" "${inhibitor_pid}" "${monitor_pid}" >"${OWNER_MARKER}"
+  while true; do
+    /usr/bin/sleep 0.1
+  done
+fi
+
+readonly TEST_ROOT="$(/usr/bin/mktemp -d)"
+readonly BIN_DIR="${TEST_ROOT}/bin"
+readonly RUNTIME_ROOT="${TEST_ROOT}/runtime"
+readonly INHIBITOR_LAUNCHES="${TEST_ROOT}/inhibitor-launches"
+readonly GDBUS_LAUNCHES="${TEST_ROOT}/gdbus-launches"
+
+test_cleanup() {
+  local child
+  while read -r child; do
+    [[ -z "${child}" ]] || kill -TERM "${child}" 2>/dev/null || true
+  done < <(jobs -pr)
+  wait 2>/dev/null || true
+  /usr/bin/rm -rf -- "${TEST_ROOT}"
+}
+trap test_cleanup EXIT
+
+/usr/bin/mkdir -p "${BIN_DIR}" "${RUNTIME_ROOT}"
+: >"${INHIBITOR_LAUNCHES}"
+: >"${GDBUS_LAUNCHES}"
+
+/usr/bin/printf '%s\n' \
+  '#!/usr/bin/bash' \
+  'set -o errexit' \
+  '/usr/bin/printf "%s\n" "$$" >>"${INHIBITOR_LAUNCHES}"' \
+  'while (( $# > 0 )); do case "$1" in --*) shift ;; *) break ;; esac; done' \
+  '"$@" &' \
+  'child=$!' \
+  'trap '\''kill -TERM "${child}" 2>/dev/null || true; wait "${child}" 2>/dev/null || true; exit 0'\'' INT TERM HUP' \
+  'wait "${child}"' >"${BIN_DIR}/systemd-inhibit"
+
+/usr/bin/printf '%s\n' \
+  '#!/usr/bin/bash' \
+  '/usr/bin/printf "%s\n" "$$" >>"${GDBUS_LAUNCHES}"' \
+  'trap "exit 0" INT TERM HUP' \
+  'while true; do /usr/bin/sleep 0.1; done' >"${BIN_DIR}/gdbus"
+
+/usr/bin/printf '%s\n' \
+  '#!/usr/bin/bash' \
+  '[[ "$1" == "-oL" ]] && shift' \
+  'exec "$@"' >"${BIN_DIR}/stdbuf"
+
+/usr/bin/printf '%s\n' '#!/usr/bin/bash' 'exit 0' >"${BIN_DIR}/apply-preset"
+/usr/bin/printf '%s\n' '#!/usr/bin/bash' '/usr/bin/sleep 30' >"${BIN_DIR}/openrgb"
+/usr/bin/printf '%s\n' '#!/usr/bin/bash' 'exit 0' >"${BIN_DIR}/ss"
+/usr/bin/printf '%s\n' '#!/usr/bin/bash' 'exec /usr/bin/ps "$@"' >"${BIN_DIR}/ps"
+/usr/bin/printf '%s\n' '#!/usr/bin/bash' 'exit 0' >"${BIN_DIR}/timeout"
+/usr/bin/chmod 0755 "${BIN_DIR}/"*
+
+export OPENRGB_BIN="${BIN_DIR}/openrgb"
+export GDBUS_BIN="${BIN_DIR}/gdbus"
+export STDBUF_BIN="${BIN_DIR}/stdbuf"
+export INHIBIT_BIN="${BIN_DIR}/systemd-inhibit"
+export INHIBIT_PROCESS_PREFIX="/usr/bin/bash ${BIN_DIR}/systemd-inhibit"
+export SS_BIN="${BIN_DIR}/ss"
+export PS_BIN="${BIN_DIR}/ps"
+export TIMEOUT_BIN="${BIN_DIR}/timeout"
+export APPLY_PRESET="${BIN_DIR}/apply-preset"
+export OPENRGB_RUNTIME_DIR="${RUNTIME_ROOT}"
+export OPENRGB_RESUME_DELAY=0.01
+export INHIBITOR_LAUNCHES GDBUS_LAUNCHES
+
+# shellcheck source=../openrgb-lifecycle
+source "${REPOSITORY_ROOT}/openrgb-lifecycle"
+
+pass_count=0
+run_test() {
+  local name="${1}"
+  shift
+  "$@"
+  pass_count=$((pass_count + 1))
+  /usr/bin/printf 'PASS: %s\n' "${name}"
+}
+
+wait_for_file() {
+  local path="${1}"
+  local attempt
+  for attempt in {1..100}; do
+    [[ -s "${path}" ]] && return 0
+    /usr/bin/sleep 0.02
+  done
+  return 1
+}
+
+wait_for_exit() {
+  local pid="${1}"
+  local attempt
+  for attempt in {1..100}; do
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      return 0
+    fi
+    /usr/bin/sleep 0.02
+  done
+  return 1
+}
+
+reset_inhibitor_state() {
+  release_inhibitor >/dev/null 2>&1 || true
+  inhibitor_pid=''
+  inhibitor_start_time=''
+  : >"${INHIBITOR_LAUNCHES}"
+}
+
+test_initial_inhibitor_startup() {
+  reset_inhibitor_state
+  start_inhibitor >/dev/null
+  is_owned_current_inhibitor "${inhibitor_pid}" "${inhibitor_start_time}"
+  [[ "$(/usr/bin/wc -l <"${INHIBITOR_LAUNCHES}")" -eq 1 ]]
+  release_inhibitor >/dev/null
+}
+
+test_repeated_reconciliation_reuses_inhibitor() {
+  reset_inhibitor_state
+  start_inhibitor >/dev/null
+  local first_pid="${inhibitor_pid}"
+  start_inhibitor >/dev/null
+  [[ "${inhibitor_pid}" == "${first_pid}" ]]
+  [[ "$(/usr/bin/wc -l <"${INHIBITOR_LAUNCHES}")" -eq 1 ]]
+  release_inhibitor >/dev/null
+}
+
+launch_owner() {
+  local mode="${1}"
+  local marker="${2}"
+  "${BASH_SOURCE[0]}" owner "${marker}" "${mode}" &
+  launched_owner_pid=$!
+  wait_for_file "${marker}"
+}
+
+test_quickshell_restart_does_not_accumulate() {
+  local first_marker="${TEST_ROOT}/owner-first"
+  local second_marker="${TEST_ROOT}/owner-second"
+  local first_owner first_inhibitor first_monitor
+  local second_owner second_inhibitor second_monitor
+
+  : >"${INHIBITOR_LAUNCHES}"
+  launch_owner unexpected "${first_marker}"
+  read -r first_owner first_inhibitor first_monitor <"${first_marker}"
+  kill -KILL "${first_owner}"
+  wait "${first_owner}" 2>/dev/null || true
+  wait_for_exit "${first_inhibitor}"
+  wait_for_exit "${first_monitor}"
+
+  launch_owner graceful "${second_marker}"
+  read -r second_owner second_inhibitor second_monitor <"${second_marker}"
+  is_same_process "${second_inhibitor}" "$(process_start_time "${second_inhibitor}")"
+  [[ "$(/usr/bin/wc -l <"${INHIBITOR_LAUNCHES}")" -eq 2 ]]
+  kill -TERM "${second_owner}"
+  wait "${second_owner}" 2>/dev/null || true
+  wait_for_exit "${second_inhibitor}"
+  wait_for_exit "${second_monitor}"
+}
+
+test_plugin_lifecycle_termination_cleans_children() {
+  local marker="${TEST_ROOT}/owner-graceful"
+  local owner owned_inhibitor owned_monitor
+  launch_owner graceful "${marker}"
+  read -r owner owned_inhibitor owned_monitor <"${marker}"
+  kill -TERM "${owner}"
+  wait "${owner}" 2>/dev/null || true
+  wait_for_exit "${owned_inhibitor}"
+  wait_for_exit "${owned_monitor}"
+}
+
+test_unexpected_parent_exit_closes_leases() {
+  local marker="${TEST_ROOT}/owner-unexpected"
+  local owner owned_inhibitor owned_monitor
+  launch_owner unexpected "${marker}"
+  read -r owner owned_inhibitor owned_monitor <"${marker}"
+  kill -KILL "${owner}"
+  wait "${owner}" 2>/dev/null || true
+  wait_for_exit "${owned_inhibitor}"
+  wait_for_exit "${owned_monitor}"
+}
+
+test_inhibitor_replacement_after_release() {
+  reset_inhibitor_state
+  start_inhibitor >/dev/null
+  local first_pid="${inhibitor_pid}"
+  release_inhibitor >/dev/null
+  start_inhibitor >/dev/null
+  [[ "$(/usr/bin/wc -l <"${INHIBITOR_LAUNCHES}")" -eq 2 ]]
+  [[ "${inhibitor_pid}" != "${first_pid}" ]]
+  release_inhibitor >/dev/null
+}
+
+test_suspend_resume_preserves_monitor_and_reacquires() {
+  reset_inhibitor_state
+  start_inhibitor >/dev/null
+  start_monitor >/dev/null
+  local original_inhibitor="${inhibitor_pid}"
+  local original_monitor="${monitor_pid}"
+  /usr/bin/sleep 30 &
+  server_pid=$!
+  handle_sleep_signal true >/dev/null
+  [[ "${suspended}" == true ]]
+  wait_for_exit "${original_inhibitor}"
+  is_same_process "${original_monitor}" "${monitor_start_time}"
+  [[ -z "${server_pid}" ]]
+
+  handle_sleep_signal false >/dev/null
+  [[ "${suspended}" == false ]]
+  [[ "${inhibitor_pid}" != "${original_inhibitor}" ]]
+  is_owned_current_inhibitor "${inhibitor_pid}" "${inhibitor_start_time}"
+  is_same_process "${original_monitor}" "${monitor_start_time}"
+  is_running "${server_pid}"
+  cleanup >/dev/null
+  shutting_down=false
+}
+
+write_proc_record() {
+  local root="${1}" pid="${2}" name="${3}" parent="${4}" start="${5}" command="${6}"
+  local field
+  /usr/bin/mkdir -p "${root}/${pid}"
+  /usr/bin/printf '%s (%s) S %s' "${pid}" "${name}" "${parent}" >"${root}/${pid}/stat"
+  for field in {5..21}; do /usr/bin/printf ' 0' >>"${root}/${pid}/stat"; done
+  /usr/bin/printf ' %s\n' "${start}" >>"${root}/${pid}/stat"
+  /usr/bin/printf 'Name:\t%s\nPPid:\t%s\nUid:\t%s\t%s\t%s\t%s\n' \
+    "${name}" "${parent}" "$(/usr/bin/id -u)" "$(/usr/bin/id -u)" "$(/usr/bin/id -u)" "$(/usr/bin/id -u)" >"${root}/${pid}/status"
+  /usr/bin/printf '0::/test/session.slice\n' >"${root}/${pid}/cgroup"
+  /usr/bin/printf '%s' "${command}" | /usr/bin/sed 's/ /\x00/g' >"${root}/${pid}/cmdline"
+}
+
+test_stale_cleanup_eligibility_and_unrelated_preservation() {
+  local proc_fixture="${TEST_ROOT}/proc"
+  local ps_fixture="${TEST_ROOT}/ps-fixture"
+  local legacy_command='/usr/bin/systemd-inhibit --what=sleep --who=OpenRGB Presets --why=Stop OpenRGB before system sleep --mode=delay /usr/bin/sleep infinity'
+  local monitor_command='/usr/bin/gdbus monitor --system --dest org.freedesktop.login1 --object-path /org/freedesktop/login1'
+  local unrelated_command='/usr/bin/systemd-inhibit --what=sleep --who=Another App --why=Unrelated --mode=delay /usr/bin/sleep infinity'
+  write_proc_record "${proc_fixture}" 100 inhibitor 200 111 "${legacy_command}"
+  write_proc_record "${proc_fixture}" 101 inhibitor 200 112 "${unrelated_command}"
+  write_proc_record "${proc_fixture}" 102 gdbus 200 113 "${monitor_command}"
+  write_proc_record "${proc_fixture}" 200 systemd 1 222 '/usr/lib/systemd/systemd --user'
+  write_proc_record "${proc_fixture}" 300 lifecycle 400 333 '/usr/bin/bash /installed/openrgb-lifecycle'
+  /usr/bin/printf '%s\n' '#!/usr/bin/bash' 'while (( $# )); do if [[ "$1" == -p ]]; then shift; pid=$1; fi; shift; done' '/usr/bin/printf "%s\n" "${pid}"' >"${ps_fixture}"
+  /usr/bin/chmod 0755 "${ps_fixture}"
+
+  local stale_result stale_monitor_result unrelated_result
+  stale_result="$(/usr/bin/env PROC_ROOT="${proc_fixture}" PS_BIN="${ps_fixture}" \
+    INHIBIT_BIN=/usr/bin/systemd-inhibit INHIBIT_PROCESS_PREFIX=/usr/bin/systemd-inhibit \
+    GDBUS_BIN=/usr/bin/gdbus \
+    OPENRGB_RUNTIME_DIR="${TEST_ROOT}/classify-runtime" \
+    /usr/bin/bash "${REPOSITORY_ROOT}/openrgb-lifecycle" --classify-legacy-inhibitor 100 111 300 333)"
+  [[ "${stale_result}" == stale-legacy ]]
+  stale_monitor_result="$(/usr/bin/env PROC_ROOT="${proc_fixture}" PS_BIN="${ps_fixture}" \
+    INHIBIT_BIN=/usr/bin/systemd-inhibit INHIBIT_PROCESS_PREFIX=/usr/bin/systemd-inhibit \
+    GDBUS_BIN=/usr/bin/gdbus \
+    OPENRGB_RUNTIME_DIR="${TEST_ROOT}/classify-runtime" \
+    /usr/bin/bash "${REPOSITORY_ROOT}/openrgb-lifecycle" --classify-legacy-monitor 102 113 300 333 100 111)"
+  [[ "${stale_monitor_result}" == stale-legacy ]]
+  if unrelated_result="$(/usr/bin/env PROC_ROOT="${proc_fixture}" PS_BIN="${ps_fixture}" \
+    INHIBIT_BIN=/usr/bin/systemd-inhibit INHIBIT_PROCESS_PREFIX=/usr/bin/systemd-inhibit \
+    GDBUS_BIN=/usr/bin/gdbus \
+    OPENRGB_RUNTIME_DIR="${TEST_ROOT}/classify-runtime" \
+    /usr/bin/bash "${REPOSITORY_ROOT}/openrgb-lifecycle" --classify-legacy-inhibitor 101 112 300 333)"; then
+    return 1
+  fi
+  [[ "${unrelated_result}" == ineligible ]]
+}
+
+test_release_refuses_unrelated_process() {
+  /usr/bin/sleep 30 &
+  local unrelated_pid=$!
+  inhibitor_pid="${unrelated_pid}"
+  inhibitor_start_time="$(process_start_time "${unrelated_pid}")"
+  local output
+  output="$(release_inhibitor)"
+  [[ "${output}" == "Refusing to signal unrecognized inhibitor PID ${unrelated_pid}" ]]
+  kill -0 "${unrelated_pid}"
+  kill -TERM "${unrelated_pid}"
+  wait "${unrelated_pid}" 2>/dev/null || true
+}
+
+test_concurrent_lifecycle_startup_is_serialized() {
+  local first_marker="${TEST_ROOT}/owner-lock-first"
+  local second_marker="${TEST_ROOT}/owner-lock-second"
+  local first_owner first_inhibitor first_monitor
+  local second_pid
+  : >"${INHIBITOR_LAUNCHES}"
+  launch_owner graceful "${first_marker}"
+  read -r first_owner first_inhibitor first_monitor <"${first_marker}"
+  "${BASH_SOURCE[0]}" owner "${second_marker}" graceful &
+  second_pid=$!
+  if wait "${second_pid}"; then
+    return 1
+  else
+    [[ "$?" -eq 75 ]]
+  fi
+  [[ ! -e "${second_marker}" ]]
+  [[ "$(/usr/bin/wc -l <"${INHIBITOR_LAUNCHES}")" -eq 1 ]]
+  kill -TERM "${first_owner}"
+  wait "${first_owner}" 2>/dev/null || true
+  wait_for_exit "${first_inhibitor}"
+  wait_for_exit "${first_monitor}"
+}
+
+run_test 'initial inhibitor startup' test_initial_inhibitor_startup
+run_test 'repeated reconciliation reuses inhibitor' test_repeated_reconciliation_reuses_inhibitor
+run_test 'Quickshell restart does not accumulate inhibitors' test_quickshell_restart_does_not_accumulate
+run_test 'plugin lifecycle termination cleans children' test_plugin_lifecycle_termination_cleans_children
+run_test 'unexpected parent exit closes leases' test_unexpected_parent_exit_closes_leases
+run_test 'existing inhibitor reuse and replacement' test_inhibitor_replacement_after_release
+run_test 'suspend and resume reacquire one inhibitor' test_suspend_resume_preserves_monitor_and_reacquires
+run_test 'stale cleanup eligibility preserves unrelated inhibitors' test_stale_cleanup_eligibility_and_unrelated_preservation
+run_test 'release refuses unrelated process identity' test_release_refuses_unrelated_process
+run_test 'concurrent lifecycle startup is serialized' test_concurrent_lifecycle_startup_is_serialized
+
+[[ "${pass_count}" -eq 10 ]]
+/usr/bin/printf 'inhibitor lifecycle: PASS (%s cases)\n' "${pass_count}"

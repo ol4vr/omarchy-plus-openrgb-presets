@@ -64,6 +64,25 @@ inhibitor, waits three seconds for SMBus devices to settle, starts OpenRGB, and
 restores the saved preset. This prevents the running OpenRGB process from
 leaving the four Corsair DDR5 controllers inaccessible across sleep.
 
+One nonblocking per-user runtime lock admits only one lifecycle owner during
+plugin rescans or concurrent shell startup. The inhibitor and logind monitor
+are launched with Linux parent-death signals through the existing util-linux
+`setpriv` command. Normal shutdown still releases them explicitly; if the
+lifecycle is killed before its traps complete, the kernel sends each child
+`SIGTERM`. Child processes explicitly close the runtime lock descriptor, so an
+OpenRGB server, preset restoration, inhibitor, or monitor cannot accidentally
+retain lifecycle ownership.
+
+Legacy 0.3.x/0.4.0 inhibitors and logind monitors can be classified for
+one-time cleanup with the read-only `--classify-legacy-inhibitor` and
+`--classify-legacy-monitor` modes. They require the candidate and active
+lifecycle PIDs plus their `/proc` start-time tokens, and return `stale-legacy`
+only when the exact command, user, cgroup, and user-systemd parent all match.
+The inhibitor check also requires its expected process-group ownership; the
+monitor check requires a uniquely paired owned inhibitor from the same startup
+window. Every other process is ineligible. Cleanup still requires separate
+owner authorization and an immediate identity recheck.
+
 Every OpenRGB CLI and Effects SDK operation has a hard timeout. A stalled SDK
 connection therefore produces a bounded error instead of freezing the panel.
 
@@ -131,6 +150,7 @@ qmllint -I "$OMARCHY_PATH/shell" \
 /usr/bin/bash -n "$PLUGIN_DIR/install-effects-plugin"
 /usr/bin/python3 -m py_compile "$PLUGIN_DIR/effects-sdk"
 "$PLUGIN_DIR/tests/test-lifecycle-duplicate-prevention"
+"$PLUGIN_DIR/tests/test-lifecycle-inhibitors"
 /usr/bin/python3 "$PLUGIN_DIR/tests/test-presets.py"
 "$PLUGIN_DIR/openrgb-lifecycle" --check
 "$PLUGIN_DIR/apply-preset" --list
@@ -172,6 +192,15 @@ hugin-sunrise-red-black
 
 The four original bundled profile hashes are unchanged, so no existing Effects
 profile needs conversion or reconstruction.
+
+## Roll back the 0.4.1 lifecycle correction
+
+Redeploy exact 0.4.0 commit
+`a903531e6d0b743e83cd29a94b25d46a78a1495c`. The correction adds only an
+ephemeral lock file below `$XDG_RUNTIME_DIR/omarchy-plus/openrgb-presets`; it
+can be left for the next login or removed after the corrected lifecycle has
+stopped. Rolling back does not change presets, Effects profiles, OpenRGB
+configuration, or saved active-preset state.
 
 ## Remove
 

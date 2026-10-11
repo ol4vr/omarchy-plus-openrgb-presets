@@ -5,19 +5,30 @@ set -o nounset
 set -o pipefail
 
 readonly OPENRGB_BIN="${OPENRGB_BIN:-/usr/bin/openrgb}"
-readonly GDBUS_BIN="/usr/bin/gdbus"
-readonly STDBUF_BIN="/usr/bin/stdbuf"
-readonly INHIBIT_BIN="/usr/bin/systemd-inhibit"
-readonly SETSID_BIN="/usr/bin/setsid"
+readonly GDBUS_BIN="${GDBUS_BIN:-/usr/bin/gdbus}"
+readonly STDBUF_BIN="${STDBUF_BIN:-/usr/bin/stdbuf}"
+readonly INHIBIT_BIN="${INHIBIT_BIN:-/usr/bin/systemd-inhibit}"
+readonly INHIBIT_PROCESS_PREFIX="${INHIBIT_PROCESS_PREFIX:-${INHIBIT_BIN}}"
+readonly SETSID_BIN="${SETSID_BIN:-/usr/bin/setsid}"
+readonly SETPRIV_BIN="${SETPRIV_BIN:-/usr/bin/setpriv}"
 readonly SS_BIN="${SS_BIN:-/usr/bin/ss}"
 readonly PS_BIN="${PS_BIN:-/usr/bin/ps}"
 readonly TIMEOUT_BIN="${TIMEOUT_BIN:-/usr/bin/timeout}"
-readonly SLEEP_BIN="/usr/bin/sleep"
+readonly SLEEP_BIN="${SLEEP_BIN:-/usr/bin/sleep}"
+readonly CAT_BIN="${CAT_BIN:-/usr/bin/cat}"
+readonly FLOCK_BIN="${FLOCK_BIN:-/usr/bin/flock}"
+readonly MKDIR_BIN="${MKDIR_BIN:-/usr/bin/mkdir}"
+readonly TR_BIN="${TR_BIN:-/usr/bin/tr}"
+readonly PROC_ROOT="${PROC_ROOT:-/proc}"
 readonly SCRIPT_PATH="$(/usr/bin/readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_DIR="$(/usr/bin/dirname "${SCRIPT_PATH}")"
 readonly APPLY_PRESET="${APPLY_PRESET:-${SCRIPT_DIR}/apply-preset}"
+readonly USER_ID="${OPENRGB_USER_ID:-$(/usr/bin/id -u)}"
+readonly RUNTIME_DIR="${OPENRGB_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/run/user/${USER_ID}}/omarchy-plus/openrgb-presets}"
+readonly LIFECYCLE_LOCK_FILE="${RUNTIME_DIR}/lifecycle.lock"
+readonly USER_MANAGER_COMMAND="${USER_MANAGER_COMMAND:-/usr/lib/systemd/systemd --user}"
 readonly RESTORE_TIMEOUT="75s"
-readonly RESUME_DELAY="3"
+readonly RESUME_DELAY="${OPENRGB_RESUME_DELAY:-3}"
 readonly -a OPENRGB_SERVER_ARGS=(
   --noautoconnect
   --startminimized
@@ -29,8 +40,11 @@ readonly -a OPENRGB_SERVER_ARGS=(
 server_pid=''
 restore_pid=''
 inhibitor_pid=''
+inhibitor_start_time=''
 monitor_pid=''
+monitor_start_time=''
 monitor_fd=''
+lifecycle_lock_fd=''
 suspended=false
 shutting_down=false
 
@@ -41,6 +55,170 @@ log() {
 is_running() {
   local pid="${1:-}"
   [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null
+}
+
+process_start_time() {
+  local pid="${1:-}"
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ -r "${PROC_ROOT}/${pid}/stat" ]] || return 1
+  /usr/bin/awk '{print $22}' "${PROC_ROOT}/${pid}/stat"
+}
+
+is_same_process() {
+  local pid="${1:-}"
+  local expected_start="${2:-}"
+  local actual_start=''
+
+  [[ -n "${expected_start}" ]] || return 1
+  actual_start="$(process_start_time "${pid}" 2>/dev/null || true)"
+  [[ -n "${actual_start}" && "${actual_start}" == "${expected_start}" ]]
+}
+
+process_command() {
+  local pid="${1:-}"
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ -r "${PROC_ROOT}/${pid}/cmdline" ]] || return 1
+  "${TR_BIN}" '\0' ' ' <"${PROC_ROOT}/${pid}/cmdline" | /usr/bin/sed 's/ $//'
+}
+
+process_parent() {
+  local pid="${1:-}"
+  [[ -r "${PROC_ROOT}/${pid}/status" ]] || return 1
+  /usr/bin/awk '$1 == "PPid:" {print $2}' "${PROC_ROOT}/${pid}/status"
+}
+
+process_uid() {
+  local pid="${1:-}"
+  [[ -r "${PROC_ROOT}/${pid}/status" ]] || return 1
+  /usr/bin/awk '$1 == "Uid:" {print $2}' "${PROC_ROOT}/${pid}/status"
+}
+
+process_cgroup() {
+  local pid="${1:-}"
+  [[ -r "${PROC_ROOT}/${pid}/cgroup" ]] || return 1
+  "${CAT_BIN}" "${PROC_ROOT}/${pid}/cgroup"
+}
+
+process_group() {
+  local pid="${1:-}"
+  "${PS_BIN}" -p "${pid}" -o pgid= 2>/dev/null | /usr/bin/awk '{$1=$1; print}'
+}
+
+legacy_inhibitor_command() {
+  /usr/bin/printf '%s' "${INHIBIT_BIN} --what=sleep --who=OpenRGB Presets --why=Stop OpenRGB before system sleep --mode=delay ${SLEEP_BIN} infinity"
+}
+
+legacy_monitor_command() {
+  /usr/bin/printf '%s' "${GDBUS_BIN} monitor --system --dest org.freedesktop.login1 --object-path /org/freedesktop/login1"
+}
+
+current_inhibitor_command() {
+  /usr/bin/printf '%s' "${INHIBIT_PROCESS_PREFIX} --what=sleep --who=OpenRGB Presets --why=Stop OpenRGB before system sleep --mode=delay ${SETPRIV_BIN} --pdeathsig TERM ${SLEEP_BIN} infinity"
+}
+
+is_owned_current_inhibitor() {
+  local pid="${1:-}"
+  local start_time="${2:-}"
+  is_same_process "${pid}" "${start_time}" \
+    && [[ "$(process_command "${pid}" 2>/dev/null || true)" == "$(current_inhibitor_command)" ]] \
+    && [[ "$(process_group "${pid}" 2>/dev/null || true)" == "${pid}" ]]
+}
+
+classify_legacy_process() {
+  local candidate_pid="${1:-}"
+  local candidate_start="${2:-}"
+  local active_pid="${3:-}"
+  local active_start="${4:-}"
+  local expected_command="${5:-}"
+  local require_group_leader="${6:-false}"
+  local candidate_parent=''
+  local candidate_cgroup=''
+  local active_cgroup=''
+
+  if ! is_same_process "${candidate_pid}" "${candidate_start}" \
+    || ! is_same_process "${active_pid}" "${active_start}" \
+    || [[ "$(process_uid "${candidate_pid}" 2>/dev/null || true)" != "${USER_ID}" ]] \
+    || [[ "$(process_command "${candidate_pid}" 2>/dev/null || true)" != "${expected_command}" ]] \
+    || [[ "${require_group_leader}" == true \
+      && "$(process_group "${candidate_pid}" 2>/dev/null || true)" != "${candidate_pid}" ]]; then
+    /usr/bin/printf '%s\n' 'ineligible'
+    return 1
+  fi
+
+  candidate_cgroup="$(process_cgroup "${candidate_pid}" 2>/dev/null || true)"
+  active_cgroup="$(process_cgroup "${active_pid}" 2>/dev/null || true)"
+  if [[ -z "${candidate_cgroup}" || "${candidate_cgroup}" != "${active_cgroup}" ]]; then
+    /usr/bin/printf '%s\n' 'ineligible'
+    return 1
+  fi
+
+  candidate_parent="$(process_parent "${candidate_pid}" 2>/dev/null || true)"
+  if [[ "${candidate_parent}" == "${active_pid}" ]]; then
+    /usr/bin/printf '%s\n' 'legitimate'
+    return 0
+  fi
+  if [[ "$(process_command "${candidate_parent}" 2>/dev/null || true)" == "${USER_MANAGER_COMMAND}" ]]; then
+    /usr/bin/printf '%s\n' 'stale-legacy'
+    return 0
+  fi
+
+  /usr/bin/printf '%s\n' 'ineligible'
+  return 1
+}
+
+classify_legacy_inhibitor() {
+  classify_legacy_process "${1:-}" "${2:-}" "${3:-}" "${4:-}" \
+    "$(legacy_inhibitor_command)" true
+}
+
+classify_legacy_monitor() {
+  local monitor_pid="${1:-}"
+  local monitor_start="${2:-}"
+  local active_pid="${3:-}"
+  local active_start="${4:-}"
+  local inhibitor_candidate_pid="${5:-}"
+  local inhibitor_candidate_start="${6:-}"
+  local monitor_class=''
+  local inhibitor_class=''
+
+  monitor_class="$(classify_legacy_process \
+    "${monitor_pid}" "${monitor_start}" "${active_pid}" "${active_start}" \
+    "$(legacy_monitor_command)" false 2>/dev/null || true)"
+  inhibitor_class="$(classify_legacy_inhibitor \
+    "${inhibitor_candidate_pid}" "${inhibitor_candidate_start}" \
+    "${active_pid}" "${active_start}" 2>/dev/null || true)"
+
+  if [[ "${monitor_class}" != "${inhibitor_class}" \
+    || "${monitor_class}" != @(legitimate|stale-legacy) \
+    || ! "${monitor_start}" =~ ^[0-9]+$ \
+    || ! "${inhibitor_candidate_start}" =~ ^[0-9]+$ \
+    || "${monitor_start}" -lt "${inhibitor_candidate_start}" \
+    || $((monitor_start - inhibitor_candidate_start)) -gt 500 ]]; then
+    /usr/bin/printf '%s\n' 'ineligible'
+    return 1
+  fi
+
+  /usr/bin/printf '%s\n' "${monitor_class}"
+}
+
+close_fd() {
+  local fd="${1:-}"
+  [[ "${fd}" =~ ^[0-9]+$ ]] || return 0
+  eval "exec ${fd}>&-"
+}
+
+close_lock_for_child() {
+  close_fd "${lifecycle_lock_fd}"
+}
+
+acquire_lifecycle_lock() {
+  local old_umask
+  old_umask="$(umask)"
+  umask 077
+  "${MKDIR_BIN}" -p -- "${RUNTIME_DIR}"
+  exec {lifecycle_lock_fd}>"${LIFECYCLE_LOCK_FILE}"
+  umask "${old_umask}"
+  "${FLOCK_BIN}" -n "${lifecycle_lock_fd}"
 }
 
 stop_process() {
@@ -111,13 +289,19 @@ start_server() {
     server_pid="${existing_pid}"
     log "Reusing OpenRGB SDK server PID ${server_pid}"
   else
-    "${OPENRGB_BIN}" "${OPENRGB_SERVER_ARGS[@]}" &
+    (
+      close_lock_for_child
+      exec "${OPENRGB_BIN}" "${OPENRGB_SERVER_ARGS[@]}"
+    ) &
     server_pid=$!
     log "OpenRGB server started as PID ${server_pid}"
   fi
 
-  "${TIMEOUT_BIN}" --signal=TERM --kill-after=2s "${RESTORE_TIMEOUT}" \
-    "${APPLY_PRESET}" --restore &
+  (
+    close_lock_for_child
+    exec "${TIMEOUT_BIN}" --signal=TERM --kill-after=2s "${RESTORE_TIMEOUT}" \
+      "${APPLY_PRESET}" --restore
+  ) &
   restore_pid=$!
 }
 
@@ -130,30 +314,91 @@ stop_server() {
 }
 
 start_inhibitor() {
-  if is_running "${inhibitor_pid}"; then
+  local attempt
+
+  if is_owned_current_inhibitor "${inhibitor_pid}" "${inhibitor_start_time}"; then
     return 0
   fi
 
-  "${SETSID_BIN}" "${INHIBIT_BIN}" \
-    --what=sleep \
-    --who='OpenRGB Presets' \
-    --why='Stop OpenRGB before system sleep' \
-    --mode=delay \
-    "${SLEEP_BIN}" infinity &
+  inhibitor_pid=''
+  inhibitor_start_time=''
+
+  (
+    close_lock_for_child
+    exec "${SETPRIV_BIN}" --pdeathsig TERM "${SETSID_BIN}" "${INHIBIT_BIN}" \
+      --what=sleep \
+      --who='OpenRGB Presets' \
+      --why='Stop OpenRGB before system sleep' \
+      --mode=delay \
+      "${SETPRIV_BIN}" --pdeathsig TERM "${SLEEP_BIN}" infinity
+  ) &
   inhibitor_pid=$!
-  log "Sleep delay inhibitor started as process group ${inhibitor_pid}"
+  inhibitor_start_time="$(process_start_time "${inhibitor_pid}")"
+  for attempt in {1..20}; do
+    if is_owned_current_inhibitor "${inhibitor_pid}" "${inhibitor_start_time}"; then
+      log "Sleep delay inhibitor started as process group ${inhibitor_pid}"
+      return 0
+    fi
+    if ! is_same_process "${inhibitor_pid}" "${inhibitor_start_time}"; then
+      break
+    fi
+    "${SLEEP_BIN}" 0.05
+  done
+
+  if is_same_process "${inhibitor_pid}" "${inhibitor_start_time}"; then
+    stop_process "${inhibitor_pid}" "Unrecognized inhibitor"
+  else
+    wait "${inhibitor_pid}" 2>/dev/null || true
+  fi
+  inhibitor_pid=''
+  inhibitor_start_time=''
+  /usr/bin/printf '%s\n' 'Sleep delay inhibitor failed to start with the expected identity' >&2
+  return 1
 }
 
 release_inhibitor() {
-  if ! is_running "${inhibitor_pid}"; then
+  if ! is_owned_current_inhibitor "${inhibitor_pid}" "${inhibitor_start_time}"; then
+    if is_same_process "${inhibitor_pid}" "${inhibitor_start_time}"; then
+      log "Refusing to signal unrecognized inhibitor PID ${inhibitor_pid}"
+    fi
     inhibitor_pid=''
+    inhibitor_start_time=''
     return 0
   fi
 
-  kill -TERM -- "-${inhibitor_pid}" 2>/dev/null || true
-  wait "${inhibitor_pid}" 2>/dev/null || true
+  if is_owned_current_inhibitor "${inhibitor_pid}" "${inhibitor_start_time}"; then
+    kill -TERM -- "-${inhibitor_pid}" 2>/dev/null || true
+    wait "${inhibitor_pid}" 2>/dev/null || true
+  else
+    log "Refusing to signal changed inhibitor PID ${inhibitor_pid}"
+  fi
   log "Sleep delay inhibitor released"
   inhibitor_pid=''
+  inhibitor_start_time=''
+}
+
+start_monitor() {
+  coproc SLEEP_MONITOR {
+    close_lock_for_child
+    exec "${SETPRIV_BIN}" --pdeathsig TERM "${STDBUF_BIN}" -oL \
+      "${GDBUS_BIN}" monitor \
+      --system \
+      --dest org.freedesktop.login1 \
+      --object-path /org/freedesktop/login1
+  }
+  monitor_pid="${SLEEP_MONITOR_PID}"
+  monitor_start_time="$(process_start_time "${monitor_pid}")"
+  monitor_fd="${SLEEP_MONITOR[0]}"
+  log "logind sleep monitor started as PID ${monitor_pid}"
+}
+
+stop_monitor() {
+  if is_same_process "${monitor_pid}" "${monitor_start_time}"; then
+    stop_process "${monitor_pid}" "logind sleep monitor"
+  fi
+  monitor_pid=''
+  monitor_start_time=''
+  monitor_fd=''
 }
 
 handle_sleep_signal() {
@@ -188,10 +433,7 @@ cleanup() {
 
   stop_server
   release_inhibitor
-  if is_running "${monitor_pid}"; then
-    kill -TERM "${monitor_pid}" 2>/dev/null || true
-    wait "${monitor_pid}" 2>/dev/null || true
-  fi
+  stop_monitor
 }
 
 request_shutdown() {
@@ -205,8 +447,9 @@ check_dependencies() {
 
   for dependency in \
     "${OPENRGB_BIN}" "${GDBUS_BIN}" "${STDBUF_BIN}" "${INHIBIT_BIN}" \
-    "${SETSID_BIN}" "${SS_BIN}" "${PS_BIN}" "${TIMEOUT_BIN}" \
-    "${SLEEP_BIN}" "${APPLY_PRESET}"; do
+    "${SETSID_BIN}" "${SETPRIV_BIN}" "${SS_BIN}" "${PS_BIN}" "${TIMEOUT_BIN}" \
+    "${SLEEP_BIN}" "${CAT_BIN}" "${FLOCK_BIN}" "${MKDIR_BIN}" \
+    "${TR_BIN}" "${APPLY_PRESET}"; do
     if [[ ! -x "${dependency}" ]]; then
       /usr/bin/printf 'Missing executable: %s\n' "${dependency}" >&2
       failed=true
@@ -220,6 +463,24 @@ check_dependencies() {
 }
 
 main() {
+  if [[ "${1:-}" == '--classify-legacy-monitor' ]]; then
+    if [[ "${#}" -ne 7 ]]; then
+      /usr/bin/printf '%s\n' \
+        'Usage: openrgb-lifecycle --classify-legacy-monitor PID START_TIME ACTIVE_PID ACTIVE_START_TIME INHIBITOR_PID INHIBITOR_START_TIME' >&2
+      return 64
+    fi
+    classify_legacy_monitor "${2}" "${3}" "${4}" "${5}" "${6}" "${7}"
+    return
+  fi
+  if [[ "${1:-}" == '--classify-legacy-inhibitor' ]]; then
+    if [[ "${#}" -ne 5 ]]; then
+      /usr/bin/printf '%s\n' \
+        'Usage: openrgb-lifecycle --classify-legacy-inhibitor PID START_TIME ACTIVE_PID ACTIVE_START_TIME' >&2
+      return 64
+    fi
+    classify_legacy_inhibitor "${2}" "${3}" "${4}" "${5}"
+    return
+  fi
   if [[ "${1:-}" == '--check' ]]; then
     check_dependencies
     return 0
@@ -230,21 +491,17 @@ main() {
   fi
 
   check_dependencies >/dev/null
+  if ! acquire_lifecycle_lock; then
+    log 'Another OpenRGB lifecycle owns the runtime lock; retrying through the service supervisor'
+    return 75
+  fi
   trap cleanup EXIT
   trap request_shutdown INT TERM HUP
 
   start_inhibitor
   start_server
 
-  coproc SLEEP_MONITOR {
-    exec "${STDBUF_BIN}" -oL "${GDBUS_BIN}" monitor \
-      --system \
-      --dest org.freedesktop.login1 \
-      --object-path /org/freedesktop/login1
-  }
-  monitor_pid="${SLEEP_MONITOR_PID}"
-  monitor_fd="${SLEEP_MONITOR[0]}"
-  log "logind sleep monitor started as PID ${monitor_pid}"
+  start_monitor
 
   while true; do
     line=''
@@ -265,6 +522,14 @@ main() {
     if [[ -n "${restore_pid}" ]] && ! is_running "${restore_pid}"; then
       wait "${restore_pid}" 2>/dev/null || true
       restore_pid=''
+    fi
+
+    if [[ "${suspended}" == false ]] \
+      && ! is_owned_current_inhibitor "${inhibitor_pid}" "${inhibitor_start_time}"; then
+      /usr/bin/printf '%s\n' 'Sleep delay inhibitor exited unexpectedly; restarting' >&2
+      inhibitor_pid=''
+      inhibitor_start_time=''
+      start_inhibitor
     fi
 
     if [[ "${suspended}" == false ]] && ! is_running "${server_pid}"; then
