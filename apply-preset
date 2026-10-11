@@ -33,11 +33,15 @@ usage() {
     'Presets:' \
     '  deep-red' \
     '  bright-white' \
+    '  deep-blue' \
     '  animated-rainbow' \
     '  neon-rain' \
     '  aurora-comet' \
     '  spectrum-wave' \
+    '  matte-black-orange' \
     '  electric-sunrise' \
+    '  horde-red' \
+    '  alliance-blue' \
     '  black'
 }
 
@@ -45,17 +49,21 @@ list_presets() {
   /usr/bin/printf '%s\n' \
     'deep-red' \
     'bright-white' \
+    'deep-blue' \
     'animated-rainbow' \
     'neon-rain' \
     'aurora-comet' \
     'spectrum-wave' \
+    'matte-black-orange' \
     'electric-sunrise' \
+    'horde-red' \
+    'alliance-blue' \
     'black'
 }
 
 is_preset() {
   case "${1}" in
-    deep-red|bright-white|animated-rainbow|neon-rain|aurora-comet|spectrum-wave|electric-sunrise|black) return 0 ;;
+    deep-red|bright-white|deep-blue|animated-rainbow|neon-rain|aurora-comet|spectrum-wave|matte-black-orange|electric-sunrise|horde-red|alliance-blue|black) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -64,11 +72,15 @@ preset_label() {
   case "${1}" in
     deep-red) /usr/bin/printf '%s' 'Deep Red' ;;
     bright-white) /usr/bin/printf '%s' 'Bright White' ;;
+    deep-blue) /usr/bin/printf '%s' 'Deep Blue' ;;
     animated-rainbow) /usr/bin/printf '%s' 'Animated Rainbow' ;;
     neon-rain) /usr/bin/printf '%s' 'Neon Rain' ;;
     aurora-comet) /usr/bin/printf '%s' 'Aurora Comet' ;;
     spectrum-wave) /usr/bin/printf '%s' 'Spectrum Wave' ;;
+    matte-black-orange) /usr/bin/printf '%s' 'Matte Black Orange' ;;
     electric-sunrise) /usr/bin/printf '%s' 'Electric Sunrise' ;;
+    horde-red) /usr/bin/printf '%s' 'Horde Red' ;;
+    alliance-blue) /usr/bin/printf '%s' 'Alliance Blue' ;;
     black) /usr/bin/printf '%s' 'Black (Turn Off RGB)' ;;
   esac
 }
@@ -228,6 +240,10 @@ apply_preset() {
       stop_effects
       apply_static FFFFFF FFFFFF 2020FF FFFFFF
       ;;
+    deep-blue)
+      stop_effects
+      apply_static 4000FF 4000FF 4000FF 4000FF
+      ;;
     animated-rainbow)
       stop_effects
       apply_rainbow
@@ -241,8 +257,17 @@ apply_preset() {
     spectrum-wave)
       apply_effects_profile hugin-rainbow-wave 'Rainbow Wave'
       ;;
+    matte-black-orange)
+      apply_effects_profile hugin-sunrise-orange-black 'Sunrise'
+      ;;
     electric-sunrise)
       apply_effects_profile hugin-sunrise-blue-red 'Sunrise'
+      ;;
+    horde-red)
+      apply_effects_profile hugin-sunrise-red-black 'Sunrise'
+      ;;
+    alliance-blue)
+      apply_effects_profile hugin-sunrise-blue-black 'Sunrise'
       ;;
     black)
       stop_effects

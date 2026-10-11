@@ -35,6 +35,14 @@ Panel {
       swatches: ["#8B0000", "#A00000", "#5C0000"]
     },
     {
+      id: "deep-blue",
+      label: "Deep Blue",
+      kind: "STATIC",
+      detail: "ELECTRIC BLUE",
+      accent: "#4000FF",
+      swatches: ["#4000FF"]
+    },
+    {
       id: "bright-white",
       label: "Bright White",
       kind: "STATIC",
@@ -83,12 +91,36 @@ Panel {
       swatches: ["#4000FF", "#FF003C", "#FF4400"]
     },
     {
+      id: "matte-black-orange",
+      label: "Matte Black Orange",
+      kind: "EFFECTS",
+      detail: "ORANGE · BLACK",
+      accent: "#FF4400",
+      swatches: ["#FF4400", "#000000"]
+    },
+    {
       id: "black",
       label: "Black (Turn Off RGB)",
       kind: "OFF",
       detail: "ALL CONTROLLERS",
       accent: "#565F89",
       swatches: ["#000000", "#101018", "#20202A"]
+    },
+    {
+      id: "horde-red",
+      label: "Horde Red",
+      kind: "EFFECTS",
+      detail: "RED · BLACK",
+      accent: "#8B0000",
+      swatches: ["#8B0000", "#000000"]
+    },
+    {
+      id: "alliance-blue",
+      label: "Alliance Blue",
+      kind: "EFFECTS",
+      detail: "BLUE · BLACK",
+      accent: "#4000FF",
+      swatches: ["#4000FF", "#000000"]
     }
   ]
 
@@ -129,6 +161,25 @@ Panel {
   function selectPreset(index) {
     if (index < 0 || index >= presets.length) return
     selectedIndex = index
+  }
+
+  function moveSelection(dx, dy) {
+    if (dy === 0) {
+      selectPreset((selectedIndex + dx + presets.length) % presets.length)
+      return
+    }
+
+    var columns = 2
+    var rows = Math.ceil(presets.length / columns)
+    var column = selectedIndex % columns
+    var row = Math.floor(selectedIndex / columns)
+    var nextRow = (row + dy + rows) % rows
+    var nextIndex = nextRow * columns + column
+    while (nextIndex >= presets.length) {
+      nextRow = (nextRow + dy + rows) % rows
+      nextIndex = nextRow * columns + column
+    }
+    selectPreset(nextIndex)
   }
 
   function applySelectedPreset() {
@@ -235,9 +286,8 @@ Panel {
       id: keyCatcher
       anchors.fill: parent
       onMoveRequested: function(dx, dy) {
-        var delta = dy !== 0 ? dy * 2 : dx
-        if (delta === 0) return
-        root.selectPreset((root.selectedIndex + delta + root.presets.length) % root.presets.length)
+        if (dx === 0 && dy === 0) return
+        root.moveSelection(dx, dy)
       }
       onActivateRequested: root.applySelectedPreset()
       onCloseRequested: root.close()

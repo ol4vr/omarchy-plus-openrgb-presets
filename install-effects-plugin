@@ -15,14 +15,20 @@ readonly -a PROFILE_NAMES=(
   hugin-rain
   hugin-rainbow-comet
   hugin-rainbow-wave
+  hugin-sunrise-blue-black
   hugin-sunrise-blue-red
+  hugin-sunrise-orange-black
+  hugin-sunrise-red-black
 )
 
 declare -Ar PROFILE_SHA256=(
   [hugin-rain]="d730f06b7c90d7051ac94e48de674829ed87bbac107a43981c8f84b93d955ebe"
   [hugin-rainbow-comet]="4f3b61a63086f5d98c07354d912cb82c987dde178c28ad95a54010e807f3f84f"
   [hugin-rainbow-wave]="fe977da32d9f8dbb9babd4d8dfc146b7d586aa00d477a56a635118a7b5c64cc9"
+  [hugin-sunrise-blue-black]="8378b809fe260da6cd9367175f63844d125f1e513c1a78c76a25b74ed60f741e"
   [hugin-sunrise-blue-red]="dc42def0e003f7e24993584d4db7f50f021922a0574b6b722ffa16dfa931cb06"
+  [hugin-sunrise-orange-black]="a399f5183e3fe581c469e2374d8f8c40c5c1f276b1be3190138c2941066b8adf"
+  [hugin-sunrise-red-black]="462f97b82efae0b8b3b2f1da5a72a87d719c3f8f017d824cf51604606b6cd499"
 )
 
 usage() {

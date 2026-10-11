@@ -6,18 +6,26 @@ hardware-animated, and synchronized OpenRGB Effects presets.
 ## Presets
 
 - **Deep Red** — calibrated static red.
+- **Deep Blue** — static Electric Sunrise blue (`#4000FF`) on every controller.
 - **Bright White** — static white with ST100 logo compensation.
 - **Animated Rainbow** — controller-native animation with an ST100 fallback.
 - **Neon Rain** — synchronized five-color Rain effect.
 - **Aurora Comet** — synchronized green Comet effect.
 - **Spectrum Wave** — synchronized Rainbow Wave effect.
+- **Matte Black Orange** — Electric Sunrise motion using `#FF4400` and off.
 - **Electric Sunrise** — synchronized blue, violet, red, and orange Sunrise effect.
+- **Horde Red** — Electric Sunrise motion using Deep Red `#8B0000` and off.
+- **Alliance Blue** — Electric Sunrise motion using `#4000FF` and off.
 - **Black (Turn Off RGB)** — stops active effects and sends black to every controller.
 
-The four synchronized presets are stored as reviewed Hugin Effects profiles in
+The seven synchronized presets are stored as reviewed Hugin Effects profiles in
 `effects-profiles/`. Static and hardware presets stop every active software
 effect before changing controller modes, preventing an old effect thread from
 overwriting the selected state.
+
+The panel library uses six complete two-column rows: Deep Red / Deep Blue,
+Bright White / Animated Rainbow, Neon Rain / Aurora Comet, Spectrum Wave /
+Electric Sunrise, Matte Black Orange / Black, and Horde Red / Alliance Blue.
 
 ## Hardware contract
 
@@ -82,7 +90,7 @@ SHA256: 2f3c2b3c2c850e7148b4aa459bd41ccf9c56bd26fd00809fa19126ac5ad8dbc0
 Source: https://openrgb.org/plugin_effects.html
 ```
 
-After reviewing and downloading that artifact, install it and the four bundled
+After reviewing and downloading that artifact, install it and the seven bundled
 profiles with:
 
 ```bash
@@ -101,7 +109,7 @@ user-provided commands. Its standard logind delay inhibitor only delays sleep
 long enough to terminate its own OpenRGB child. The SDK server accepts
 connections only from Hugin's loopback interface.
 
-`apply-preset` accepts only the eight fixed identifiers listed by
+`apply-preset` accepts only the twelve fixed identifiers listed by
 `apply-preset --list`. It serializes changes with a private advisory lock and
 records the latest OpenRGB or Effects SDK diagnostic output at:
 
@@ -123,10 +131,13 @@ qmllint -I "$OMARCHY_PATH/shell" \
 /usr/bin/bash -n "$PLUGIN_DIR/install-effects-plugin"
 /usr/bin/python3 -m py_compile "$PLUGIN_DIR/effects-sdk"
 "$PLUGIN_DIR/tests/test-lifecycle-duplicate-prevention"
+/usr/bin/python3 "$PLUGIN_DIR/tests/test-presets.py"
 "$PLUGIN_DIR/openrgb-lifecycle" --check
 "$PLUGIN_DIR/apply-preset" --list
 "$PLUGIN_DIR/apply-preset" --dry-run black
 "$PLUGIN_DIR/apply-preset" --dry-run spectrum-wave
+"$PLUGIN_DIR/apply-preset" --dry-run matte-black-orange
+"$PLUGIN_DIR/apply-preset" --dry-run deep-blue
 ```
 
 ## Install
@@ -144,6 +155,23 @@ Time, with the panel opening below the widget.
 When enabled, the service performs one background scan and restores the last
 successful preset. The fallback for a missing state file is Bright White. The
 removed Tokyo Night Purple identifier migrates to Bright White.
+
+## Roll back to 0.3.1
+
+Before rolling back a deployed 0.4.0 installation, select one of the 0.3.1
+presets if a new preset is active. Redeploy exact commit
+`9063fce3a48912326eb6e8e024b36d48d420a8f5`, run its reviewed Effects
+installer, and remove only these 0.4.0 profile files from the installed Effects
+profile directory:
+
+```text
+hugin-sunrise-blue-black
+hugin-sunrise-orange-black
+hugin-sunrise-red-black
+```
+
+The four original bundled profile hashes are unchanged, so no existing Effects
+profile needs conversion or reconstruction.
 
 ## Remove
 
