@@ -4,18 +4,27 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-readonly OPENRGB_BIN="/usr/bin/openrgb"
+readonly OPENRGB_BIN="${OPENRGB_BIN:-/usr/bin/openrgb}"
 readonly GDBUS_BIN="/usr/bin/gdbus"
 readonly STDBUF_BIN="/usr/bin/stdbuf"
 readonly INHIBIT_BIN="/usr/bin/systemd-inhibit"
 readonly SETSID_BIN="/usr/bin/setsid"
-readonly TIMEOUT_BIN="/usr/bin/timeout"
+readonly SS_BIN="${SS_BIN:-/usr/bin/ss}"
+readonly PS_BIN="${PS_BIN:-/usr/bin/ps}"
+readonly TIMEOUT_BIN="${TIMEOUT_BIN:-/usr/bin/timeout}"
 readonly SLEEP_BIN="/usr/bin/sleep"
 readonly SCRIPT_PATH="$(/usr/bin/readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_DIR="$(/usr/bin/dirname "${SCRIPT_PATH}")"
-readonly APPLY_PRESET="${SCRIPT_DIR}/apply-preset"
+readonly APPLY_PRESET="${APPLY_PRESET:-${SCRIPT_DIR}/apply-preset}"
 readonly RESTORE_TIMEOUT="75s"
 readonly RESUME_DELAY="3"
+readonly -a OPENRGB_SERVER_ARGS=(
+  --noautoconnect
+  --startminimized
+  --server
+  --server-host 127.0.0.1
+  --server-port 6742
+)
 
 server_pid=''
 restore_pid=''
@@ -65,19 +74,47 @@ stop_restore() {
   restore_pid=''
 }
 
+find_existing_server() {
+  local listener=''
+  local pid=''
+  local command=''
+  local expected_command="${OPENRGB_BIN} ${OPENRGB_SERVER_ARGS[*]}"
+
+  listener="$("${SS_BIN}" -H -ltnp 'sport = :6742' 2>/dev/null \
+    | /usr/bin/awk '$4 == "127.0.0.1:6742" && index($0, "users:((\"openrgb\",pid=") {print}')"
+  if [[ -z "${listener}" || "${listener}" == *$'\n'* ]]; then
+    return 1
+  fi
+
+  pid="$(/usr/bin/printf '%s\n' "${listener}" \
+    | /usr/bin/sed -nE 's/.*pid=([0-9]+).*/\1/p')"
+  if [[ -z "${pid}" ]] || ! is_running "${pid}"; then
+    return 1
+  fi
+
+  command="$("${PS_BIN}" -ww -p "${pid}" -o args= 2>/dev/null || true)"
+  if [[ "${command}" != "${expected_command}" ]]; then
+    return 1
+  fi
+
+  /usr/bin/printf '%s' "${pid}"
+}
+
 start_server() {
+  local existing_pid=''
+
   if is_running "${server_pid}"; then
     return 0
   fi
 
-  "${OPENRGB_BIN}" \
-    --noautoconnect \
-    --startminimized \
-    --server \
-    --server-host 127.0.0.1 \
-    --server-port 6742 &
-  server_pid=$!
-  log "OpenRGB server started as PID ${server_pid}"
+  if existing_pid="$(find_existing_server)"; then
+    server_pid="${existing_pid}"
+    log "Reusing OpenRGB SDK server PID ${server_pid}"
+  else
+    "${OPENRGB_BIN}" "${OPENRGB_SERVER_ARGS[@]}" &
+    server_pid=$!
+    log "OpenRGB server started as PID ${server_pid}"
+  fi
 
   "${TIMEOUT_BIN}" --signal=TERM --kill-after=2s "${RESTORE_TIMEOUT}" \
     "${APPLY_PRESET}" --restore &
@@ -168,7 +205,8 @@ check_dependencies() {
 
   for dependency in \
     "${OPENRGB_BIN}" "${GDBUS_BIN}" "${STDBUF_BIN}" "${INHIBIT_BIN}" \
-    "${SETSID_BIN}" "${TIMEOUT_BIN}" "${SLEEP_BIN}" "${APPLY_PRESET}"; do
+    "${SETSID_BIN}" "${SS_BIN}" "${PS_BIN}" "${TIMEOUT_BIN}" \
+    "${SLEEP_BIN}" "${APPLY_PRESET}"; do
     if [[ ! -x "${dependency}" ]]; then
       /usr/bin/printf 'Missing executable: %s\n' "${dependency}" >&2
       failed=true
@@ -239,4 +277,6 @@ main() {
   done
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

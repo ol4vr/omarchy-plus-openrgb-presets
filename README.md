@@ -40,9 +40,11 @@ RAM modules and one each of the GPU, ST100, and motherboard.
 ## Runtime architecture
 
 The Omarchy service starts `openrgb-lifecycle`, which owns one GUI-capable
-OpenRGB process minimized in the background. It performs the slow hardware scan
-once, loads the Effects Plugin, and exposes the SDK only on `127.0.0.1:6742`.
-The service then restores the last successful preset after the SDK and accepted
+OpenRGB process minimized in the background. Before launching OpenRGB, the
+lifecycle reuses the existing `127.0.0.1:6742` listener only when its owner has
+the exact accepted OpenRGB server command. It performs the slow hardware scan
+once, loads the Effects Plugin, and exposes the SDK only on loopback. The
+service then restores the last successful preset after the SDK and accepted
 controllers become ready. Preset changes normally take about one second rather
 than repeating the hardware scan.
 
@@ -120,6 +122,7 @@ qmllint -I "$OMARCHY_PATH/shell" \
 /usr/bin/bash -n "$PLUGIN_DIR/openrgb-lifecycle"
 /usr/bin/bash -n "$PLUGIN_DIR/install-effects-plugin"
 /usr/bin/python3 -m py_compile "$PLUGIN_DIR/effects-sdk"
+"$PLUGIN_DIR/tests/test-lifecycle-duplicate-prevention"
 "$PLUGIN_DIR/openrgb-lifecycle" --check
 "$PLUGIN_DIR/apply-preset" --list
 "$PLUGIN_DIR/apply-preset" --dry-run black

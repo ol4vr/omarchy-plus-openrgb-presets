@@ -1,0 +1,79 @@
+#!/usr/bin/bash
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+readonly REPOSITORY_ROOT="$(/usr/bin/readlink -f "$(/usr/bin/dirname "${BASH_SOURCE[0]}")/..")"
+readonly TEST_ROOT="$(/usr/bin/mktemp -d)"
+readonly LAUNCH_MARKER="${TEST_ROOT}/openrgb-launched"
+readonly OUTPUT_FILE="${TEST_ROOT}/lifecycle-output"
+
+existing_pid=''
+test_cleanup() {
+  if [[ -n "${existing_pid}" ]]; then
+    kill "${existing_pid}" 2>/dev/null || true
+    wait "${existing_pid}" 2>/dev/null || true
+  fi
+  /usr/bin/rm -rf -- "${TEST_ROOT}"
+}
+trap test_cleanup EXIT
+
+/usr/bin/mkdir -p "${TEST_ROOT}/bin"
+
+/usr/bin/sleep 30 &
+existing_pid=$!
+
+OPENRGB_TEST_PID="${existing_pid}"
+OPENRGB_TEST_COMMAND="${TEST_ROOT}/bin/openrgb --noautoconnect --startminimized --server --server-host 127.0.0.1 --server-port 6742"
+export OPENRGB_TEST_PID OPENRGB_TEST_COMMAND LAUNCH_MARKER
+
+for command in openrgb ss ps timeout apply-preset; do
+  /usr/bin/install -m 0755 /dev/null "${TEST_ROOT}/bin/${command}"
+done
+
+{
+  /usr/bin/printf '%s\n' '#!/usr/bin/bash'
+  /usr/bin/printf '%s\n' '/usr/bin/printf "%s\\n" launched >"${LAUNCH_MARKER}"'
+} >"${TEST_ROOT}/bin/openrgb"
+{
+  /usr/bin/printf '%s\n' '#!/usr/bin/bash'
+  /usr/bin/printf '%s\n' '/usr/bin/printf '\''LISTEN 0 10 127.0.0.1:6742 0.0.0.0:* users:(("openrgb",pid=%s,fd=5))\\n'\'' "${OPENRGB_TEST_PID}"'
+} >"${TEST_ROOT}/bin/ss"
+{
+  /usr/bin/printf '%s\n' '#!/usr/bin/bash'
+  /usr/bin/printf '%s\n' '/usr/bin/printf "%s\\n" "${OPENRGB_TEST_COMMAND}"'
+} >"${TEST_ROOT}/bin/ps"
+{
+  /usr/bin/printf '%s\n' '#!/usr/bin/bash'
+  /usr/bin/printf '%s\n' 'exit 0'
+} >"${TEST_ROOT}/bin/timeout"
+{
+  /usr/bin/printf '%s\n' '#!/usr/bin/bash'
+  /usr/bin/printf '%s\n' 'exit 0'
+} >"${TEST_ROOT}/bin/apply-preset"
+/usr/bin/chmod 0755 "${TEST_ROOT}/bin/"*
+
+OPENRGB_BIN="${TEST_ROOT}/bin/openrgb"
+SS_BIN="${TEST_ROOT}/bin/ss"
+PS_BIN="${TEST_ROOT}/bin/ps"
+TIMEOUT_BIN="${TEST_ROOT}/bin/timeout"
+APPLY_PRESET="${TEST_ROOT}/bin/apply-preset"
+export OPENRGB_BIN SS_BIN PS_BIN TIMEOUT_BIN APPLY_PRESET
+
+# shellcheck source=../openrgb-lifecycle
+source "${REPOSITORY_ROOT}/openrgb-lifecycle"
+
+start_server >"${OUTPUT_FILE}"
+wait "${restore_pid}" 2>/dev/null || true
+server_pid=''
+restore_pid=''
+start_server >>"${OUTPUT_FILE}"
+wait "${restore_pid}" 2>/dev/null || true
+output="$(<"${OUTPUT_FILE}")"
+
+[[ "${server_pid}" == "${existing_pid}" ]]
+[[ "${output}" == $'Reusing OpenRGB SDK server PID '"${existing_pid}"$'\nReusing OpenRGB SDK server PID '"${existing_pid}" ]]
+[[ ! -e "${LAUNCH_MARKER}" ]]
+
+/usr/bin/printf '%s\n' 'duplicate prevention: PASS'
