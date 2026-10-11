@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused source-only validation for OpenRGB Presets 0.4.0."""
+"""Focused source-only validation for OpenRGB Presets 0.4.2."""
 
 from __future__ import annotations
 
@@ -27,18 +27,21 @@ ORIGINAL_PROFILE_HASHES = {
     "hugin-sunrise-blue-red": "dc42def0e003f7e24993584d4db7f50f021922a0574b6b722ffa16dfa931cb06",
 }
 NEW_PROFILES = {
-    "hugin-sunrise-orange-black": (
-        [0xFF4400, 0x000000],
-        "a399f5183e3fe581c469e2374d8f8c40c5c1f276b1be3190138c2941066b8adf",
-    ),
-    "hugin-sunrise-blue-black": (
-        [0x4000FF, 0x000000],
-        "8378b809fe260da6cd9367175f63844d125f1e513c1a78c76a25b74ed60f741e",
-    ),
-    "hugin-sunrise-red-black": (
-        [0x8B0000, 0x000000],
-        "462f97b82efae0b8b3b2f1da5a72a87d719c3f8f017d824cf51604606b6cd499",
-    ),
+    "hugin-sunrise-orange-black": {
+        "human_rgb": ["#FF4400", "#000000"],
+        "packed_rgbcolor": [17663, 0],
+        "sha256": "cb4cba768dfb838407f31adcfc29c48fcac9f9174bd71d66894d71f881d6eecf",
+    },
+    "hugin-sunrise-blue-black": {
+        "human_rgb": ["#4000FF", "#000000"],
+        "packed_rgbcolor": [16711744, 0],
+        "sha256": "b157ec0dd7646d2bdd90f6f2a7f4819d83bf4b293c9753543b859c691235a38b",
+    },
+    "hugin-sunrise-red-black": {
+        "human_rgb": ["#8B0000", "#000000"],
+        "packed_rgbcolor": [139, 0],
+        "sha256": "acb22e80bd049e654b6879a9e3d95e288aac5869556575e9cc1c2b105db1d425",
+    },
 }
 VISIBLE_ORDER = [
     "deep-red",
@@ -78,33 +81,50 @@ def load_profile(name: str) -> dict[str, object]:
     return json.loads((PROFILES / name).read_text(encoding="utf-8"))
 
 
+def pack_rgbcolor(human_rgb: str) -> int:
+    """Convert human #RRGGBB notation to OpenRGB's packed 0x00BBGGRR."""
+    red = int(human_rgb[1:3], 16)
+    green = int(human_rgb[3:5], 16)
+    blue = int(human_rgb[5:7], 16)
+    return red | (green << 8) | (blue << 16)
+
+
 class PresetTests(unittest.TestCase):
     def test_original_effects_profiles_are_byte_identical(self) -> None:
         for name, expected_hash in ORIGINAL_PROFILE_HASHES.items():
             self.assertEqual(sha256(PROFILES / name), expected_hash, name)
 
+    def test_human_rgb_is_packed_as_openrgb_rgbcolor(self) -> None:
+        for name, specification in NEW_PROFILES.items():
+            self.assertEqual(
+                [pack_rgbcolor(color) for color in specification["human_rgb"]],
+                specification["packed_rgbcolor"],
+                name,
+            )
+
     def test_new_profiles_clone_electric_sunrise_except_for_two_colors(self) -> None:
         original = load_profile("hugin-sunrise-blue-red")
         original_effect = original["Effects"][0]
-        self.assertEqual(original_effect["UserColors"], [0x4000FF, 0x5100FF, 0xFF003C, 0xFF4400])
+        self.assertEqual(original_effect["UserColors"], [4194559, 5308671, 16711740, 16729088])
 
-        for name, (colors, expected_hash) in NEW_PROFILES.items():
+        for name, specification in NEW_PROFILES.items():
+            packed_colors = specification["packed_rgbcolor"]
             profile = load_profile(name)
             expected = copy.deepcopy(original)
-            expected["Effects"][0]["UserColors"] = colors
+            expected["Effects"][0]["UserColors"] = packed_colors
             self.assertEqual(profile, expected, name)
-            self.assertEqual(profile["Effects"][0]["UserColors"], colors, name)
+            self.assertEqual(profile["Effects"][0]["UserColors"], packed_colors, name)
             self.assertEqual(profile["Effects"][0]["ControllerZones"], original_effect["ControllerZones"], name)
             self.assertEqual(len(profile["Effects"][0]["ControllerZones"]), 10, name)
             self.assertEqual(profile["Effects"][0]["EffectClassName"], "Sunrise", name)
             self.assertEqual(profile["Effects"][0]["CustomSettings"], original_effect["CustomSettings"], name)
             self.assertEqual(profile["Effects"][0]["Speed"], original_effect["Speed"], name)
             self.assertEqual(profile["Effects"][0]["FPS"], original_effect["FPS"], name)
-            self.assertEqual(sha256(PROFILES / name), expected_hash, name)
+            self.assertEqual(sha256(PROFILES / name), specification["sha256"], name)
 
     def test_manifest_and_panel_order(self) -> None:
         manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.4.1")
+        self.assertEqual(manifest["version"], "0.4.2")
 
         panel = PANEL.read_text(encoding="utf-8")
         library = panel.split(
@@ -242,8 +262,8 @@ class PresetTests(unittest.TestCase):
 
         for name, expected_hash in ORIGINAL_PROFILE_HASHES.items():
             self.assertIn(f'[{name}]="{expected_hash}"', installer)
-        for name, (_, expected_hash) in NEW_PROFILES.items():
-            self.assertIn(f'[{name}]="{expected_hash}"', installer)
+        for name, specification in NEW_PROFILES.items():
+            self.assertIn(f'[{name}]="{specification["sha256"]}"', installer)
 
 
 if __name__ == "__main__":

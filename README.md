@@ -23,6 +23,11 @@ The seven synchronized presets are stored as reviewed Hugin Effects profiles in
 effect before changing controller modes, preventing an old effect thread from
 overwriting the selected state.
 
+Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
+`UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order;
+the orange, blue, and red Sunrise palettes are therefore stored as `17663`,
+`16711744`, and `139`, respectively.
+
 The panel library uses six complete two-column rows: Deep Red / Deep Blue,
 Bright White / Animated Rainbow, Neon Rain / Aurora Comet, Spectrum Wave /
 Electric Sunrise, Matte Black Orange / Black, and Horde Red / Alliance Blue.
@@ -201,6 +206,14 @@ ephemeral lock file below `$XDG_RUNTIME_DIR/omarchy-plus/openrgb-presets`; it
 can be left for the next login or removed after the corrected lifecycle has
 stopped. Rolling back does not change presets, Effects profiles, OpenRGB
 configuration, or saved active-preset state.
+
+## Roll back the 0.4.2 palette correction
+
+Redeploy exact 0.4.1 commit
+`ec74773e02d20d8d31550627d71f7524ae543789` and run its reviewed Effects
+installer. This restores only the previous stored color values and release
+metadata; it does not change the accepted panel layout, lifecycle behavior,
+controller assignments, or saved active-preset state.
 
 ## Remove
 
