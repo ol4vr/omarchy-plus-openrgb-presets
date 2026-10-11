@@ -94,9 +94,9 @@ Panel {
       id: "matte-black-orange",
       label: "Matte Black Orange",
       kind: "EFFECTS",
-      detail: "ORANGE · AMBER",
+      detail: "ORANGE · RED · BURNT",
       accent: "#FF4400",
-      swatches: ["#FF4400", "#FF8800"]
+      swatches: ["#FF4400", "#E83B00", "#C92B00"]
     },
     {
       id: "black",
@@ -110,17 +110,17 @@ Panel {
       id: "horde-red",
       label: "Horde Red",
       kind: "EFFECTS",
-      detail: "DEEP RED · DARK RED",
+      detail: "RED · DEEP · DARK",
       accent: "#8B0000",
-      swatches: ["#8B0000", "#4A0000"]
+      swatches: ["#8B0000", "#680000", "#4A0000"]
     },
     {
       id: "alliance-blue",
       label: "Alliance Blue",
       kind: "EFFECTS",
-      detail: "BLUE · BLACK",
+      detail: "BLUE · MID · DARK",
       accent: "#0033AA",
-      swatches: ["#0033AA", "#000000"]
+      swatches: ["#0033AA", "#002788", "#001A66"]
     }
   ]
 

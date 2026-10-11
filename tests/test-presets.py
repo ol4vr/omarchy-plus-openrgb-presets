@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused source-only validation for OpenRGB Presets 0.4.3."""
+"""Focused source-only validation for OpenRGB Presets 0.4.4."""
 
 from __future__ import annotations
 
@@ -28,40 +28,40 @@ ORIGINAL_PROFILE_HASHES = {
 }
 NEW_PROFILES = {
     "hugin-sunrise-orange-black": {
-        "human_rgb": ["#FF4400", "#FF8800"],
-        "packed_rgbcolor": [17663, 35071],
-        "sha256": "1b1f366e6a5327711eb92ba6965fc8064417883295e2f0aadca1c21fd7827915",
+        "human_rgb": ["#FF4400", "#E83B00", "#C92B00", "#E83B00"],
+        "packed_rgbcolor": [17663, 15336, 11209, 15336],
+        "sha256": "1c4e48c63383206f8262ff0ba51aea7412d6d81c6ef47b57162854f0ea8aceb3",
     },
     "hugin-sunrise-blue-black": {
-        "human_rgb": ["#0033AA", "#000000"],
-        "packed_rgbcolor": [11154176, 0],
-        "sha256": "2b74a9f096630ca6b68a893de6658bfbdec77d2b94a19eedb3becc0c2bf88317",
+        "human_rgb": ["#0033AA", "#002788", "#001A66", "#002788"],
+        "packed_rgbcolor": [11154176, 8922880, 6691328, 8922880],
+        "sha256": "7f5f217bdd8216d38901670e8eabe60845c031c399ecb01ae0c75f4831675b2e",
     },
     "hugin-sunrise-red-black": {
-        "human_rgb": ["#8B0000", "#4A0000"],
-        "packed_rgbcolor": [139, 74],
-        "sha256": "86fe0ce00eafe0ad3786c86b8418f6f36eddd1e818cd34f762d2a357a576f9ac",
+        "human_rgb": ["#8B0000", "#680000", "#4A0000", "#680000"],
+        "packed_rgbcolor": [139, 104, 74, 104],
+        "sha256": "2e121548e40910da6df8e1a425ef0c4fd41dfdb56533c7262098cd7ed3034bd6",
     },
 }
 PANEL_INDICATORS = {
     "deep-blue": ("STATIC", "DEEP BLUE", "#0033AA", ["#0033AA"]),
     "matte-black-orange": (
         "EFFECTS",
-        "ORANGE · AMBER",
+        "ORANGE · RED · BURNT",
         "#FF4400",
-        ["#FF4400", "#FF8800"],
+        ["#FF4400", "#E83B00", "#C92B00"],
     ),
     "horde-red": (
         "EFFECTS",
-        "DEEP RED · DARK RED",
+        "RED · DEEP · DARK",
         "#8B0000",
-        ["#8B0000", "#4A0000"],
+        ["#8B0000", "#680000", "#4A0000"],
     ),
     "alliance-blue": (
         "EFFECTS",
-        "BLUE · BLACK",
+        "BLUE · MID · DARK",
         "#0033AA",
-        ["#0033AA", "#000000"],
+        ["#0033AA", "#002788", "#001A66"],
     ),
 }
 VISIBLE_ORDER = [
@@ -139,7 +139,7 @@ class PresetTests(unittest.TestCase):
                 name,
             )
 
-    def test_new_profiles_clone_electric_sunrise_except_for_two_colors(self) -> None:
+    def test_new_profiles_clone_electric_sunrise_except_for_four_colors(self) -> None:
         original = load_profile("hugin-sunrise-blue-red")
         original_effect = original["Effects"][0]
         self.assertEqual(original_effect["UserColors"], [4194559, 5308671, 16711740, 16729088])
@@ -151,6 +151,8 @@ class PresetTests(unittest.TestCase):
             expected["Effects"][0]["UserColors"] = packed_colors
             self.assertEqual(profile, expected, name)
             self.assertEqual(profile["Effects"][0]["UserColors"], packed_colors, name)
+            self.assertEqual(len(profile["Effects"][0]["UserColors"]), 4, name)
+            self.assertNotIn(0, profile["Effects"][0]["UserColors"], name)
             self.assertEqual(profile["Effects"][0]["ControllerZones"], original_effect["ControllerZones"], name)
             self.assertEqual(len(profile["Effects"][0]["ControllerZones"]), 10, name)
             self.assertEqual(profile["Effects"][0]["EffectClassName"], "Sunrise", name)
@@ -161,7 +163,7 @@ class PresetTests(unittest.TestCase):
 
     def test_manifest_and_panel_order(self) -> None:
         manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.4.3")
+        self.assertEqual(manifest["version"], "0.4.4")
 
         panel = PANEL.read_text(encoding="utf-8")
         library = panel.split(
