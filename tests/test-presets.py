@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused source-only validation for OpenRGB Presets 0.4.4."""
+"""Focused source-only validation for OpenRGB Presets 0.4.5."""
 
 from __future__ import annotations
 
@@ -28,19 +28,22 @@ ORIGINAL_PROFILE_HASHES = {
 }
 NEW_PROFILES = {
     "hugin-sunrise-orange-black": {
-        "human_rgb": ["#FF4400", "#E83B00", "#C92B00", "#E83B00"],
-        "packed_rgbcolor": [17663, 15336, 11209, 15336],
-        "sha256": "1c4e48c63383206f8262ff0ba51aea7412d6d81c6ef47b57162854f0ea8aceb3",
+        "human_rgb": ["#FF4400", "#E83B00", "#C92B00", "#501000"],
+        "packed_rgbcolor": [17663, 15336, 11209, 4176],
+        "v044_packed_rgbcolor": [17663, 15336, 11209, 15336],
+        "sha256": "7c568e6d66b1d0bec7e5d542cc7c2ed90add36a73b7596a6c33ccbacd319b41f",
     },
     "hugin-sunrise-blue-black": {
-        "human_rgb": ["#0033AA", "#002788", "#001A66", "#002788"],
-        "packed_rgbcolor": [11154176, 8922880, 6691328, 8922880],
-        "sha256": "7f5f217bdd8216d38901670e8eabe60845c031c399ecb01ae0c75f4831675b2e",
+        "human_rgb": ["#0033AA", "#002788", "#001A66", "#000B22"],
+        "packed_rgbcolor": [11154176, 8922880, 6691328, 2231040],
+        "v044_packed_rgbcolor": [11154176, 8922880, 6691328, 8922880],
+        "sha256": "0498bcb01a53c37a4d64b5ea33e9a7ffbe206f30584d78464aa1cbbd2ee36780",
     },
     "hugin-sunrise-red-black": {
-        "human_rgb": ["#8B0000", "#680000", "#4A0000", "#680000"],
-        "packed_rgbcolor": [139, 104, 74, 104],
-        "sha256": "2e121548e40910da6df8e1a425ef0c4fd41dfdb56533c7262098cd7ed3034bd6",
+        "human_rgb": ["#8B0000", "#680000", "#4A0000", "#180000"],
+        "packed_rgbcolor": [139, 104, 74, 24],
+        "v044_packed_rgbcolor": [139, 104, 74, 104],
+        "sha256": "b1dd58fe5810389a353016eeacc1a36016908f5377ec9860df83d82b2fe77194",
     },
 }
 PANEL_INDICATORS = {
@@ -153,6 +156,9 @@ class PresetTests(unittest.TestCase):
             self.assertEqual(profile["Effects"][0]["UserColors"], packed_colors, name)
             self.assertEqual(len(profile["Effects"][0]["UserColors"]), 4, name)
             self.assertNotIn(0, profile["Effects"][0]["UserColors"], name)
+            previous_colors = specification["v044_packed_rgbcolor"]
+            self.assertEqual(packed_colors[:3], previous_colors[:3], name)
+            self.assertNotEqual(packed_colors[3], previous_colors[3], name)
             self.assertEqual(profile["Effects"][0]["ControllerZones"], original_effect["ControllerZones"], name)
             self.assertEqual(len(profile["Effects"][0]["ControllerZones"]), 10, name)
             self.assertEqual(profile["Effects"][0]["EffectClassName"], "Sunrise", name)
@@ -163,7 +169,7 @@ class PresetTests(unittest.TestCase):
 
     def test_manifest_and_panel_order(self) -> None:
         manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.4.4")
+        self.assertEqual(manifest["version"], "0.4.5")
 
         panel = PANEL.read_text(encoding="utf-8")
         library = panel.split(

@@ -12,10 +12,10 @@ hardware-animated, and synchronized OpenRGB Effects presets.
 - **Neon Rain** — synchronized five-color Rain effect.
 - **Aurora Comet** — synchronized green Comet effect.
 - **Spectrum Wave** — synchronized Rainbow Wave effect.
-- **Matte Black Orange** — Electric Sunrise motion using `#FF4400`, `#E83B00`, and `#C92B00`.
+- **Matte Black Orange** — Electric Sunrise motion using `#FF4400`, `#E83B00`, `#C92B00`, and `#501000`.
 - **Electric Sunrise** — synchronized blue, violet, red, and orange Sunrise effect.
-- **Horde Red** — Electric Sunrise motion using `#8B0000`, `#680000`, and `#4A0000`.
-- **Alliance Blue** — Electric Sunrise motion using `#0033AA`, `#002788`, and `#001A66`.
+- **Horde Red** — Electric Sunrise motion using `#8B0000`, `#680000`, `#4A0000`, and `#180000`.
+- **Alliance Blue** — Electric Sunrise motion using `#0033AA`, `#002788`, `#001A66`, and `#000B22`.
 - **Black (Turn Off RGB)** — stops active effects and sends black to every controller.
 
 The seven synchronized presets are stored as reviewed Hugin Effects profiles in
@@ -26,14 +26,14 @@ overwriting the selected state.
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
 The experimental orange, blue, and red Sunrise gradients are therefore stored
-as `[17663, 15336, 11209, 15336]`,
-`[11154176, 8922880, 6691328, 8922880]`, and `[139, 104, 74, 104]`,
+as `[17663, 15336, 11209, 4176]`,
+`[11154176, 8922880, 6691328, 2231040]`, and `[139, 104, 74, 24]`,
 respectively.
 
 Effects Plugin 1.0rc2's Sunrise implementation always renders four gradient
-stops. Each experimental profile now supplies all four explicitly, returning
-the final stop to its middle shade rather than relying on zero-valued black
-padding. FPS, speed, motion, intensity, radius, timing, and controller
+stops. Each experimental profile supplies all four explicitly, with a darker
+same-hue final stop for stronger visible motion without relying on zero-valued
+black padding. FPS, speed, motion, intensity, radius, timing, and controller
 assignments remain identical to Electric Sunrise.
 
 The panel library uses six complete two-column rows: Deep Red / Deep Blue,
@@ -239,6 +239,15 @@ installer. This restores only the three prior two-color profile palettes,
 their panel indicators, and release metadata without changing Deep Blue,
 Electric Sunrise, the accepted layout, lifecycle behavior, controller
 assignments, or saved preset.
+
+## Roll back the 0.4.5 darker gradient endpoints
+
+Redeploy exact 0.4.4 commit
+`ce587ab09de1d434809653b911a7bac22c067ea9` and run its reviewed Effects
+installer. This restores only the prior fourth color in each experimental
+Sunrise profile and its release metadata without changing the first three
+colors, animation settings, controller assignments, panel layout, lifecycle
+behavior, or saved preset.
 
 ## Remove
 
