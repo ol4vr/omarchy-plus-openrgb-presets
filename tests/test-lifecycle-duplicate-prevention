@@ -6,74 +6,302 @@ set -o pipefail
 
 readonly REPOSITORY_ROOT="$(/usr/bin/readlink -f "$(/usr/bin/dirname "${BASH_SOURCE[0]}")/..")"
 readonly TEST_ROOT="$(/usr/bin/mktemp -d)"
-readonly LAUNCH_MARKER="${TEST_ROOT}/openrgb-launched"
-readonly OUTPUT_FILE="${TEST_ROOT}/lifecycle-output"
+readonly PROC_FIXTURE="${TEST_ROOT}/proc"
+readonly BIN_DIR="${TEST_ROOT}/bin"
+readonly LISTENER_STATE="${TEST_ROOT}/listener"
+readonly SIGNAL_LOG="${TEST_ROOT}/signals"
 
-existing_pid=''
 test_cleanup() {
-  if [[ -n "${existing_pid}" ]]; then
-    kill "${existing_pid}" 2>/dev/null || true
-    wait "${existing_pid}" 2>/dev/null || true
-  fi
   /usr/bin/rm -rf -- "${TEST_ROOT}"
 }
 trap test_cleanup EXIT
 
-/usr/bin/mkdir -p "${TEST_ROOT}/bin"
+/usr/bin/mkdir -p "${PROC_FIXTURE}" "${BIN_DIR}" "${TEST_ROOT}/runtime"
+: >"${LISTENER_STATE}"
+: >"${SIGNAL_LOG}"
 
-/usr/bin/sleep 30 &
-existing_pid=$!
-
-OPENRGB_TEST_PID="${existing_pid}"
-OPENRGB_TEST_COMMAND="${TEST_ROOT}/bin/openrgb --noautoconnect --startminimized --server --server-host 127.0.0.1 --server-port 6742"
-export OPENRGB_TEST_PID OPENRGB_TEST_COMMAND LAUNCH_MARKER
-
-for command in openrgb ss ps timeout apply-preset; do
-  /usr/bin/install -m 0755 /dev/null "${TEST_ROOT}/bin/${command}"
+for command in openrgb apply-preset timeout; do
+  /usr/bin/install -m 0755 /dev/null "${BIN_DIR}/${command}"
 done
 
-{
-  /usr/bin/printf '%s\n' '#!/usr/bin/bash'
-  /usr/bin/printf '%s\n' '/usr/bin/printf "%s\\n" launched >"${LAUNCH_MARKER}"'
-} >"${TEST_ROOT}/bin/openrgb"
-{
-  /usr/bin/printf '%s\n' '#!/usr/bin/bash'
-  /usr/bin/printf '%s\n' '/usr/bin/printf '\''LISTEN 0 10 127.0.0.1:6742 0.0.0.0:* users:(("openrgb",pid=%s,fd=5))\\n'\'' "${OPENRGB_TEST_PID}"'
-} >"${TEST_ROOT}/bin/ss"
-{
-  /usr/bin/printf '%s\n' '#!/usr/bin/bash'
-  /usr/bin/printf '%s\n' '/usr/bin/printf "%s\\n" "${OPENRGB_TEST_COMMAND}"'
-} >"${TEST_ROOT}/bin/ps"
-{
-  /usr/bin/printf '%s\n' '#!/usr/bin/bash'
-  /usr/bin/printf '%s\n' 'exit 0'
-} >"${TEST_ROOT}/bin/timeout"
-{
-  /usr/bin/printf '%s\n' '#!/usr/bin/bash'
-  /usr/bin/printf '%s\n' 'exit 0'
-} >"${TEST_ROOT}/bin/apply-preset"
-/usr/bin/chmod 0755 "${TEST_ROOT}/bin/"*
+/usr/bin/printf '%s\n' \
+  '#!/usr/bin/bash' \
+  'pid="$(<"${LISTENER_STATE}")"' \
+  'if [[ "${pid}" =~ ^[1-9][0-9]*$ ]]; then' \
+  '  /usr/bin/printf '\''LISTEN 0 10 127.0.0.1:6742 0.0.0.0:* users:(("openrgb",pid=%s,fd=5))\n'\'' "${pid}"' \
+  'fi' >"${BIN_DIR}/ss"
+/usr/bin/chmod 0755 "${BIN_DIR}/ss"
 
-OPENRGB_BIN="${TEST_ROOT}/bin/openrgb"
-SS_BIN="${TEST_ROOT}/bin/ss"
-PS_BIN="${TEST_ROOT}/bin/ps"
-TIMEOUT_BIN="${TEST_ROOT}/bin/timeout"
-APPLY_PRESET="${TEST_ROOT}/bin/apply-preset"
-export OPENRGB_BIN SS_BIN PS_BIN TIMEOUT_BIN APPLY_PRESET
+export OPENRGB_BIN="${BIN_DIR}/openrgb"
+export SS_BIN="${BIN_DIR}/ss"
+export TIMEOUT_BIN="${BIN_DIR}/timeout"
+export APPLY_PRESET="${BIN_DIR}/apply-preset"
+export PROC_ROOT="${PROC_FIXTURE}"
+export OPENRGB_RUNTIME_DIR="${TEST_ROOT}/runtime"
+export OPENRGB_SERVER_LOG="${TEST_ROOT}/openrgb-server.log"
+export LISTENER_STATE
 
 # shellcheck source=../openrgb-lifecycle
 source "${REPOSITORY_ROOT}/openrgb-lifecycle"
 
-start_server >"${OUTPUT_FILE}"
-wait "${restore_pid}" 2>/dev/null || true
-server_pid=''
-restore_pid=''
-start_server >>"${OUTPUT_FILE}"
-wait "${restore_pid}" 2>/dev/null || true
-output="$(<"${OUTPUT_FILE}")"
+launch_count=0
+restore_count=0
+next_pid=5000
+next_start=9000
 
-[[ "${server_pid}" == "${existing_pid}" ]]
-[[ "${output}" == $'Reusing OpenRGB SDK server PID '"${existing_pid}"$'\nReusing OpenRGB SDK server PID '"${existing_pid}" ]]
-[[ ! -e "${LAUNCH_MARKER}" ]]
+write_server_process() {
+  local pid="${1}"
+  local start_time="${2}"
+  local command
+  local field
 
-/usr/bin/printf '%s\n' 'duplicate prevention: PASS'
+  command="$(expected_server_command)"
+  /usr/bin/mkdir -p "${PROC_FIXTURE}/${pid}"
+  /usr/bin/printf '%s (openrgb) S 1' "${pid}" >"${PROC_FIXTURE}/${pid}/stat"
+  for field in {5..21}; do
+    /usr/bin/printf ' 0' >>"${PROC_FIXTURE}/${pid}/stat"
+  done
+  /usr/bin/printf ' %s\n' "${start_time}" >>"${PROC_FIXTURE}/${pid}/stat"
+  /usr/bin/printf '%s' "${command}" | /usr/bin/tr ' ' '\0' >"${PROC_FIXTURE}/${pid}/cmdline"
+}
+
+set_listener() {
+  /usr/bin/printf '%s' "${1:-}" >"${LISTENER_STATE}"
+}
+
+remove_server_process() {
+  local pid="${1}"
+  /usr/bin/rm -rf -- "${PROC_FIXTURE:?}/${pid}"
+  if [[ "$(<"${LISTENER_STATE}")" == "${pid}" ]]; then
+    set_listener ''
+  fi
+}
+
+# Signal-free process model. All lifecycle signal requests are recorded and
+# reflected into the private /proc fixture instead of reaching a real process.
+kill() {
+  local operation="${1:-}"
+  local pid="${2:-}"
+
+  if [[ "${operation}" == -0 ]]; then
+    [[ -d "${PROC_FIXTURE}/${pid}" ]]
+    return
+  fi
+  [[ "${operation}" == @(-TERM|-KILL) && "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  /usr/bin/printf '%s %s\n' "${operation}" "${pid}" >>"${SIGNAL_LOG}"
+  remove_server_process "${pid}"
+}
+
+launch_server() {
+  next_pid=$((next_pid + 1))
+  next_start=$((next_start + 1))
+  launch_count=$((launch_count + 1))
+  server_pid="${next_pid}"
+  server_start_time="${next_start}"
+  server_origin='launched'
+  write_server_process "${server_pid}" "${server_start_time}"
+  set_listener "${server_pid}"
+}
+
+start_restore() {
+  restore_count=$((restore_count + 1))
+  restore_pid=''
+}
+
+stop_restore() {
+  restore_pid=''
+}
+
+start_inhibitor() {
+  inhibitor_pid='mock-inhibitor'
+  inhibitor_start_time='mock-start'
+}
+
+release_inhibitor() {
+  inhibitor_pid=''
+  inhibitor_start_time=''
+}
+
+stop_monitor() {
+  monitor_pid=''
+  monitor_start_time=''
+  monitor_fd=''
+}
+
+reset_lifecycle_state() {
+  clear_server_identity
+  restore_pid=''
+  inhibitor_pid=''
+  inhibitor_start_time=''
+  monitor_pid=''
+  monitor_start_time=''
+  monitor_fd=''
+  suspended=false
+  shutting_down=false
+}
+
+reset_fixture() {
+  /usr/bin/rm -rf -- "${PROC_FIXTURE:?}/"*
+  set_listener ''
+  : >"${SIGNAL_LOG}"
+  reset_lifecycle_state
+  launch_count=0
+  restore_count=0
+}
+
+adopt_fixture_server() {
+  local pid="${1}"
+  local start_time="${2}"
+  write_server_process "${pid}" "${start_time}"
+  set_listener "${pid}"
+  start_server >/dev/null
+  [[ "${server_pid}" == "${pid}" ]]
+  [[ "${server_start_time}" == "${start_time}" ]]
+  [[ "${server_origin}" == adopted ]]
+}
+
+pass_count=0
+run_test() {
+  local name="${1}"
+  shift
+  reset_fixture
+  "$@"
+  pass_count=$((pass_count + 1))
+  /usr/bin/printf 'PASS: %s\n' "${name}"
+}
+
+test_adopted_server_survives_handoff() {
+  adopt_fixture_server 4101 8101
+  cleanup handoff >/dev/null
+  [[ -d "${PROC_FIXTURE}/4101" ]]
+  [[ "$(<"${LISTENER_STATE}")" == 4101 ]]
+  [[ ! -s "${SIGNAL_LOG}" ]]
+  [[ "${server_origin}" == none ]]
+}
+
+test_successor_adopts_same_identity() {
+  adopt_fixture_server 4102 8102
+  cleanup handoff >/dev/null
+  shutting_down=false
+  start_server >/dev/null
+  [[ "${server_pid}" == 4102 ]]
+  [[ "${server_start_time}" == 8102 ]]
+  [[ "${server_origin}" == adopted ]]
+  [[ "${launch_count}" -eq 0 ]]
+}
+
+test_lifecycle_owned_server_survives_and_is_adopted() {
+  start_server >/dev/null
+  local owned_pid="${server_pid}"
+  local owned_start="${server_start_time}"
+  [[ "${server_origin}" == launched ]]
+  cleanup handoff >/dev/null
+  [[ -d "${PROC_FIXTURE}/${owned_pid}" ]]
+  [[ ! -s "${SIGNAL_LOG}" ]]
+
+  shutting_down=false
+  start_server >/dev/null
+  [[ "${server_pid}" == "${owned_pid}" ]]
+  [[ "${server_start_time}" == "${owned_start}" ]]
+  [[ "${server_origin}" == adopted ]]
+  [[ "${launch_count}" -eq 1 ]]
+}
+
+test_suspend_stops_adopted_and_resume_starts_one() {
+  adopt_fixture_server 4103 8103
+  handle_sleep_signal true >/dev/null
+  [[ "${suspended}" == true ]]
+  [[ "$(<"${SIGNAL_LOG}")" == '-TERM 4103' ]]
+  [[ ! -d "${PROC_FIXTURE}/4103" ]]
+  [[ "${server_origin}" == none ]]
+
+  handle_sleep_signal false >/dev/null
+  [[ "${suspended}" == false ]]
+  [[ "${launch_count}" -eq 1 ]]
+  [[ "${server_origin}" == launched ]]
+  [[ "$(<"${LISTENER_STATE}")" == "${server_pid}" ]]
+}
+
+test_pid_reuse_prevents_signaling() {
+  adopt_fixture_server 4104 8104
+  write_server_process 4104 9999
+  if ! stop_server suspend >/dev/null; then
+    return 1
+  fi
+  [[ ! -s "${SIGNAL_LOG}" ]]
+  [[ -d "${PROC_FIXTURE}/4104" ]]
+  [[ "${server_origin}" == none ]]
+}
+
+test_listener_mismatch_prevents_signaling() {
+  adopt_fixture_server 4105 8105
+  write_server_process 4106 8106
+  set_listener 4106
+  if stop_server suspend >/dev/null; then
+    return 1
+  fi
+  [[ ! -s "${SIGNAL_LOG}" ]]
+  [[ -d "${PROC_FIXTURE}/4105" ]]
+  [[ "${server_pid}" == 4105 ]]
+  [[ "${server_start_time}" == 8105 ]]
+}
+
+test_command_mismatch_prevents_signaling() {
+  adopt_fixture_server 4108 8108
+  /usr/bin/printf '%s' '/usr/bin/unrelated --server' \
+    | /usr/bin/tr ' ' '\0' >"${PROC_FIXTURE}/4108/cmdline"
+  if stop_server suspend >/dev/null; then
+    return 1
+  fi
+  [[ ! -s "${SIGNAL_LOG}" ]]
+  [[ -d "${PROC_FIXTURE}/4108" ]]
+  [[ "${server_pid}" == 4108 ]]
+  [[ "${server_start_time}" == 8108 ]]
+}
+
+test_repeated_handoffs_do_not_duplicate() {
+  start_server >/dev/null
+  local original_pid="${server_pid}"
+  local original_start="${server_start_time}"
+  local reload
+  for reload in {1..5}; do
+    cleanup handoff >/dev/null
+    shutting_down=false
+    start_server >/dev/null
+    [[ "${server_pid}" == "${original_pid}" ]]
+    [[ "${server_start_time}" == "${original_start}" ]]
+  done
+  [[ "${launch_count}" -eq 1 ]]
+  [[ ! -s "${SIGNAL_LOG}" ]]
+}
+
+test_duplicate_start_reuses_listener() {
+  adopt_fixture_server 4107 8107
+  start_server >/dev/null
+  [[ "${server_pid}" == 4107 ]]
+  [[ "${server_start_time}" == 8107 ]]
+  [[ "${launch_count}" -eq 0 ]]
+}
+
+test_deliberate_cleanup_stops_verified_server() {
+  start_server >/dev/null
+  local owned_pid="${server_pid}"
+  cleanup deliberate >/dev/null
+  [[ "$(<"${SIGNAL_LOG}")" == "-TERM ${owned_pid}" ]]
+  [[ ! -d "${PROC_FIXTURE}/${owned_pid}" ]]
+  [[ "${server_origin}" == none ]]
+}
+
+run_test 'adopted SDK survives ordinary lifecycle cleanup' test_adopted_server_survives_handoff
+run_test 'successor adopts the same PID and start-time identity' test_successor_adopts_same_identity
+run_test 'lifecycle-owned SDK survives shell handoff' test_lifecycle_owned_server_survives_and_is_adopted
+run_test 'suspend stops adopted SDK and resume restores exactly one' test_suspend_stops_adopted_and_resume_starts_one
+run_test 'PID reuse prevents signaling' test_pid_reuse_prevents_signaling
+run_test 'listener ownership mismatch prevents signaling' test_listener_mismatch_prevents_signaling
+run_test 'command identity mismatch prevents signaling' test_command_mismatch_prevents_signaling
+run_test 'repeated shell reloads do not launch duplicates' test_repeated_handoffs_do_not_duplicate
+run_test 'existing duplicate-server prevention remains active' test_duplicate_start_reuses_listener
+run_test 'deliberate cleanup stops only the verified SDK' test_deliberate_cleanup_stops_verified_server
+
+[[ "${pass_count}" -eq 10 ]]
+/usr/bin/printf 'SDK ownership lifecycle: PASS (%s signal-free cases)\n' "${pass_count}"

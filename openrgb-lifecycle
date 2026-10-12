@@ -26,6 +26,7 @@ readonly APPLY_PRESET="${APPLY_PRESET:-${SCRIPT_DIR}/apply-preset}"
 readonly USER_ID="${OPENRGB_USER_ID:-$(/usr/bin/id -u)}"
 readonly RUNTIME_DIR="${OPENRGB_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/run/user/${USER_ID}}/omarchy-plus/openrgb-presets}"
 readonly LIFECYCLE_LOCK_FILE="${RUNTIME_DIR}/lifecycle.lock"
+readonly SERVER_LOG_FILE="${OPENRGB_SERVER_LOG:-${RUNTIME_DIR}/openrgb-server.log}"
 readonly USER_MANAGER_COMMAND="${USER_MANAGER_COMMAND:-/usr/lib/systemd/systemd --user}"
 readonly RESTORE_TIMEOUT="75s"
 readonly RESUME_DELAY="${OPENRGB_RESUME_DELAY:-3}"
@@ -38,6 +39,8 @@ readonly -a OPENRGB_SERVER_ARGS=(
 )
 
 server_pid=''
+server_start_time=''
+server_origin='none'
 restore_pid=''
 inhibitor_pid=''
 inhibitor_start_time=''
@@ -252,11 +255,13 @@ stop_restore() {
   restore_pid=''
 }
 
-find_existing_server() {
+expected_server_command() {
+  /usr/bin/printf '%s' "${OPENRGB_BIN} ${OPENRGB_SERVER_ARGS[*]}"
+}
+
+listener_owner_pid() {
   local listener=''
   local pid=''
-  local command=''
-  local expected_command="${OPENRGB_BIN} ${OPENRGB_SERVER_ARGS[*]}"
 
   listener="$("${SS_BIN}" -H -ltnp 'sport = :6742' 2>/dev/null \
     | /usr/bin/awk '$4 == "127.0.0.1:6742" && index($0, "users:((\"openrgb\",pid=") {print}')"
@@ -266,37 +271,80 @@ find_existing_server() {
 
   pid="$(/usr/bin/printf '%s\n' "${listener}" \
     | /usr/bin/sed -nE 's/.*pid=([0-9]+).*/\1/p')"
-  if [[ -z "${pid}" ]] || ! is_running "${pid}"; then
-    return 1
-  fi
-
-  command="$("${PS_BIN}" -ww -p "${pid}" -o args= 2>/dev/null || true)"
-  if [[ "${command}" != "${expected_command}" ]]; then
+  if [[ -z "${pid}" ]]; then
     return 1
   fi
 
   /usr/bin/printf '%s' "${pid}"
 }
 
-start_server() {
-  local existing_pid=''
+is_server_process() {
+  local pid="${1:-}"
+  local start_time="${2:-}"
+
+  is_same_process "${pid}" "${start_time}" \
+    && [[ "$(process_command "${pid}" 2>/dev/null || true)" == "$(expected_server_command)" ]]
+}
+
+is_server_listener() {
+  local pid="${1:-}"
+  local start_time="${2:-}"
+  local owner=''
+
+  is_server_process "${pid}" "${start_time}" || return 1
+  owner="$(listener_owner_pid 2>/dev/null || true)"
+  [[ "${owner}" == "${pid}" ]] || return 1
+  is_server_process "${pid}" "${start_time}" || return 1
+  [[ "$(listener_owner_pid 2>/dev/null || true)" == "${pid}" ]]
+}
+
+find_existing_server() {
+  local pid=''
+  local start_time=''
+
+  pid="$(listener_owner_pid 2>/dev/null || true)"
+  [[ -n "${pid}" ]] || return 1
+  start_time="$(process_start_time "${pid}" 2>/dev/null || true)"
+  [[ -n "${start_time}" ]] || return 1
+  is_server_listener "${pid}" "${start_time}" || return 1
+
+  /usr/bin/printf '%s %s\n' "${pid}" "${start_time}"
+}
+
+clear_server_identity() {
+  server_pid=''
+  server_start_time=''
+  server_origin='none'
+}
+
+launch_server() {
+  local attempt
+
+  (
+    close_lock_for_child
+    exec "${OPENRGB_BIN}" "${OPENRGB_SERVER_ARGS[@]}" >>"${SERVER_LOG_FILE}" 2>&1
+  ) &
+  server_pid=$!
+  server_start_time=''
+  server_origin='launched'
+
+  for attempt in {1..20}; do
+    server_start_time="$(process_start_time "${server_pid}" 2>/dev/null || true)"
+    if [[ -n "${server_start_time}" ]]; then
+      log "OpenRGB server started as PID ${server_pid} (start ${server_start_time})"
+      return 0
+    fi
+    "${SLEEP_BIN}" 0.05
+  done
 
   if is_running "${server_pid}"; then
-    return 0
+    log "Refusing to track OpenRGB PID ${server_pid} without a start-time identity"
   fi
+  clear_server_identity
+  return 1
+}
 
-  if existing_pid="$(find_existing_server)"; then
-    server_pid="${existing_pid}"
-    log "Reusing OpenRGB SDK server PID ${server_pid}"
-  else
-    (
-      close_lock_for_child
-      exec "${OPENRGB_BIN}" "${OPENRGB_SERVER_ARGS[@]}"
-    ) &
-    server_pid=$!
-    log "OpenRGB server started as PID ${server_pid}"
-  fi
-
+start_restore() {
   (
     close_lock_for_child
     exec "${TIMEOUT_BIN}" --signal=TERM --kill-after=2s "${RESTORE_TIMEOUT}" \
@@ -305,12 +353,79 @@ start_server() {
   restore_pid=$!
 }
 
-stop_server() {
-  stop_restore
-  if is_running "${server_pid}"; then
-    stop_process "${server_pid}" "OpenRGB server"
+start_server() {
+  local existing_pid=''
+  local existing_start_time=''
+
+  if is_server_listener "${server_pid}" "${server_start_time}"; then
+    return 0
   fi
-  server_pid=''
+
+  if is_server_process "${server_pid}" "${server_start_time}"; then
+    log "Refusing to replace tracked OpenRGB PID ${server_pid}: listener ownership is not verified"
+    return 1
+  fi
+  clear_server_identity
+
+  if read -r existing_pid existing_start_time < <(find_existing_server); then
+    server_pid="${existing_pid}"
+    server_start_time="${existing_start_time}"
+    server_origin='adopted'
+    log "Reusing OpenRGB SDK server PID ${server_pid} (start ${server_start_time})"
+  else
+    launch_server
+  fi
+
+  start_restore
+}
+
+detach_server() {
+  stop_restore
+  if is_server_process "${server_pid}" "${server_start_time}"; then
+    log "Leaving ${server_origin} OpenRGB SDK server PID ${server_pid} running for lifecycle handoff"
+  fi
+  clear_server_identity
+}
+
+stop_server() {
+  local reason="${1:-deliberate shutdown}"
+  local attempt
+
+  stop_restore
+  if [[ -z "${server_pid}" ]]; then
+    clear_server_identity
+    return 0
+  fi
+
+  if ! is_same_process "${server_pid}" "${server_start_time}"; then
+    log "Tracked OpenRGB PID ${server_pid} no longer has start identity ${server_start_time}; not signaling"
+    clear_server_identity
+    return 0
+  fi
+  if ! is_server_listener "${server_pid}" "${server_start_time}"; then
+    log "Refusing to signal OpenRGB PID ${server_pid} for ${reason}: process or listener identity changed"
+    return 1
+  fi
+
+  kill -TERM "${server_pid}" 2>/dev/null || true
+  for attempt in {1..20}; do
+    if ! is_same_process "${server_pid}" "${server_start_time}"; then
+      wait "${server_pid}" 2>/dev/null || true
+      log "OpenRGB server stopped for ${reason}"
+      clear_server_identity
+      return 0
+    fi
+    "${SLEEP_BIN}" 0.1
+  done
+
+  if ! is_server_listener "${server_pid}" "${server_start_time}"; then
+    log "Refusing to escalate OpenRGB PID ${server_pid} for ${reason}: listener ownership changed"
+    return 1
+  fi
+  kill -KILL "${server_pid}" 2>/dev/null || true
+  wait "${server_pid}" 2>/dev/null || true
+  log "OpenRGB server required SIGKILL for ${reason}"
+  clear_server_identity
 }
 
 start_inhibitor() {
@@ -410,7 +525,9 @@ handle_sleep_signal() {
     fi
     suspended=true
     log "PrepareForSleep(true): stopping OpenRGB"
-    stop_server
+    if ! stop_server 'suspend'; then
+      /usr/bin/printf '%s\n' 'OpenRGB could not be stopped safely before sleep' >&2
+    fi
     release_inhibitor
     return 0
   fi
@@ -426,18 +543,31 @@ handle_sleep_signal() {
 }
 
 cleanup() {
+  local mode="${1:-handoff}"
+
   if [[ "${shutting_down}" == true ]]; then
     return 0
   fi
   shutting_down=true
 
-  stop_server
+  case "${mode}" in
+    handoff)
+      detach_server
+      ;;
+    deliberate)
+      stop_server 'deliberate lifecycle shutdown'
+      ;;
+    *)
+      /usr/bin/printf 'Unknown cleanup mode: %s\n' "${mode}" >&2
+      return 64
+      ;;
+  esac
   release_inhibitor
   stop_monitor
 }
 
 request_shutdown() {
-  cleanup
+  cleanup handoff
   exit 0
 }
 
@@ -532,9 +662,10 @@ main() {
       start_inhibitor
     fi
 
-    if [[ "${suspended}" == false ]] && ! is_running "${server_pid}"; then
+    if [[ "${suspended}" == false ]] \
+      && ! is_same_process "${server_pid}" "${server_start_time}"; then
       /usr/bin/printf '%s\n' 'OpenRGB server exited unexpectedly; restarting' >&2
-      server_pid=''
+      clear_server_identity
       stop_restore
       "${SLEEP_BIN}" 2
       start_server

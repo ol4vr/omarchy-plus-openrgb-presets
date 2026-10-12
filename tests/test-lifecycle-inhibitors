@@ -215,20 +215,32 @@ test_suspend_resume_preserves_monitor_and_reacquires() {
   start_monitor >/dev/null
   local original_inhibitor="${inhibitor_pid}"
   local original_monitor="${monitor_pid}"
-  /usr/bin/sleep 30 &
-  server_pid=$!
+  local server_stop_requests=0
+  local server_start_requests=0
+  stop_server() {
+    server_stop_requests=$((server_stop_requests + 1))
+    clear_server_identity
+  }
+  start_server() {
+    server_start_requests=$((server_start_requests + 1))
+    server_pid='mock-server'
+    server_start_time='mock-start'
+    server_origin='launched'
+  }
   handle_sleep_signal true >/dev/null
   [[ "${suspended}" == true ]]
   wait_for_exit "${original_inhibitor}"
   is_same_process "${original_monitor}" "${monitor_start_time}"
   [[ -z "${server_pid}" ]]
+  [[ "${server_stop_requests}" -eq 1 ]]
 
   handle_sleep_signal false >/dev/null
   [[ "${suspended}" == false ]]
   [[ "${inhibitor_pid}" != "${original_inhibitor}" ]]
   is_owned_current_inhibitor "${inhibitor_pid}" "${inhibitor_start_time}"
   is_same_process "${original_monitor}" "${monitor_start_time}"
-  is_running "${server_pid}"
+  [[ "${server_pid}" == mock-server ]]
+  [[ "${server_start_requests}" -eq 1 ]]
   cleanup >/dev/null
   shutting_down=false
 }

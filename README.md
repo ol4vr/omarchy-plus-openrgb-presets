@@ -60,22 +60,30 @@ RAM modules and one each of the GPU, ST100, and motherboard.
 
 ## Runtime architecture
 
-The Omarchy service starts `openrgb-lifecycle`, which owns one GUI-capable
+The Omarchy service starts `openrgb-lifecycle`, which maintains one GUI-capable
 OpenRGB process minimized in the background. Before launching OpenRGB, the
 lifecycle reuses the existing `127.0.0.1:6742` listener only when its owner has
-the exact accepted OpenRGB server command. It performs the slow hardware scan
-once, loads the Effects Plugin, and exposes the SDK only on loopback. The
-service then restores the last successful preset after the SDK and accepted
-controllers become ready. Preset changes normally take about one second rather
-than repeating the hardware scan.
+the exact accepted OpenRGB server command. It records whether the server was
+launched or adopted together with its PID and Linux `/proc` start-time token.
+Ordinary Quickshell teardown releases only the lifecycle's tracking state; it
+does not signal either an adopted server or one launched by the outgoing
+lifecycle. The successor validates and adopts the same listener identity, so a
+shell restart does not repeat the hardware scan. OpenRGB output is written to
+the per-session runtime log `openrgb-server.log` rather than a Quickshell pipe
+that closes during handoff. The service restores the last successful preset
+after the SDK and accepted controllers become ready. Preset changes normally
+take about one second rather than repeating the hardware scan.
 
 `openrgb-lifecycle` monitors logind's `PrepareForSleep` signal and holds a
 standard delay inhibitor while Hugin is awake. Before suspend or hibernation it
-terminates OpenRGB, waiting briefly and using SIGKILL only if a clean shutdown
-does not complete, then releases the inhibitor. After resume it reacquires the
-inhibitor, waits three seconds for SMBus devices to settle, starts OpenRGB, and
-restores the saved preset. This prevents the running OpenRGB process from
-leaving the four Corsair DDR5 controllers inaccessible across sleep.
+terminates OpenRGB only after revalidating the tracked PID, start-time token,
+exact command, and ownership of the loopback listener. It waits briefly and
+uses SIGKILL only if that complete identity still matches, then releases the
+inhibitor. After resume it reacquires the inhibitor, waits three seconds for
+SMBus devices to settle, starts or adopts exactly one OpenRGB server, and
+restores the saved preset. A stale PID or changed listener is never signaled.
+This prevents the running OpenRGB process from leaving the four Corsair DDR5
+controllers inaccessible across sleep.
 
 One nonblocking per-user runtime lock admits only one lifecycle owner during
 plugin rescans or concurrent shell startup. The inhibitor and logind monitor
@@ -257,15 +265,27 @@ Deep Blue CLI color, its panel indicator, focused assertions, documentation,
 and release metadata. Effects profiles, animation settings, controller
 assignments, panel layout, lifecycle behavior, and saved preset are unchanged.
 
+## Roll back the 0.4.7 SDK lifecycle handoff correction
+
+Redeploy exact 0.4.6 commit
+`1e70d15f2ad20c3b4d2bf6606b7054d9b9c2e7c6`. This restores the previous SDK
+cleanup behavior and release metadata without changing presets, Effects
+profiles, controller mappings, OpenRGB configuration, or saved preset. Because
+0.4.6 can terminate an adopted listener during shell teardown, perform rollback
+only with the reviewed controller-health preflight and preserve the active
+server identity for recovery.
+
 ## Remove
 
 ```bash
 omarchy plugin remove io.github.ol4vr.openrgb-presets
 ```
 
-Removing the Omarchy plugin stops its OpenRGB background host but leaves the
-official Effects Plugin binary, saved profiles, and current hardware lighting
-state in place.
+Removing the Omarchy plugin stops its lifecycle, inhibitor, and logind monitor
+but leaves the verified OpenRGB SDK host running, just as an ordinary shell
+handoff does. A deliberate SDK stop remains a separate owner-authorized
+operation. The official Effects Plugin binary, saved profiles, and current
+hardware lighting state remain in place.
 
 ## ST100 rainbow limitation
 
