@@ -19,9 +19,43 @@ hardware-animated, and synchronized OpenRGB Effects presets.
 - **Black (Turn Off RGB)** — stops active effects and sends black to every controller.
 
 The seven synchronized presets are stored as reviewed Hugin Effects profiles in
-`effects-profiles/`. Static and hardware presets stop every active software
-effect before changing controller modes, preventing an old effect thread from
-overwriting the selected state.
+`effects-profiles/`. Their 60 FPS assignments contain only the GPU, both ST100
+zones, and the three motherboard zones. Static and hardware presets stop every
+active software effect before changing controller modes, preventing an old
+effect thread from overwriting the selected state.
+
+## Temporary static DDR5 workaround
+
+Version 0.4.8 keeps all four Corsair DDR5 modules out of continuously updating
+Effects Plugin assignments. Selecting or restoring a preset writes one static
+Direct-mode color to the shared DDR5 device name after active effects are
+stopped and the non-DDR effect is loaded. The GPU, ST100, and motherboard
+retain the exact existing profile, 60 FPS rate, colors, animation settings,
+and zone mappings. Animated Rainbow
+continues to use the GPU and motherboard hardware rainbow modes plus the ST100
+fallback, while DDR5 receives one static write instead of its former hardware
+rainbow selection.
+
+| Preset | Static DDR5 color | Source |
+| --- | --- | --- |
+| Deep Red | `#8B0000` | owner-approved |
+| Deep Blue | `#000B22` | owner-approved |
+| Bright White | `#FFFFFF` | owner-approved |
+| Animated Rainbow | `#404040` | owner-approved neutral dim white |
+| Neon Rain | `#5500FF` | darkest decoded profile `UserColors` entry |
+| Aurora Comet | `#404040` | owner-approved neutral dim white |
+| Spectrum Wave | `#404040` | owner-approved neutral dim white |
+| Electric Sunrise | `#3C00FF` | darkest decoded profile `UserColors` entry |
+| Matte Black Orange | `#501000` | owner-approved |
+| Black | `#000000` | owner-approved |
+| Horde Red | `#180000` | owner-approved |
+| Alliance Blue | `#000B22` | owner-approved |
+
+Animated Rainbow, Aurora Comet, and Spectrum Wave do not expose a finite active
+palette from which a unique darkest color can be derived: the two rainbow
+effects generate the spectrum, while Comet has `RandomColors` enabled. Their
+owner-approved static DDR5 fallback is therefore neutral dim white. No source
+palette or non-DDR visual effect is changed by this workaround.
 
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
@@ -274,6 +308,17 @@ profiles, controller mappings, OpenRGB configuration, or saved preset. Because
 0.4.6 can terminate an adopted listener during shell teardown, perform rollback
 only with the reviewed controller-health preflight and preserve the active
 server identity for recovery.
+
+## Roll back the 0.4.8 static DDR5 workaround
+
+Redeploy exact accepted v0.4.7 commit
+`ae8d12589e5f77b190fa0cffcde06bfa55fbe4f7` and run its reviewed Effects
+installer to restore the seven original ten-zone profiles. Do not roll back or
+reapply a profile while DDR5 SPD access is degraded. After a reviewed cold
+recovery and seven-controller health check, applying the saved preset restores
+the prior continuously animated DDR5 behavior. Version 0.4.8 changes no panel,
+palette, non-DDR animation, SDK lifecycle, controller identity, or persisted
+preset format.
 
 ## Remove
 

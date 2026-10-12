@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused source-only validation for OpenRGB Presets 0.4.7."""
+"""Focused source-only validation for OpenRGB Presets 0.4.8."""
 
 from __future__ import annotations
 
@@ -21,30 +21,33 @@ PANEL = ROOT / "Panel.qml"
 INSTALLER = ROOT / "install-effects-plugin"
 PROFILES = ROOT / "effects-profiles"
 
-ORIGINAL_PROFILE_HASHES = {
-    "hugin-rain": "d730f06b7c90d7051ac94e48de674829ed87bbac107a43981c8f84b93d955ebe",
-    "hugin-rainbow-comet": "4f3b61a63086f5d98c07354d912cb82c987dde178c28ad95a54010e807f3f84f",
-    "hugin-rainbow-wave": "fe977da32d9f8dbb9babd4d8dfc146b7d586aa00d477a56a635118a7b5c64cc9",
-    "hugin-sunrise-blue-red": "dc42def0e003f7e24993584d4db7f50f021922a0574b6b722ffa16dfa931cb06",
+PROFILE_HASHES = {
+    "hugin-rain": "5c1c6086f4bd23e32093afe0412b079fe15b53c923faa2a54acfc93d68c9c361",
+    "hugin-rainbow-comet": "efe1c16277873e91b04a75930096bbd9958b8c29ec241ac00e76b54ed923ffae",
+    "hugin-rainbow-wave": "8be31745f42fb13f354f7025f2dbc84b20af4549f4678a4c7808ed7e3a61699c",
+    "hugin-sunrise-blue-black": "117d4e597c6fb328c99d82dff6a15ae876d1e7cc0875ac6737999dc1123faaa8",
+    "hugin-sunrise-blue-red": "c10e289c2e0966bc0f79d43dd105c855a754693a8efdeb5c69002ab2e563604c",
+    "hugin-sunrise-orange-black": "02db5c13ab37021f664908e792914d5d731c783559a2d3f691e789d19f98be02",
+    "hugin-sunrise-red-black": "9e22534f40e48bdaf534d796f3d82908acaa6cb5dd83e53ba4c9fec15cc4c73f",
 }
 NEW_PROFILES = {
     "hugin-sunrise-orange-black": {
         "human_rgb": ["#FF4400", "#E83B00", "#C92B00", "#501000"],
         "packed_rgbcolor": [17663, 15336, 11209, 4176],
         "v044_packed_rgbcolor": [17663, 15336, 11209, 15336],
-        "sha256": "7c568e6d66b1d0bec7e5d542cc7c2ed90add36a73b7596a6c33ccbacd319b41f",
+        "sha256": "02db5c13ab37021f664908e792914d5d731c783559a2d3f691e789d19f98be02",
     },
     "hugin-sunrise-blue-black": {
         "human_rgb": ["#0033AA", "#002788", "#001A66", "#000B22"],
         "packed_rgbcolor": [11154176, 8922880, 6691328, 2231040],
         "v044_packed_rgbcolor": [11154176, 8922880, 6691328, 8922880],
-        "sha256": "0498bcb01a53c37a4d64b5ea33e9a7ffbe206f30584d78464aa1cbbd2ee36780",
+        "sha256": "117d4e597c6fb328c99d82dff6a15ae876d1e7cc0875ac6737999dc1123faaa8",
     },
     "hugin-sunrise-red-black": {
         "human_rgb": ["#8B0000", "#680000", "#4A0000", "#180000"],
         "packed_rgbcolor": [139, 104, 74, 24],
         "v044_packed_rgbcolor": [139, 104, 74, 104],
-        "sha256": "b1dd58fe5810389a353016eeacc1a36016908f5377ec9860df83d82b2fe77194",
+        "sha256": "9e22534f40e48bdaf534d796f3d82908acaa6cb5dd83e53ba4c9fec15cc4c73f",
     },
 }
 PANEL_INDICATORS = {
@@ -96,6 +99,41 @@ HELPER_ORDER = [
     "alliance-blue",
     "black",
 ]
+RAM_DEVICE = "Corsair Dominator Platinum RGB DDR5"
+GPU_DEVICE = "ASUS TUF GeForce RTX 4090 Gaming OG OC"
+ST100_DEVICE = "Corsair ST100 RGB"
+MAINBOARD_DEVICE = "ASUS ROG STRIX Z790-F GAMING WIFI"
+NON_RAM_ZONES = [
+    (GPU_DEVICE, 0),
+    (ST100_DEVICE, 0),
+    (ST100_DEVICE, 1),
+    (MAINBOARD_DEVICE, 0),
+    (MAINBOARD_DEVICE, 1),
+    (MAINBOARD_DEVICE, 2),
+]
+DDR5_STATIC_COLORS = {
+    "deep-red": "8B0000",
+    "deep-blue": "000B22",
+    "bright-white": "FFFFFF",
+    "animated-rainbow": "404040",
+    "neon-rain": "5500FF",
+    "aurora-comet": "404040",
+    "spectrum-wave": "404040",
+    "electric-sunrise": "3C00FF",
+    "matte-black-orange": "501000",
+    "black": "000000",
+    "horde-red": "180000",
+    "alliance-blue": "000B22",
+}
+EFFECT_PROFILES = {
+    "neon-rain": ("hugin-rain", "Rain"),
+    "aurora-comet": ("hugin-rainbow-comet", "Comet"),
+    "spectrum-wave": ("hugin-rainbow-wave", "Rainbow Wave"),
+    "electric-sunrise": ("hugin-sunrise-blue-red", "Sunrise"),
+    "matte-black-orange": ("hugin-sunrise-orange-black", "Sunrise"),
+    "horde-red": ("hugin-sunrise-red-black", "Sunrise"),
+    "alliance-blue": ("hugin-sunrise-blue-black", "Sunrise"),
+}
 
 
 def sha256(path: Path) -> str:
@@ -123,8 +161,19 @@ def unpack_rgbcolor(packed_rgbcolor: int) -> str:
 
 
 class PresetTests(unittest.TestCase):
-    def test_original_effects_profiles_are_byte_identical(self) -> None:
-        for name, expected_hash in ORIGINAL_PROFILE_HASHES.items():
+    def test_effects_profiles_exclude_ddr5_and_preserve_non_ram_zones(self) -> None:
+        for name, expected_hash in PROFILE_HASHES.items():
+            profile = load_profile(name)
+            self.assertEqual(len(profile["Effects"]), 1, name)
+            effect = profile["Effects"][0]
+            self.assertEqual(effect["FPS"], 60, name)
+            zones = effect["ControllerZones"]
+            self.assertEqual(
+                [(zone["name"], zone["zone_idx"]) for zone in zones],
+                NON_RAM_ZONES,
+                name,
+            )
+            self.assertNotIn(RAM_DEVICE, [zone["name"] for zone in zones], name)
             self.assertEqual(sha256(PROFILES / name), expected_hash, name)
 
     def test_human_rgb_is_packed_as_openrgb_rgbcolor(self) -> None:
@@ -161,7 +210,7 @@ class PresetTests(unittest.TestCase):
             self.assertEqual(packed_colors[:3], previous_colors[:3], name)
             self.assertNotEqual(packed_colors[3], previous_colors[3], name)
             self.assertEqual(profile["Effects"][0]["ControllerZones"], original_effect["ControllerZones"], name)
-            self.assertEqual(len(profile["Effects"][0]["ControllerZones"]), 10, name)
+            self.assertEqual(len(profile["Effects"][0]["ControllerZones"]), 6, name)
             self.assertEqual(profile["Effects"][0]["EffectClassName"], "Sunrise", name)
             self.assertEqual(profile["Effects"][0]["CustomSettings"], original_effect["CustomSettings"], name)
             self.assertEqual(profile["Effects"][0]["Speed"], original_effect["Speed"], name)
@@ -170,7 +219,7 @@ class PresetTests(unittest.TestCase):
 
     def test_manifest_and_panel_order(self) -> None:
         manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.4.7")
+        self.assertEqual(manifest["version"], "0.4.8")
 
         panel = PANEL.read_text(encoding="utf-8")
         library = panel.split(
@@ -241,41 +290,10 @@ class PresetTests(unittest.TestCase):
                 ).stdout.strip()
                 self.assertEqual(current, preset)
 
-    def test_new_preset_dry_runs_have_exact_commands(self) -> None:
-        expected_profiles = {
-            "matte-black-orange": "hugin-sunrise-orange-black",
-            "horde-red": "hugin-sunrise-red-black",
-            "alliance-blue": "hugin-sunrise-blue-black",
-        }
+    def test_every_preset_applies_one_exact_static_ddr5_color(self) -> None:
         with tempfile.TemporaryDirectory() as state_home:
             environment = os.environ | {"XDG_STATE_HOME": state_home}
-            deep_blue = subprocess.run(
-                [str(APPLY), "--dry-run", "deep-blue"],
-                check=True,
-                capture_output=True,
-                text=True,
-                env=environment,
-            ).stdout
-            self.assertIn("stop-all", deep_blue)
-            self.assertEqual(set(re.findall(r"--color ([0-9A-F,]+)", deep_blue)), {"000B22"})
-            self.assertNotIn("000000", deep_blue)
-            command = shlex.split(deep_blue.split("DRY RUN: ", 2)[2].splitlines()[0])
-            self.assertEqual(
-                [command[index + 1] for index, value in enumerate(command) if value == "--device"],
-                [
-                    "Corsair Dominator Platinum RGB DDR5",
-                    "ASUS TUF GeForce RTX 4090 Gaming OG OC",
-                    "Corsair ST100 RGB",
-                    "Corsair ST100 RGB",
-                    "ASUS ROG STRIX Z790-F GAMING WIFI",
-                ],
-            )
-            self.assertEqual(
-                [command[index + 1] for index, value in enumerate(command) if value == "--zone"],
-                ["0", "1"],
-            )
-
-            for preset, profile in expected_profiles.items():
+            for preset, expected_color in DDR5_STATIC_COLORS.items():
                 output = subprocess.run(
                     [str(APPLY), "--dry-run", preset],
                     check=True,
@@ -283,33 +301,89 @@ class PresetTests(unittest.TestCase):
                     text=True,
                     env=environment,
                 ).stdout
-                self.assertIn(f"load-profile {profile} Sunrise", output)
-                self.assertNotIn("stop-all", output)
+                commands = [
+                    shlex.split(line.removeprefix("DRY RUN:"))
+                    for line in output.splitlines()
+                    if line.startswith("DRY RUN:")
+                ]
+                openrgb_commands = [
+                    command for command in commands if command[0] == "/usr/bin/openrgb"
+                ]
+                ram_segments = []
+                for command in openrgb_commands:
+                    device_indexes = [
+                        index
+                        for index, value in enumerate(command)
+                        if value == "--device"
+                    ]
+                    for position, index in enumerate(device_indexes):
+                        if command[index + 1] != RAM_DEVICE:
+                            continue
+                        stop = (
+                            device_indexes[position + 1]
+                            if position + 1 < len(device_indexes)
+                            else len(command)
+                        )
+                        ram_segments.append(command[index:stop])
 
-            electric_sunrise = subprocess.run(
-                [str(APPLY), "--dry-run", "electric-sunrise"],
-                check=True,
-                capture_output=True,
-                text=True,
-                env=environment,
-            ).stdout
-            self.assertIn(
-                "load-profile hugin-sunrise-blue-red Sunrise",
-                electric_sunrise,
-            )
+                self.assertEqual(len(ram_segments), 1, preset)
+                self.assertEqual(
+                    ram_segments[0],
+                    ["--device", RAM_DEVICE, "--mode", "direct", "--color", expected_color],
+                    preset,
+                )
 
-            black = subprocess.run(
-                [str(APPLY), "--dry-run", "black"],
-                check=True,
-                capture_output=True,
-                text=True,
-                env=environment,
-            ).stdout
-            self.assertIn("stop-all", black)
-            self.assertEqual(
-                set(re.findall(r"--color ([0-9A-F,]+)", black)),
-                {"000000"},
-            )
+                if preset in EFFECT_PROFILES:
+                    profile, effect = EFFECT_PROFILES[preset]
+                    load_commands = [
+                        command
+                        for command in commands
+                        if command[0] == str(ROOT / "effects-sdk")
+                        and "load-profile" in command
+                    ]
+                    self.assertEqual(
+                        load_commands,
+                        [[str(ROOT / "effects-sdk"), "load-profile", profile, effect]],
+                        preset,
+                    )
+                    stop_commands = [
+                        command
+                        for command in commands
+                        if command == [str(ROOT / "effects-sdk"), "stop-all"]
+                    ]
+                    self.assertEqual(len(stop_commands), 1, preset)
+                    self.assertLess(
+                        commands.index(stop_commands[0]),
+                        commands.index(load_commands[0]),
+                        preset,
+                    )
+                    self.assertLess(
+                        commands.index(load_commands[0]),
+                        commands.index(openrgb_commands[0]),
+                        preset,
+                    )
+                    self.assertEqual(
+                        [
+                            command[index + 1]
+                            for command in openrgb_commands
+                            for index, value in enumerate(command)
+                            if value == "--device"
+                        ],
+                        [RAM_DEVICE],
+                        preset,
+                    )
+                else:
+                    devices = [
+                        command[index + 1]
+                        for command in openrgb_commands
+                        for index, value in enumerate(command)
+                        if value == "--device"
+                    ]
+                    self.assertEqual(
+                        devices,
+                        [RAM_DEVICE, GPU_DEVICE, ST100_DEVICE, ST100_DEVICE, MAINBOARD_DEVICE],
+                        preset,
+                    )
 
     def test_installer_registers_all_profiles_with_exact_hashes(self) -> None:
         installer = INSTALLER.read_text(encoding="utf-8")
@@ -328,10 +402,8 @@ class PresetTests(unittest.TestCase):
         ]
         self.assertEqual(names, expected_names)
 
-        for name, expected_hash in ORIGINAL_PROFILE_HASHES.items():
+        for name, expected_hash in PROFILE_HASHES.items():
             self.assertIn(f'[{name}]="{expected_hash}"', installer)
-        for name, specification in NEW_PROFILES.items():
-            self.assertIn(f'[{name}]="{specification["sha256"]}"', installer)
 
 
 if __name__ == "__main__":

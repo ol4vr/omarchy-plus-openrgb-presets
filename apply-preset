@@ -188,6 +188,23 @@ apply_effects_profile() {
   fi
 }
 
+apply_ram_static() {
+  local color="${1}"
+
+  run_openrgb \
+    --device "${RAM_DEVICE}" --mode direct --color "${color}"
+}
+
+apply_effects_with_static_ram() {
+  local profile="${1}"
+  local expected_effect="${2}"
+  local ram_color="${3}"
+
+  stop_effects
+  apply_effects_profile "${profile}" "${expected_effect}"
+  apply_ram_static "${ram_color}"
+}
+
 run_openrgb() {
   if [[ "${dry_run}" == true ]]; then
     print_command "$@"
@@ -219,8 +236,10 @@ apply_static() {
 }
 
 apply_rainbow() {
+  local ram_color="${1}"
+
   run_openrgb \
-    --device "${RAM_DEVICE}" --mode rainbow --speed 50 \
+    --device "${RAM_DEVICE}" --mode direct --color "${ram_color}" \
     --device "${GPU_DEVICE}" --mode rainbow --speed 50 \
     --device "${ST100_DEVICE}" --zone 0 --mode direct \
       --color FF0000,FF7F00,FFFF00,00FF00,00FFFF,0000FF,8B00FF,FF00FF \
@@ -246,28 +265,28 @@ apply_preset() {
       ;;
     animated-rainbow)
       stop_effects
-      apply_rainbow
+      apply_rainbow 404040
       ;;
     neon-rain)
-      apply_effects_profile hugin-rain 'Rain'
+      apply_effects_with_static_ram hugin-rain 'Rain' 5500FF
       ;;
     aurora-comet)
-      apply_effects_profile hugin-rainbow-comet 'Comet'
+      apply_effects_with_static_ram hugin-rainbow-comet 'Comet' 404040
       ;;
     spectrum-wave)
-      apply_effects_profile hugin-rainbow-wave 'Rainbow Wave'
+      apply_effects_with_static_ram hugin-rainbow-wave 'Rainbow Wave' 404040
       ;;
     matte-black-orange)
-      apply_effects_profile hugin-sunrise-orange-black 'Sunrise'
+      apply_effects_with_static_ram hugin-sunrise-orange-black 'Sunrise' 501000
       ;;
     electric-sunrise)
-      apply_effects_profile hugin-sunrise-blue-red 'Sunrise'
+      apply_effects_with_static_ram hugin-sunrise-blue-red 'Sunrise' 3C00FF
       ;;
     horde-red)
-      apply_effects_profile hugin-sunrise-red-black 'Sunrise'
+      apply_effects_with_static_ram hugin-sunrise-red-black 'Sunrise' 180000
       ;;
     alliance-blue)
-      apply_effects_profile hugin-sunrise-blue-black 'Sunrise'
+      apply_effects_with_static_ram hugin-sunrise-blue-black 'Sunrise' 000B22
       ;;
     black)
       stop_effects
