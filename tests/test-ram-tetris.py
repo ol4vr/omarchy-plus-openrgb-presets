@@ -115,22 +115,53 @@ class FakeControl:
 
 class PaletteAndFrames(unittest.TestCase):
     def test_all_twelve_exact_palettes(self):
-        self.assertEqual(len(core.PRESET_PALETTES), 12)
         self.assertEqual(
-            core.PRESET_PALETTES["horde-red"],
-            ("#8B0000", "#680000", "#4A0000", "#180000"),
-        )
-        self.assertEqual(
-            core.PRESET_PALETTES["alliance-blue"],
-            ("#0033AA", "#002788", "#001A66", "#000B22"),
-        )
-        self.assertEqual(
-            core.PRESET_PALETTES["matte-black-orange"],
-            ("#FF4400", "#E83B00", "#C92B00", "#501000"),
-        )
-        self.assertEqual(
-            core.PRESET_PALETTES["electric-sunrise"],
-            ("#FF0040", "#FF0051", "#3C00FF", "#0044FF"),
+            core.PRESET_PALETTES,
+            {
+                "deep-red": ("#8B0000",),
+                "deep-blue": ("#000B22",),
+                "bright-white": ("#FFFFFF",),
+                "animated-rainbow": (
+                    "#11FF00",
+                    "#8A2BE2",
+                    "#FFD400",
+                    "#FF0040",
+                ),
+                "neon-rain": (
+                    "#5500FF",
+                    "#11FF00",
+                    "#00FF8C",
+                    "#FF00F6",
+                    "#FFD400",
+                ),
+                "aurora-comet": ("#95FF00", "#00D4FF", "#8A2BE2"),
+                "spectrum-wave": (
+                    "#11FF00",
+                    "#8A2BE2",
+                    "#FFD400",
+                    "#FF0040",
+                ),
+                "electric-sunrise": (
+                    "#FF0040",
+                    "#FF0051",
+                    "#3C00FF",
+                    "#0044FF",
+                ),
+                "matte-black-orange": (
+                    "#FF4400",
+                    "#E83B00",
+                    "#C92B00",
+                    "#501000",
+                ),
+                "black": (),
+                "horde-red": ("#8B0000", "#680000", "#4A0000", "#180000"),
+                "alliance-blue": (
+                    "#0033AA",
+                    "#002788",
+                    "#001A66",
+                    "#000B22",
+                ),
+            },
         )
         self.assertTrue(
             all(
@@ -139,6 +170,20 @@ class PaletteAndFrames(unittest.TestCase):
                 if name != "black"
             )
         )
+
+    def test_rainbow_blocks_use_only_the_refined_palette(self):
+        expected = {"#11FF00", "#8A2BE2", "#FFD400", "#FF0040"}
+        for preset in ("animated-rainbow", "spectrum-wave"):
+            observed: set[str] = set()
+            for seed in range(16):
+                frames = core.generate_cycle(preset, seed)
+                landed = frames[-2].colors
+                self.assertNotIn(core.OFF, landed)
+                self.assertLessEqual(set(landed), expected)
+                for index in range(0, core.LED_COUNT, core.BLOCK_SIZE):
+                    self.assertEqual(landed[index], landed[index + 1])
+                observed.update(landed)
+            self.assertEqual(observed, expected)
 
     def test_cycle_is_36_accumulation_frames_plus_reset(self):
         frames = core.generate_cycle("horde-red", 24)

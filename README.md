@@ -68,10 +68,10 @@ off and suspends animation while preserving the ON preference.
 
 | Preset | RAM Tetris palette |
 | --- | --- |
-| Animated Rainbow | `#FF4D6D`, `#FFD166`, `#06D6A0`, `#4CC9F0`, `#9B5DE5` |
+| Animated Rainbow | `#11FF00`, `#8A2BE2`, `#FFD400`, `#FF0040` |
 | Neon Rain | `#5500FF`, `#11FF00`, `#00FF8C`, `#FF00F6`, `#FFD400` |
 | Aurora Comet | `#95FF00`, `#00D4FF`, `#8A2BE2` |
-| Spectrum Wave | `#FF4D6D`, `#FFD166`, `#06D6A0`, `#4CC9F0`, `#9B5DE5` |
+| Spectrum Wave | `#11FF00`, `#8A2BE2`, `#FFD400`, `#FF0040` |
 | Electric Sunrise | `#FF0040`, `#FF0051`, `#3C00FF`, `#0044FF` |
 | Matte Black Orange | `#FF4400`, `#E83B00`, `#C92B00`, `#501000` |
 | Horde Red | `#8B0000`, `#680000`, `#4A0000`, `#180000` |
@@ -93,6 +93,10 @@ Version 0.4.12 maps Spectrum Wave's profile class name `RainbowWave` to the
 Effects SDK display name `Rainbow Wave`. The writer continues to require the
 exact single expected live effect and the reviewed six non-DDR assignments;
 missing, duplicate, or additional Effects instances still fail closed.
+
+Version 0.4.13 refines only the Animated Rainbow and Spectrum Wave RAM Tetris
+palettes to the accepted green, purple, yellow, and red colors. Their non-DDR
+Effects behavior and neutral static DDR5 fallback remain unchanged.
 
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
