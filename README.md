@@ -89,6 +89,11 @@ behavior. The writer still verifies its lifecycle PID, start token, and exact
 argv, but excludes descendant Bash helpers that inherit the owner's argv. An
 independent same-argv lifecycle remains a fail-closed duplicate.
 
+Version 0.4.12 maps Spectrum Wave's profile class name `RainbowWave` to the
+Effects SDK display name `Rainbow Wave`. The writer continues to require the
+exact single expected live effect and the reviewed six non-DDR assignments;
+missing, duplicate, or additional Effects instances still fail closed.
+
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
 The experimental orange, blue, and red Sunrise gradients are therefore stored

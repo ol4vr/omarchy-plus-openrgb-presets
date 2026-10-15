@@ -74,6 +74,10 @@ PROFILE_BY_PRESET = {
     "alliance-blue": "hugin-sunrise-blue-black",
 }
 
+LIVE_EFFECT_NAME_BY_CLASS = {
+    "RainbowWave": "Rainbow Wave",
+}
+
 
 class SafetyStop(RuntimeError):
     """A mandatory health gate failed; no further hardware write is allowed."""
@@ -575,7 +579,7 @@ class EffectsContract:
             name = effect.get("EffectClassName")
             if not isinstance(name, str):
                 raise SafetyStop("Effects profile effect name is invalid")
-            self.expected[name] += 1
+            self.expected[LIVE_EFFECT_NAME_BY_CLASS.get(name, name)] += 1
             for zone in effect["ControllerZones"]:
                 zone_count += 1
                 if not isinstance(zone, dict):

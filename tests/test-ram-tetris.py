@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Focused offline validation for the v0.4.11 RAM Tetris integration."""
+"""Focused offline validation for the v0.4.12 RAM Tetris integration."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from collections import Counter
 from fractions import Fraction
 from pathlib import Path
 from unittest import mock
@@ -586,6 +587,39 @@ class RuntimeSafetyTests(unittest.TestCase):
             failure = json.loads((state / "ram-tetris-failure.json").read_text())
             self.assertEqual(failure["state"], "failed")
             self.assertIn("SDK connection", failure["message"])
+
+
+class EffectsContractTests(unittest.TestCase):
+    def test_spectrum_wave_uses_the_live_effect_display_name(self):
+        contract = runtime.EffectsContract("spectrum-wave", ROOT)
+
+        self.assertEqual(contract.expected, Counter({"Rainbow Wave": 1}))
+        contract.verify(("Rainbow Wave",))
+        for active in ((), ("RainbowWave",), ("Rainbow Wave", "Sunrise")):
+            with (
+                self.subTest(active=active),
+                self.assertRaisesRegex(
+                    runtime.SafetyStop,
+                    "live Effects instances changed or include DDR5",
+                ),
+            ):
+                contract.verify(active)
+
+    def test_other_accepted_live_effect_names_are_unchanged(self):
+        expected = {
+            "neon-rain": "Rain",
+            "aurora-comet": "Comet",
+            "electric-sunrise": "Sunrise",
+            "matte-black-orange": "Sunrise",
+            "horde-red": "Sunrise",
+            "alliance-blue": "Sunrise",
+        }
+
+        for preset, effect in expected.items():
+            with self.subTest(preset=preset):
+                contract = runtime.EffectsContract(preset, ROOT)
+                self.assertEqual(contract.expected, Counter({effect: 1}))
+                contract.verify((effect,))
 
 
 class IntegrationSourceTests(unittest.TestCase):
