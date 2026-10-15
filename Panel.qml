@@ -22,7 +22,7 @@ Panel {
   property string activePreset: "bright-white"
   property string pendingPreset: ""
   property int selectedIndex: 0
-  property string statusText: "Bright White active"
+  property string statusText: "Static White active"
   property bool statusError: false
   property string processOutput: ""
   property string processError: ""
@@ -36,24 +36,27 @@ Panel {
   readonly property var presets: [
     {
       id: "deep-red",
-      label: "Deep Red",
+      label: "Static Red",
       kind: "STATIC",
+      mode: "STATIC COLOR",
       detail: "LOW-LIGHT FOCUS",
       accent: "#F7768E",
       swatches: ["#8B0000", "#A00000", "#5C0000"]
     },
     {
       id: "deep-blue",
-      label: "Deep Blue",
+      label: "Static Blue",
       kind: "STATIC",
+      mode: "STATIC COLOR",
       detail: "DEEP BLUE",
-      accent: "#000B22",
+      accent: "#7AA2F7",
       swatches: ["#000B22"]
     },
     {
       id: "bright-white",
-      label: "Bright White",
+      label: "Static White",
       kind: "STATIC",
+      mode: "STATIC COLOR",
       detail: "CLEAR DESK LIGHT",
       accent: "#C0CAF5",
       swatches: ["#FFFFFF", "#E8E8FF", "#D8D8E8"]
@@ -62,6 +65,7 @@ Panel {
       id: "animated-rainbow",
       label: "Animated Rainbow",
       kind: "HARDWARE",
+      mode: "RAINBOW",
       detail: "CONTROLLER EFFECT",
       accent: "#BB9AF7",
       swatches: ["#FF4D6D", "#FFD166", "#06D6A0", "#4CC9F0", "#9B5DE5"]
@@ -70,6 +74,7 @@ Panel {
       id: "neon-rain",
       label: "Neon Rain",
       kind: "EFFECTS",
+      mode: "RAIN",
       detail: "FIVE-COLOR RAIN",
       accent: "#7DCFFF",
       swatches: ["#FF0055", "#8CFF00", "#00D4FF"]
@@ -78,6 +83,7 @@ Panel {
       id: "aurora-comet",
       label: "Aurora Comet",
       kind: "EFFECTS",
+      mode: "COMET",
       detail: "GREEN COMET",
       accent: "#9ECE6A",
       swatches: ["#95FF00", "#00D4FF", "#8A2BE2"]
@@ -86,6 +92,7 @@ Panel {
       id: "spectrum-wave",
       label: "Spectrum Wave",
       kind: "EFFECTS",
+      mode: "RAINBOW WAVE",
       detail: "SYNCED RAINBOW",
       accent: "#7AA2F7",
       swatches: ["#FF4D6D", "#FFD166", "#06D6A0", "#4CC9F0", "#9B5DE5"]
@@ -94,6 +101,7 @@ Panel {
       id: "electric-sunrise",
       label: "Electric Sunrise",
       kind: "EFFECTS",
+      mode: "SUNRISE",
       detail: "BLUE · RED · ORANGE",
       accent: "#E0AF68",
       swatches: ["#4000FF", "#FF003C", "#FF4400"]
@@ -102,6 +110,7 @@ Panel {
       id: "matte-black-orange",
       label: "Matte Black Orange",
       kind: "EFFECTS",
+      mode: "SUNRISE",
       detail: "ORANGE · RED · BURNT",
       accent: "#FF4400",
       swatches: ["#FF4400", "#E83B00", "#C92B00"]
@@ -110,24 +119,27 @@ Panel {
       id: "black",
       label: "Black (Turn Off RGB)",
       kind: "OFF",
+      mode: "LIGHTS OFF",
       detail: "ALL CONTROLLERS",
-      accent: "#565F89",
+      accent: "#A9B1D6",
       swatches: ["#000000", "#101018", "#20202A"]
     },
     {
       id: "horde-red",
-      label: "Horde Red",
+      label: "For the Horde!",
       kind: "EFFECTS",
+      mode: "SUNRISE",
       detail: "RED · DEEP · DARK",
-      accent: "#8B0000",
+      accent: "#F7768E",
       swatches: ["#8B0000", "#680000", "#4A0000"]
     },
     {
       id: "alliance-blue",
-      label: "Alliance Blue",
+      label: "For the Alliance!",
       kind: "EFFECTS",
+      mode: "SUNRISE",
       detail: "BLUE · MID · DARK",
-      accent: "#0033AA",
+      accent: "#7AA2F7",
       swatches: ["#0033AA", "#002788", "#001A66"]
     }
   ]
@@ -386,7 +398,7 @@ Panel {
       Column {
         id: content
         width: parent.width
-        spacing: Style.space(12)
+        spacing: Style.space(8)
 
         Row {
           width: parent.width
@@ -414,7 +426,7 @@ Panel {
           readonly property color accentColor: root.activePresetData.accent
 
           width: parent.width
-          height: Style.space(104)
+          height: Style.space(80)
           radius: Style.cornerRadius
           color: Qt.rgba(accentColor.r, accentColor.g, accentColor.b, 0.09)
           border.width: 1
@@ -431,21 +443,21 @@ Panel {
           Text {
             id: activeIcon
             anchors.left: parent.left
-            anchors.leftMargin: Style.space(18)
+            anchors.leftMargin: Style.space(14)
             anchors.verticalCenter: parent.verticalCenter
             text: "󱩒"
             color: activeCard.accentColor
             font.family: root.contentFontFamily
-            font.pixelSize: Style.space(42)
+            font.pixelSize: Style.space(30)
           }
 
           Column {
             anchors.left: activeIcon.right
-            anchors.leftMargin: Style.space(16)
+            anchors.leftMargin: Style.space(12)
             anchors.right: activeMeta.left
             anchors.rightMargin: Style.space(12)
             anchors.verticalCenter: parent.verticalCenter
-            spacing: Style.space(3)
+            spacing: Style.space(1)
 
             Text {
               width: parent.width
@@ -464,7 +476,10 @@ Panel {
               color: root.contentForeground
               font.family: root.contentFontFamily
               font.pixelSize: Style.font.title
+              fontSizeMode: Text.HorizontalFit
+              minimumPixelSize: Style.font.body
               font.bold: true
+              maximumLineCount: 1
               elide: Text.ElideRight
             }
 
@@ -483,16 +498,16 @@ Panel {
 
           Column {
             id: activeMeta
-            width: Style.space(112)
+            width: Style.space(132)
             anchors.right: parent.right
-            anchors.rightMargin: Style.space(16)
+            anchors.rightMargin: Style.space(12)
             anchors.verticalCenter: parent.verticalCenter
-            spacing: Style.space(12)
+            spacing: Style.space(3)
 
             Rectangle {
               anchors.horizontalCenter: parent.horizontalCenter
               width: activeKind.implicitWidth + Style.space(18)
-              height: Style.space(24)
+              height: Style.space(20)
               radius: Style.cornerRadius
               color: Qt.rgba(activeCard.accentColor.r, activeCard.accentColor.g, activeCard.accentColor.b, 0.14)
               border.width: 1
@@ -508,6 +523,18 @@ Panel {
                 font.bold: true
                 font.letterSpacing: 0.8
               }
+            }
+
+            Text {
+              width: parent.width
+              text: actionProc.running ? "PRESET TRANSITION" : root.activePresetData.mode
+              color: root.contentForeground
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+              font.letterSpacing: 0.7
+              horizontalAlignment: Text.AlignHCenter
+              elide: Text.ElideRight
             }
 
             Row {
@@ -539,55 +566,64 @@ Panel {
             : root.ramTetrisPreference ? "#9ECE6A" : "#565F89"
 
           width: parent.width
-          height: Style.space(60)
+          height: Style.space(46)
           radius: Style.cornerRadius
           color: Qt.rgba(accentColor.r, accentColor.g, accentColor.b, 0.08)
           border.width: 1
           border.color: Qt.rgba(accentColor.r, accentColor.g, accentColor.b, 0.34)
 
-          Column {
+          Text {
+            id: tetrisIcon
             anchors.left: parent.left
-            anchors.leftMargin: Style.space(14)
-            anchors.right: toggleTrack.left
-            anchors.rightMargin: Style.space(14)
+            anchors.leftMargin: Style.space(12)
             anchors.verticalCenter: parent.verticalCenter
-            spacing: Style.space(2)
+            text: "󰍛"
+            color: tetrisToggle.accentColor
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.space(20)
+          }
 
-            Text {
-              width: parent.width
-              text: "RAM TETRIS"
-              color: root.contentForeground
-              font.family: root.contentFontFamily
-              font.pixelSize: Style.font.body
-              font.bold: true
-              font.letterSpacing: 0.9
-            }
+          Text {
+            id: tetrisTitle
+            anchors.left: tetrisIcon.right
+            anchors.leftMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            text: "RAM TETRIS"
+            color: root.contentForeground
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.body
+            font.bold: true
+            font.letterSpacing: 0.9
+          }
 
-            Text {
-              width: parent.width
-              text: tetrisActionProc.running ? "UPDATING…" : root.ramTetrisMessage.toUpperCase()
-              color: tetrisToggle.accentColor
-              font.family: root.contentFontFamily
-              font.pixelSize: Style.font.caption
-              font.letterSpacing: 0.6
-              elide: Text.ElideRight
-            }
+          Text {
+            anchors.left: tetrisTitle.right
+            anchors.leftMargin: Style.space(12)
+            anchors.right: toggleTrack.left
+            anchors.rightMargin: Style.space(12)
+            anchors.verticalCenter: parent.verticalCenter
+            text: tetrisActionProc.running ? "UPDATING…" : root.ramTetrisMessage.toUpperCase()
+            color: tetrisToggle.accentColor
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+            font.letterSpacing: 0.6
+            elide: Text.ElideRight
           }
 
           Rectangle {
             id: toggleTrack
-            width: Style.space(48)
-            height: Style.space(26)
+            width: Style.space(44)
+            height: Style.space(24)
             radius: height / 2
             anchors.right: parent.right
-            anchors.rightMargin: Style.space(14)
+            anchors.rightMargin: Style.space(12)
             anchors.verticalCenter: parent.verticalCenter
             color: Qt.rgba(tetrisToggle.accentColor.r, tetrisToggle.accentColor.g, tetrisToggle.accentColor.b, 0.26)
             border.width: 1
             border.color: tetrisToggle.accentColor
 
             Rectangle {
-              width: Style.space(20)
+              width: Style.space(18)
               height: width
               radius: width / 2
               anchors.verticalCenter: parent.verticalCenter
@@ -638,8 +674,8 @@ Panel {
           id: presetGrid
           width: parent.width
           columns: 2
-          columnSpacing: Style.space(10)
-          rowSpacing: Style.space(10)
+          columnSpacing: Style.space(8)
+          rowSpacing: Style.space(7)
           readonly property real cardWidth: (width - columnSpacing) / 2
 
           Repeater {
@@ -654,17 +690,19 @@ Panel {
               readonly property color accentColor: modelData.accent
 
               width: presetGrid.cardWidth
-              height: Style.space(82)
+              height: Style.space(60)
               radius: Style.cornerRadius
               color: isActive
                 ? Qt.rgba(accentColor.r, accentColor.g, accentColor.b, 0.11)
                 : mouse.containsMouse || isSelected
                   ? Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.11)
                   : Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.055)
-              border.width: isActive || isSelected ? 1 : 0
+              border.width: 1
               border.color: isActive
                 ? Qt.rgba(accentColor.r, accentColor.g, accentColor.b, 0.62)
-                : Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.34)
+                : isSelected
+                  ? Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.34)
+                  : Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.10)
 
               Rectangle {
                 anchors.left: parent.left
@@ -679,8 +717,8 @@ Panel {
                 id: cardSwatches
                 anchors.left: parent.left
                 anchors.leftMargin: Style.space(12)
-                anchors.top: parent.top
-                anchors.topMargin: Style.space(13)
+                anchors.bottom: parent.bottom
+                anchors.bottomMargin: Style.space(9)
                 spacing: Style.space(3)
 
                 Repeater {
@@ -701,7 +739,8 @@ Panel {
               Rectangle {
                 anchors.right: parent.right
                 anchors.rightMargin: Style.space(10)
-                anchors.verticalCenter: cardSwatches.verticalCenter
+                anchors.bottom: parent.bottom
+                anchors.bottomMargin: Style.space(8)
                 width: cardKind.implicitWidth + Style.space(12)
                 height: Style.space(18)
                 radius: Style.cornerRadius
@@ -710,11 +749,11 @@ Panel {
                 Text {
                   id: cardKind
                   anchors.centerIn: parent
-                  text: presetCard.isActive ? "ACTIVE" : presetCard.modelData.kind
+                  text: presetCard.modelData.kind
                   color: presetCard.accentColor
                   font.family: root.contentFontFamily
                   font.pixelSize: Style.font.caption
-                  font.bold: presetCard.isActive
+                  font.bold: true
                   font.letterSpacing: 0.6
                 }
               }
@@ -724,29 +763,16 @@ Panel {
                 anchors.leftMargin: Style.space(12)
                 anchors.right: parent.right
                 anchors.rightMargin: Style.space(12)
-                anchors.top: cardSwatches.bottom
-                anchors.topMargin: Style.space(8)
+                anchors.top: parent.top
+                anchors.topMargin: Style.space(9)
                 text: presetCard.modelData.label
                 color: root.contentForeground
                 font.family: root.contentFontFamily
                 font.pixelSize: Style.font.body
-                font.bold: presetCard.isActive
-                elide: Text.ElideRight
-              }
-
-              Text {
-                anchors.left: parent.left
-                anchors.leftMargin: Style.space(12)
-                anchors.right: parent.right
-                anchors.rightMargin: Style.space(12)
-                anchors.bottom: parent.bottom
-                anchors.bottomMargin: Style.space(9)
-                text: presetCard.modelData.detail
-                color: presetCard.accentColor
-                opacity: 0.82
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.caption
-                font.letterSpacing: 0.7
+                fontSizeMode: Text.HorizontalFit
+                minimumPixelSize: Style.font.caption
+                font.bold: true
+                maximumLineCount: 1
                 elide: Text.ElideRight
               }
 

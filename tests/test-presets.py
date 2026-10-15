@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused source-only validation for OpenRGB Presets 0.4.16."""
+"""Focused source-only validation for OpenRGB Presets 0.4.17."""
 
 from __future__ import annotations
 
@@ -7,13 +7,12 @@ import copy
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import shlex
 import subprocess
 import tempfile
 import unittest
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 APPLY = ROOT / "apply-preset"
@@ -51,25 +50,66 @@ NEW_PROFILES = {
     },
 }
 PANEL_INDICATORS = {
-    "deep-blue": ("STATIC", "DEEP BLUE", "#000B22", ["#000B22"]),
+    "deep-blue": (
+        "Static Blue",
+        "STATIC",
+        "STATIC COLOR",
+        "DEEP BLUE",
+        "#7AA2F7",
+        ["#000B22"],
+    ),
     "matte-black-orange": (
+        "Matte Black Orange",
         "EFFECTS",
+        "SUNRISE",
         "ORANGE · RED · BURNT",
         "#FF4400",
         ["#FF4400", "#E83B00", "#C92B00"],
     ),
     "horde-red": (
+        "For the Horde!",
         "EFFECTS",
+        "SUNRISE",
         "RED · DEEP · DARK",
-        "#8B0000",
+        "#F7768E",
         ["#8B0000", "#680000", "#4A0000"],
     ),
     "alliance-blue": (
+        "For the Alliance!",
         "EFFECTS",
+        "SUNRISE",
         "BLUE · MID · DARK",
-        "#0033AA",
+        "#7AA2F7",
         ["#0033AA", "#002788", "#001A66"],
     ),
+}
+DISPLAY_LABELS = {
+    "deep-red": "Static Red",
+    "deep-blue": "Static Blue",
+    "bright-white": "Static White",
+    "animated-rainbow": "Animated Rainbow",
+    "neon-rain": "Neon Rain",
+    "aurora-comet": "Aurora Comet",
+    "spectrum-wave": "Spectrum Wave",
+    "electric-sunrise": "Electric Sunrise",
+    "matte-black-orange": "Matte Black Orange",
+    "black": "Black (Turn Off RGB)",
+    "horde-red": "For the Horde!",
+    "alliance-blue": "For the Alliance!",
+}
+DISPLAY_MODES = {
+    "deep-red": "STATIC COLOR",
+    "deep-blue": "STATIC COLOR",
+    "bright-white": "STATIC COLOR",
+    "animated-rainbow": "RAINBOW",
+    "neon-rain": "RAIN",
+    "aurora-comet": "COMET",
+    "spectrum-wave": "RAINBOW WAVE",
+    "electric-sunrise": "SUNRISE",
+    "matte-black-orange": "SUNRISE",
+    "black": "LIGHTS OFF",
+    "horde-red": "SUNRISE",
+    "alliance-blue": "SUNRISE",
 }
 VISIBLE_ORDER = [
     "deep-red",
@@ -275,7 +315,7 @@ class PresetTests(unittest.TestCase):
 
     def test_manifest_and_panel_order(self) -> None:
         manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.4.16")
+        self.assertEqual(manifest["version"], "0.4.17")
 
         panel = PANEL.read_text(encoding="utf-8")
         library = panel.split(
@@ -290,12 +330,31 @@ class PresetTests(unittest.TestCase):
         self.assertIn('id: "bright-white"', panel)
         self.assertNotIn("brightWhitePreset", panel)
 
-        for preset, (kind, detail, accent, swatches) in PANEL_INDICATORS.items():
+        for preset, (label, kind, mode, detail, accent, swatches) in PANEL_INDICATORS.items():
             block = library.split(f'id: "{preset}"', 1)[1].split("\n    }", 1)[0]
+            self.assertIn(f'label: "{label}"', block, preset)
             self.assertIn(f'kind: "{kind}"', block, preset)
+            self.assertIn(f'mode: "{mode}"', block, preset)
             self.assertIn(f'detail: "{detail}"', block, preset)
             self.assertIn(f'accent: "{accent}"', block, preset)
             self.assertIn(f"swatches: {json.dumps(swatches)}", block, preset)
+
+        for preset, label in DISPLAY_LABELS.items():
+            block = library.split(f'id: "{preset}"', 1)[1].split("\n    }", 1)[0]
+            self.assertIn(f'label: "{label}"', block, preset)
+            self.assertIn(f'mode: "{DISPLAY_MODES[preset]}"', block, preset)
+        self.assertNotIn('id: "static-red"', panel)
+        self.assertNotIn('id: "static-blue"', panel)
+        self.assertNotIn('id: "static-white"', panel)
+
+        self.assertIn("height: Style.space(80)", panel)
+        self.assertIn("height: Style.space(60)", panel)
+        self.assertIn("rowSpacing: Style.space(7)", panel)
+        self.assertIn('text: "󰍛"', panel)
+        self.assertIn("root.activePresetData.mode", panel)
+        self.assertGreaterEqual(panel.count("fontSizeMode: Text.HorizontalFit"), 2)
+        self.assertIn("maximumLineCount: 1", panel)
+        self.assertNotIn("text: presetCard.modelData.detail", panel)
 
         def move(index: int, dx: int, dy: int) -> int:
             if dy == 0:
@@ -360,6 +419,7 @@ class PresetTests(unittest.TestCase):
                     text=True,
                     env=environment,
                 ).stdout
+                self.assertIn(f"Applied: {DISPLAY_LABELS[preset]}", output, preset)
                 commands = [
                     shlex.split(line.removeprefix("DRY RUN:"))
                     for line in output.splitlines()

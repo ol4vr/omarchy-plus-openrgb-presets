@@ -5,17 +5,17 @@ hardware-animated, and synchronized OpenRGB Effects presets.
 
 ## Presets
 
-- **Deep Red** — calibrated static red.
-- **Deep Blue** — static darkest Alliance blue (`#000B22`) on every controller.
-- **Bright White** — static white with ST100 logo compensation.
+- **Static Red** — calibrated static red.
+- **Static Blue** — static darkest Alliance blue (`#000B22`) on every controller.
+- **Static White** — static white with ST100 logo compensation.
 - **Animated Rainbow** — controller-native animation with an ST100 fallback.
 - **Neon Rain** — synchronized five-color Rain effect.
 - **Aurora Comet** — synchronized green Comet effect.
 - **Spectrum Wave** — synchronized Rainbow Wave effect.
 - **Matte Black Orange** — Electric Sunrise motion using `#FF4400`, `#E83B00`, `#C92B00`, and `#501000`.
 - **Electric Sunrise** — synchronized blue, violet, red, and orange Sunrise effect.
-- **Horde Red** — Electric Sunrise motion using `#8B0000`, `#680000`, `#4A0000`, and `#180000`.
-- **Alliance Blue** — Electric Sunrise motion using `#0033AA`, `#002788`, `#001A66`, and `#000B22`.
+- **For the Horde!** — Electric Sunrise motion using `#8B0000`, `#680000`, `#4A0000`, and `#180000`.
+- **For the Alliance!** — Electric Sunrise motion using `#0033AA`, `#002788`, `#001A66`, and `#000B22`.
 - **Black (Turn Off RGB)** — stops active effects and sends black to every controller.
 
 The seven synchronized presets are stored as reviewed Hugin Effects profiles in
@@ -36,9 +36,9 @@ Tetris palette.
 
 | Preset | Six paired static groups (`0-1` through `10-11`) |
 | --- | --- |
-| Deep Red | `#8B0000 · #8B0000 · #8B0000 · #8B0000 · #8B0000 · #8B0000` |
-| Deep Blue | `#000B22 · #000B22 · #000B22 · #000B22 · #000B22 · #000B22` |
-| Bright White | `#FFFFFF · #FFFFFF · #FFFFFF · #FFFFFF · #FFFFFF · #FFFFFF` |
+| Static Red | `#8B0000 · #8B0000 · #8B0000 · #8B0000 · #8B0000 · #8B0000` |
+| Static Blue | `#000B22 · #000B22 · #000B22 · #000B22 · #000B22 · #000B22` |
+| Static White | `#FFFFFF · #FFFFFF · #FFFFFF · #FFFFFF · #FFFFFF · #FFFFFF` |
 | Animated Rainbow | `#11FF00 · #8A2BE2 · #FFD400 · #FF0040 · #8A2BE2 · #11FF00` |
 | Neon Rain | `#5500FF · #11FF00 · #00FF8C · #FF00F6 · #FFD400 · #5500FF` |
 | Aurora Comet | `#95FF00 · #00D4FF · #8A2BE2 · #8A2BE2 · #00D4FF · #95FF00` |
@@ -46,8 +46,8 @@ Tetris palette.
 | Electric Sunrise | `#FF0040 · #FF0051 · #3C00FF · #0044FF · #FF0051 · #FF0040` |
 | Matte Black Orange | `#FF4400 · #E83B00 · #C92B00 · #501000 · #E83B00 · #FF4400` |
 | Black | `#000000 · #000000 · #000000 · #000000 · #000000 · #000000` |
-| Horde Red | `#8B0000 · #680000 · #4A0000 · #180000 · #680000 · #8B0000` |
-| Alliance Blue | `#0033AA · #002788 · #001A66 · #000B22 · #002788 · #0033AA` |
+| For the Horde! | `#8B0000 · #680000 · #4A0000 · #180000 · #680000 · #8B0000` |
+| For the Alliance! | `#0033AA · #002788 · #001A66 · #000B22 · #002788 · #0033AA` |
 
 Four-color palettes use the approved `A B C D B A` group order. The
 three-color Aurora palette uses `A B C C B A`; five-color Neon Rain uses
@@ -73,10 +73,10 @@ off and suspends animation while preserving the ON preference.
 | Spectrum Wave | `#11FF00`, `#8A2BE2`, `#FFD400`, `#FF0040` |
 | Electric Sunrise | `#FF0040`, `#FF0051`, `#3C00FF`, `#0044FF` |
 | Matte Black Orange | `#FF4400`, `#E83B00`, `#C92B00`, `#501000` |
-| Horde Red | `#8B0000`, `#680000`, `#4A0000`, `#180000` |
-| Alliance Blue | `#0033AA`, `#002788`, `#001A66`, `#000B22` |
+| For the Horde! | `#8B0000`, `#680000`, `#4A0000`, `#180000` |
+| For the Alliance! | `#0033AA`, `#002788`, `#001A66`, `#000B22` |
 
-Deep Red, Deep Blue, and Bright White use their one accepted static color.
+Static Red, Static Blue, and Static White use their one accepted static color.
 
 Version 0.4.10 changes no lighting behavior. The RAM Tetris entry point disables
 Python bytecode generation before loading its local scheduler module, keeping
@@ -110,6 +110,16 @@ request is present. An unexplained preference change still latches a fail-closed
 state, while healthy OFF restoration continues to use the selected preset's
 reviewed static array.
 
+Version 0.4.17 compacts the Lighting Panel without changing RGB behavior. The
+two-column preset library keeps its six-row order, exact swatches, mode badges,
+keyboard navigation, and focus states while removing card subtitles and
+reducing vertical space. The active card retains its description and now shows
+the exact mode: Static Color, Rainbow, Rain, Comet, Rainbow Wave, Sunrise, or
+Lights Off. RAM Tetris uses a compact memory-chip row. Static Red, Static Blue,
+Static White, For the Horde!, and For the Alliance! are display-label changes
+only; their stable preset identifiers, saved-state compatibility, palettes, and
+restoration paths are unchanged.
+
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
 The experimental orange, blue, and red Sunrise gradients are therefore stored
@@ -123,9 +133,10 @@ same-hue final stop for stronger visible motion without relying on zero-valued
 black padding. FPS, speed, motion, intensity, radius, timing, and controller
 assignments remain identical to Electric Sunrise.
 
-The panel library uses six complete two-column rows: Deep Red / Deep Blue,
-Bright White / Animated Rainbow, Neon Rain / Aurora Comet, Spectrum Wave /
-Electric Sunrise, Matte Black Orange / Black, and Horde Red / Alliance Blue.
+The panel library uses six complete two-column rows: Static Red / Static Blue,
+Static White / Animated Rainbow, Neon Rain / Aurora Comet, Spectrum Wave /
+Electric Sunrise, Matte Black Orange / Black, and For the Horde! / For the
+Alliance!.
 
 ## Hardware contract
 
@@ -315,8 +326,9 @@ left bar section. Hugin's bar configuration places it immediately after Screen
 Time, with the panel opening below the widget.
 
 When enabled, the service performs one background scan and restores the last
-successful preset. The fallback for a missing state file is Bright White. The
-removed Tokyo Night Purple identifier migrates to Bright White.
+successful preset. The fallback for a missing state file is Static White. The
+removed Tokyo Night Purple identifier migrates to Static White; the internal
+identifier remains `bright-white` for saved-state compatibility.
 
 ## Roll back to 0.3.1
 

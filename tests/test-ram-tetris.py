@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Focused offline validation for the v0.4.16 RAM Tetris integration."""
+"""Focused offline validation for the v0.4.17 RAM Tetris integration."""
 
 from __future__ import annotations
 

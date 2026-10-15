@@ -91,17 +91,17 @@ static_ram_pattern() {
 
 preset_label() {
   case "${1}" in
-    deep-red) /usr/bin/printf '%s' 'Deep Red' ;;
-    bright-white) /usr/bin/printf '%s' 'Bright White' ;;
-    deep-blue) /usr/bin/printf '%s' 'Deep Blue' ;;
+    deep-red) /usr/bin/printf '%s' 'Static Red' ;;
+    bright-white) /usr/bin/printf '%s' 'Static White' ;;
+    deep-blue) /usr/bin/printf '%s' 'Static Blue' ;;
     animated-rainbow) /usr/bin/printf '%s' 'Animated Rainbow' ;;
     neon-rain) /usr/bin/printf '%s' 'Neon Rain' ;;
     aurora-comet) /usr/bin/printf '%s' 'Aurora Comet' ;;
     spectrum-wave) /usr/bin/printf '%s' 'Spectrum Wave' ;;
     matte-black-orange) /usr/bin/printf '%s' 'Matte Black Orange' ;;
     electric-sunrise) /usr/bin/printf '%s' 'Electric Sunrise' ;;
-    horde-red) /usr/bin/printf '%s' 'Horde Red' ;;
-    alliance-blue) /usr/bin/printf '%s' 'Alliance Blue' ;;
+    horde-red) /usr/bin/printf '%s' 'For the Horde!' ;;
+    alliance-blue) /usr/bin/printf '%s' 'For the Alliance!' ;;
     black) /usr/bin/printf '%s' 'Black (Turn Off RGB)' ;;
   esac
 }
