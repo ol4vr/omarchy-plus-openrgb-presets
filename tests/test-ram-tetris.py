@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Focused offline validation for the v0.4.9 RAM Tetris integration."""
+"""Focused offline validation for the v0.4.10 RAM Tetris integration."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,7 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.dont_write_bytecode = True
 
 core_spec = importlib.util.spec_from_file_location(
     "ram_tetris_core", ROOT / "ram_tetris_core.py"
@@ -321,6 +323,54 @@ class RuntimeSafetyTests(unittest.TestCase):
                 ).read_text()
             )
             self.assertEqual(stop["reason"], "user-off")
+
+    def test_disposable_checkout_commands_do_not_create_bytecode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory, "plugin")
+            checkout.mkdir()
+            for name in ("ram-tetris", "ram_tetris_core.py"):
+                shutil.copy2(ROOT / name, checkout / name)
+
+            state_home = Path(directory, "state")
+            runtime_home = Path(directory, "runtime")
+            env = os.environ | {
+                "HOME": directory,
+                "XDG_STATE_HOME": str(state_home),
+                "XDG_RUNTIME_DIR": str(runtime_home),
+            }
+            env.pop("PYTHONDONTWRITEBYTECODE", None)
+            entrypoint = checkout / "ram-tetris"
+            commands = (
+                ("status",),
+                ("enable",),
+                ("disable",),
+                ("request-stop", "user-off"),
+                ("clear-stop",),
+                ("fail", "simulated communication failure"),
+                ("clear-failure", "--acknowledge-reviewed-recovery"),
+                (
+                    "run",
+                    "--server-pid",
+                    "1",
+                    "--server-start",
+                    "1",
+                    "--lifecycle-pid",
+                    "1",
+                    "--lifecycle-start",
+                    "1",
+                ),
+            )
+            for command in commands:
+                subprocess.run(
+                    [entrypoint, *command],
+                    env=env,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            self.assertFalse(any(checkout.rglob("__pycache__")))
+            self.assertFalse(any(checkout.rglob("*.pyc")))
 
     def test_duplicate_runner_lock_fails_closed_before_hardware(self):
         with tempfile.TemporaryDirectory() as directory:

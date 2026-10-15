@@ -79,6 +79,11 @@ off and suspends animation while preserving the ON preference.
 
 Deep Red, Deep Blue, and Bright White use their one accepted static color.
 
+Version 0.4.10 changes no lighting behavior. The RAM Tetris entry point disables
+Python bytecode generation before loading its local scheduler module, keeping
+Git-managed production checkouts free of generated `__pycache__` and `.pyc`
+artifacts for every command.
+
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
 The experimental orange, blue, and red Sunrise gradients are therefore stored

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import glob
+import importlib
 import json
 import os
 import re
@@ -27,7 +28,8 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-import ram_tetris_core as core
+sys.dont_write_bytecode = True
+core = importlib.import_module("ram_tetris_core")
 
 HOST = "127.0.0.1"
 PORT = 6742
