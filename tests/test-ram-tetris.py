@@ -217,11 +217,24 @@ class PaletteAndFrames(unittest.TestCase):
         )
         self.assertEqual(core.generate_cycle("black", 9)[0].colors, (core.OFF,) * 12)
 
-    def test_static_fallbacks_are_unchanged(self):
-        self.assertEqual(core.STATIC_DDR5_COLORS["animated-rainbow"], "#404040")
-        self.assertEqual(core.STATIC_DDR5_COLORS["electric-sunrise"], "#3C00FF")
-        self.assertEqual(core.STATIC_DDR5_COLORS["horde-red"], "#180000")
-        self.assertEqual(core.STATIC_DDR5_COLORS["black"], core.OFF)
+    def test_all_static_fallbacks_are_exact(self):
+        self.assertEqual(
+            core.STATIC_DDR5_COLORS,
+            {
+                "deep-red": "#8B0000",
+                "deep-blue": "#000B22",
+                "bright-white": "#FFFFFF",
+                "animated-rainbow": "#0033AA",
+                "neon-rain": "#5500FF",
+                "aurora-comet": "#404040",
+                "spectrum-wave": "#0033AA",
+                "electric-sunrise": "#3C00FF",
+                "matte-black-orange": "#501000",
+                "black": core.OFF,
+                "horde-red": "#180000",
+                "alliance-blue": "#000B22",
+            },
+        )
 
 
 class SchedulerTests(unittest.TestCase):

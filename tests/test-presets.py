@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused source-only validation for OpenRGB Presets 0.4.13."""
+"""Focused source-only validation for OpenRGB Presets 0.4.14."""
 
 from __future__ import annotations
 
@@ -115,10 +115,10 @@ DDR5_STATIC_COLORS = {
     "deep-red": "8B0000",
     "deep-blue": "000B22",
     "bright-white": "FFFFFF",
-    "animated-rainbow": "404040",
+    "animated-rainbow": "0033AA",
     "neon-rain": "5500FF",
     "aurora-comet": "404040",
-    "spectrum-wave": "404040",
+    "spectrum-wave": "0033AA",
     "electric-sunrise": "3C00FF",
     "matte-black-orange": "501000",
     "black": "000000",
@@ -219,7 +219,7 @@ class PresetTests(unittest.TestCase):
 
     def test_manifest_and_panel_order(self) -> None:
         manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.4.13")
+        self.assertEqual(manifest["version"], "0.4.14")
 
         panel = PANEL.read_text(encoding="utf-8")
         library = panel.split(

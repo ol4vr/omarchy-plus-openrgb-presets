@@ -41,10 +41,10 @@ rainbow selection.
 | Deep Red | `#8B0000` | owner-approved |
 | Deep Blue | `#000B22` | owner-approved |
 | Bright White | `#FFFFFF` | owner-approved |
-| Animated Rainbow | `#404040` | owner-approved neutral dim white |
+| Animated Rainbow | `#0033AA` | owner-approved blue fallback |
 | Neon Rain | `#5500FF` | darkest decoded profile `UserColors` entry |
 | Aurora Comet | `#404040` | owner-approved neutral dim white |
-| Spectrum Wave | `#404040` | owner-approved neutral dim white |
+| Spectrum Wave | `#0033AA` | owner-approved blue fallback |
 | Electric Sunrise | `#3C00FF` | darkest decoded profile `UserColors` entry |
 | Matte Black Orange | `#501000` | owner-approved |
 | Black | `#000000` | owner-approved |
@@ -53,9 +53,10 @@ rainbow selection.
 
 Animated Rainbow, Aurora Comet, and Spectrum Wave do not expose a finite active
 palette from which a unique darkest color can be derived: the two rainbow
-effects generate the spectrum, while Comet has `RandomColors` enabled. Their
-owner-approved static DDR5 fallback is therefore neutral dim white. No source
-palette or non-DDR visual effect is changed by this workaround.
+effects generate the spectrum, while Comet has `RandomColors` enabled. Aurora
+Comet retains its neutral dim-white fallback; the two rainbow presets use the
+owner-approved blue fallback. No source palette or non-DDR visual effect is
+changed by this workaround.
 
 Version 0.4.9 adds a compact **RAM Tetris** toggle without changing the twelve
 preset cards or keyboard navigation. Its separate preference defaults to OFF
@@ -97,6 +98,11 @@ missing, duplicate, or additional Effects instances still fail closed.
 Version 0.4.13 refines only the Animated Rainbow and Spectrum Wave RAM Tetris
 palettes to the accepted green, purple, yellow, and red colors. Their non-DDR
 Effects behavior and neutral static DDR5 fallback remain unchanged.
+
+Version 0.4.14 changes only the Animated Rainbow and Spectrum Wave static DDR5
+fallback from `#404040` to the owner-approved OpenRGB CLI color `#0033AA`.
+Their RAM Tetris palettes, non-DDR Effects, and animation behavior are
+unchanged.
 
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
