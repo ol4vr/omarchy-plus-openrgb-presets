@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Focused offline validation for the v0.4.15 RAM Tetris integration."""
+"""Focused offline validation for the v0.4.16 RAM Tetris integration."""
 
 from __future__ import annotations
 
@@ -415,6 +415,26 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertTrue(all(colors == expected for _, colors in sdk.writes))
         self.assertEqual(control.states[-1], "off")
 
+    @mock.patch.object(runtime, "_preference", return_value=False)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_user_off_preference_transition_is_a_clean_stop(self, _preset, _preference):
+        writer, sdk, control = self.writer("user-off")
+        writer.run()
+        self.assertEqual(len(sdk.writes), 4)
+        expected = core.static_pattern_for("horde-red")
+        self.assertTrue(all(colors == expected for _, colors in sdk.writes))
+        self.assertEqual(control.states[-1], "off")
+
+    @mock.patch.object(runtime, "_preference", return_value=False)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_unexplained_preference_change_still_fails_closed(
+        self, _preset, _preference
+    ):
+        writer, sdk, _control = self.writer(None)
+        with self.assertRaisesRegex(runtime.SafetyStop, "preference changed"):
+            writer.run()
+        self.assertEqual(sdk.writes, [])
+
     @mock.patch.object(runtime, "_preference", return_value=True)
     @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
     def test_user_off_skips_already_correct_static_arrays(self, _preset, _preference):
@@ -504,6 +524,30 @@ class RuntimeSafetyTests(unittest.TestCase):
                 ).read_text()
             )
             self.assertEqual(stop["reason"], "user-off")
+
+    def test_disable_publishes_stop_before_preference_off(self):
+        calls = []
+
+        def record_stop(_control, reason):
+            calls.append(("stop", reason))
+
+        def record_preference(path, value):
+            calls.append(("preference", path.name, value))
+
+        with (
+            mock.patch.object(runtime, "_request_stop", side_effect=record_stop),
+            mock.patch.object(runtime, "_atomic_text", side_effect=record_preference),
+            mock.patch.object(sys, "argv", ["ram-tetris", "disable"]),
+        ):
+            self.assertEqual(runtime.main(), 0)
+
+        self.assertEqual(
+            calls,
+            [
+                ("stop", "user-off"),
+                ("preference", "ram-tetris-enabled", "off\n"),
+            ],
+        )
 
     def test_disposable_checkout_commands_do_not_create_bytecode(self):
         with tempfile.TemporaryDirectory() as directory:

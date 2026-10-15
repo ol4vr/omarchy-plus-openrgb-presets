@@ -103,6 +103,13 @@ static DDR5 fallback from `#404040` to the owner-approved OpenRGB CLI color
 paired arrays documented above while leaving RAM Tetris, non-DDR Effects, and
 animation behavior unchanged.
 
+Version 0.4.16 makes a user-requested OFF transition race-free. The helper
+publishes the `user-off` stop request before changing the persisted preference,
+and the writer treats an OFF value as a clean stop only when that matching stop
+request is present. An unexplained preference change still latches a fail-closed
+state, while healthy OFF restoration continues to use the selected preset's
+reviewed static array.
+
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
 The experimental orange, blue, and red Sunrise gradients are therefore stored

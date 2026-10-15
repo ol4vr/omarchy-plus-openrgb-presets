@@ -685,7 +685,10 @@ class TetrisWriter:
     ) -> tuple[dict[core.ControllerIdentity, ControllerSnapshot], Mapping[str, int]]:
         self.health.verify_processes()
         if not _preference():
-            raise SafetyStop("RAM Tetris preference changed")
+            if self.control.stop_reason() == "user-off":
+                self.stopping = True
+            else:
+                raise SafetyStop("RAM Tetris preference changed")
         if _selected_preset() != self.preset:
             raise SafetyStop("selected preset changed")
         temperatures = self.health.temperatures()
@@ -969,8 +972,8 @@ def main() -> int:
         print("RAM Tetris preference enabled")
         return 0
     if args.action == "disable":
-        _atomic_text(_state_root() / "ram-tetris-enabled", "off\n")
         _request_stop(control, "user-off")
+        _atomic_text(_state_root() / "ram-tetris-enabled", "off\n")
         print("RAM Tetris preference disabled; safe static restoration requested")
         return 0
     if args.action == "request-stop":
