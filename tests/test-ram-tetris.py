@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Focused offline validation for the v0.4.12 RAM Tetris integration."""
+"""Focused offline validation for the v0.4.15 RAM Tetris integration."""
 
 from __future__ import annotations
 
@@ -40,7 +40,12 @@ loader.exec_module(runtime)
 
 
 class FakeSDK:
-    def __init__(self, color: str = "#180000") -> None:
+    def __init__(
+        self,
+        color: str = "#180000",
+        colors: tuple[str, ...] | None = None,
+    ) -> None:
+        initial = colors if colors is not None else (color,) * core.LED_COUNT
         self.writes: list[tuple[int, tuple[str, ...]]] = []
         self.controllers = [
             runtime.ControllerSnapshot(
@@ -49,7 +54,7 @@ class FakeSDK:
                 identity.location,
                 "Direct",
                 12,
-                (color,) * 12,
+                initial,
             )
             for index, identity in enumerate(core.VERIFIED_DIMMS)
         ]
@@ -217,24 +222,86 @@ class PaletteAndFrames(unittest.TestCase):
         )
         self.assertEqual(core.generate_cycle("black", 9)[0].colors, (core.OFF,) * 12)
 
-    def test_all_static_fallbacks_are_exact(self):
-        self.assertEqual(
-            core.STATIC_DDR5_COLORS,
-            {
-                "deep-red": "#8B0000",
-                "deep-blue": "#000B22",
-                "bright-white": "#FFFFFF",
-                "animated-rainbow": "#0033AA",
-                "neon-rain": "#5500FF",
-                "aurora-comet": "#404040",
-                "spectrum-wave": "#0033AA",
-                "electric-sunrise": "#3C00FF",
-                "matte-black-orange": "#501000",
-                "black": core.OFF,
-                "horde-red": "#180000",
-                "alliance-blue": "#000B22",
-            },
-        )
+    def test_all_static_fallback_patterns_are_exact_palette_pairs(self):
+        expected_pairs = {
+            "deep-red": ("#8B0000",) * 6,
+            "deep-blue": ("#000B22",) * 6,
+            "bright-white": ("#FFFFFF",) * 6,
+            "animated-rainbow": (
+                "#11FF00",
+                "#8A2BE2",
+                "#FFD400",
+                "#FF0040",
+                "#8A2BE2",
+                "#11FF00",
+            ),
+            "neon-rain": (
+                "#5500FF",
+                "#11FF00",
+                "#00FF8C",
+                "#FF00F6",
+                "#FFD400",
+                "#5500FF",
+            ),
+            "aurora-comet": (
+                "#95FF00",
+                "#00D4FF",
+                "#8A2BE2",
+                "#8A2BE2",
+                "#00D4FF",
+                "#95FF00",
+            ),
+            "spectrum-wave": (
+                "#11FF00",
+                "#8A2BE2",
+                "#FFD400",
+                "#FF0040",
+                "#8A2BE2",
+                "#11FF00",
+            ),
+            "electric-sunrise": (
+                "#FF0040",
+                "#FF0051",
+                "#3C00FF",
+                "#0044FF",
+                "#FF0051",
+                "#FF0040",
+            ),
+            "matte-black-orange": (
+                "#FF4400",
+                "#E83B00",
+                "#C92B00",
+                "#501000",
+                "#E83B00",
+                "#FF4400",
+            ),
+            "black": (core.OFF,) * 6,
+            "horde-red": (
+                "#8B0000",
+                "#680000",
+                "#4A0000",
+                "#180000",
+                "#680000",
+                "#8B0000",
+            ),
+            "alliance-blue": (
+                "#0033AA",
+                "#002788",
+                "#001A66",
+                "#000B22",
+                "#002788",
+                "#0033AA",
+            ),
+        }
+        for preset, pair_pattern in expected_pairs.items():
+            pattern = core.static_pattern_for(preset)
+            self.assertEqual(len(pattern), core.LED_COUNT, preset)
+            self.assertEqual(pattern[::2], pair_pattern, preset)
+            self.assertEqual(pattern[1::2], pair_pattern, preset)
+            if preset == "black":
+                self.assertEqual(set(pattern), {core.OFF})
+            else:
+                self.assertEqual(set(pattern), set(core.PRESET_PALETTES[preset]))
 
 
 class SchedulerTests(unittest.TestCase):
@@ -344,7 +411,20 @@ class RuntimeSafetyTests(unittest.TestCase):
         writer, sdk, control = self.writer("user-off")
         writer.run()
         self.assertEqual(len(sdk.writes), 4)
-        self.assertTrue(all(colors == ("#180000",) * 12 for _, colors in sdk.writes))
+        expected = core.static_pattern_for("horde-red")
+        self.assertTrue(all(colors == expected for _, colors in sdk.writes))
+        self.assertEqual(control.states[-1], "off")
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_user_off_skips_already_correct_static_arrays(self, _preset, _preference):
+        sdk = FakeSDK(colors=core.static_pattern_for("horde-red"))
+        control = FakeControl("user-off")
+        writer = runtime.TetrisWriter(
+            sdk, FakeHealth(), FakeEffects(), control, "horde-red"
+        )
+        writer.run()
+        self.assertEqual(sdk.writes, [])
         self.assertEqual(control.states[-1], "off")
 
     @mock.patch.object(runtime, "_preference", return_value=True)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused source-only validation for OpenRGB Presets 0.4.14."""
+"""Focused source-only validation for OpenRGB Presets 0.4.15."""
 
 from __future__ import annotations
 
@@ -111,19 +111,75 @@ NON_RAM_ZONES = [
     (MAINBOARD_DEVICE, 1),
     (MAINBOARD_DEVICE, 2),
 ]
-DDR5_STATIC_COLORS = {
-    "deep-red": "8B0000",
-    "deep-blue": "000B22",
-    "bright-white": "FFFFFF",
-    "animated-rainbow": "0033AA",
-    "neon-rain": "5500FF",
-    "aurora-comet": "404040",
-    "spectrum-wave": "0033AA",
-    "electric-sunrise": "3C00FF",
-    "matte-black-orange": "501000",
-    "black": "000000",
-    "horde-red": "180000",
-    "alliance-blue": "000B22",
+DDR5_STATIC_PAIR_PATTERNS = {
+    "deep-red": ("8B0000",) * 6,
+    "deep-blue": ("000B22",) * 6,
+    "bright-white": ("FFFFFF",) * 6,
+    "animated-rainbow": (
+        "11FF00",
+        "8A2BE2",
+        "FFD400",
+        "FF0040",
+        "8A2BE2",
+        "11FF00",
+    ),
+    "neon-rain": (
+        "5500FF",
+        "11FF00",
+        "00FF8C",
+        "FF00F6",
+        "FFD400",
+        "5500FF",
+    ),
+    "aurora-comet": (
+        "95FF00",
+        "00D4FF",
+        "8A2BE2",
+        "8A2BE2",
+        "00D4FF",
+        "95FF00",
+    ),
+    "spectrum-wave": (
+        "11FF00",
+        "8A2BE2",
+        "FFD400",
+        "FF0040",
+        "8A2BE2",
+        "11FF00",
+    ),
+    "electric-sunrise": (
+        "FF0040",
+        "FF0051",
+        "3C00FF",
+        "0044FF",
+        "FF0051",
+        "FF0040",
+    ),
+    "matte-black-orange": (
+        "FF4400",
+        "E83B00",
+        "C92B00",
+        "501000",
+        "E83B00",
+        "FF4400",
+    ),
+    "black": ("000000",) * 6,
+    "horde-red": (
+        "8B0000",
+        "680000",
+        "4A0000",
+        "180000",
+        "680000",
+        "8B0000",
+    ),
+    "alliance-blue": (
+        "0033AA",
+        "002788",
+        "001A66",
+        "000B22",
+        "002788",
+        "0033AA",
+    ),
 }
 EFFECT_PROFILES = {
     "neon-rain": ("hugin-rain", "Rain"),
@@ -219,7 +275,7 @@ class PresetTests(unittest.TestCase):
 
     def test_manifest_and_panel_order(self) -> None:
         manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.4.14")
+        self.assertEqual(manifest["version"], "0.4.15")
 
         panel = PANEL.read_text(encoding="utf-8")
         library = panel.split(
@@ -290,10 +346,13 @@ class PresetTests(unittest.TestCase):
                 ).stdout.strip()
                 self.assertEqual(current, preset)
 
-    def test_every_preset_applies_one_exact_static_ddr5_color(self) -> None:
+    def test_every_preset_applies_one_exact_static_ddr5_pattern(self) -> None:
         with tempfile.TemporaryDirectory() as state_home:
             environment = os.environ | {"XDG_STATE_HOME": state_home}
-            for preset, expected_color in DDR5_STATIC_COLORS.items():
+            for preset, pair_pattern in DDR5_STATIC_PAIR_PATTERNS.items():
+                expected_colors = ",".join(
+                    color for color in pair_pattern for _ in range(2)
+                )
                 output = subprocess.run(
                     [str(APPLY), "--dry-run", preset],
                     check=True,
@@ -329,7 +388,14 @@ class PresetTests(unittest.TestCase):
                 self.assertEqual(len(ram_segments), 1, preset)
                 self.assertEqual(
                     ram_segments[0],
-                    ["--device", RAM_DEVICE, "--mode", "direct", "--color", expected_color],
+                    [
+                        "--device",
+                        RAM_DEVICE,
+                        "--mode",
+                        "direct",
+                        "--color",
+                        expected_colors,
+                    ],
                     preset,
                 )
 

@@ -732,8 +732,7 @@ class TetrisWriter:
         )
 
     def _restore_static(self) -> None:
-        color = core.STATIC_DDR5_COLORS[self.preset]
-        static = (color,) * core.LED_COUNT
+        static = core.static_pattern_for(self.preset)
         for identity in core.VERIFIED_DIMMS:
             controllers, _ = self._health_gate_for_restoration()
             if controllers[identity].colors == static:

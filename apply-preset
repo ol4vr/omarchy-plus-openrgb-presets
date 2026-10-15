@@ -72,6 +72,23 @@ is_preset() {
   esac
 }
 
+static_ram_pattern() {
+  case "${1}" in
+    deep-red) /usr/bin/printf '%s' '8B0000,8B0000,8B0000,8B0000,8B0000,8B0000,8B0000,8B0000,8B0000,8B0000,8B0000,8B0000' ;;
+    deep-blue) /usr/bin/printf '%s' '000B22,000B22,000B22,000B22,000B22,000B22,000B22,000B22,000B22,000B22,000B22,000B22' ;;
+    bright-white) /usr/bin/printf '%s' 'FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF' ;;
+    animated-rainbow|spectrum-wave) /usr/bin/printf '%s' '11FF00,11FF00,8A2BE2,8A2BE2,FFD400,FFD400,FF0040,FF0040,8A2BE2,8A2BE2,11FF00,11FF00' ;;
+    neon-rain) /usr/bin/printf '%s' '5500FF,5500FF,11FF00,11FF00,00FF8C,00FF8C,FF00F6,FF00F6,FFD400,FFD400,5500FF,5500FF' ;;
+    aurora-comet) /usr/bin/printf '%s' '95FF00,95FF00,00D4FF,00D4FF,8A2BE2,8A2BE2,8A2BE2,8A2BE2,00D4FF,00D4FF,95FF00,95FF00' ;;
+    electric-sunrise) /usr/bin/printf '%s' 'FF0040,FF0040,FF0051,FF0051,3C00FF,3C00FF,0044FF,0044FF,FF0051,FF0051,FF0040,FF0040' ;;
+    matte-black-orange) /usr/bin/printf '%s' 'FF4400,FF4400,E83B00,E83B00,C92B00,C92B00,501000,501000,E83B00,E83B00,FF4400,FF4400' ;;
+    black) /usr/bin/printf '%s' '000000,000000,000000,000000,000000,000000,000000,000000,000000,000000,000000,000000' ;;
+    horde-red) /usr/bin/printf '%s' '8B0000,8B0000,680000,680000,4A0000,4A0000,180000,180000,680000,680000,8B0000,8B0000' ;;
+    alliance-blue) /usr/bin/printf '%s' '0033AA,0033AA,002788,002788,001A66,001A66,000B22,000B22,002788,002788,0033AA,0033AA' ;;
+    *) return 64 ;;
+  esac
+}
+
 preset_label() {
   case "${1}" in
     deep-red) /usr/bin/printf '%s' 'Deep Red' ;;
@@ -230,9 +247,10 @@ apply_static() {
   local st100_base="${2}"
   local st100_logo="${3}"
   local mainboard_colors="${4}"
+  local ram_colors="${5}"
 
   run_openrgb \
-    --device "${RAM_DEVICE}" --mode direct --color "${main_color}" \
+    --device "${RAM_DEVICE}" --mode direct --color "${ram_colors}" \
     --device "${GPU_DEVICE}" --mode static --color "${main_color}" \
     --device "${ST100_DEVICE}" --zone 0 --mode direct --color "${st100_base}" \
     --device "${ST100_DEVICE}" --zone 1 --mode direct --color "${st100_logo}" \
@@ -253,48 +271,50 @@ apply_rainbow() {
 
 apply_preset() {
   local preset="${1}"
+  local ram_colors
+  ram_colors="$(static_ram_pattern "${preset}")"
 
   case "${preset}" in
     deep-red)
       stop_effects
-      apply_static 8B0000 A00000 A00000 8B0000
+      apply_static 8B0000 A00000 A00000 8B0000 "${ram_colors}"
       ;;
     bright-white)
       stop_effects
-      apply_static FFFFFF FFFFFF 2020FF FFFFFF
+      apply_static FFFFFF FFFFFF 2020FF FFFFFF "${ram_colors}"
       ;;
     deep-blue)
       stop_effects
-      apply_static 000B22 000B22 000B22 000B22
+      apply_static 000B22 000B22 000B22 000B22 "${ram_colors}"
       ;;
     animated-rainbow)
       stop_effects
-      apply_rainbow 0033AA
+      apply_rainbow "${ram_colors}"
       ;;
     neon-rain)
-      apply_effects_with_static_ram hugin-rain 'Rain' 5500FF
+      apply_effects_with_static_ram hugin-rain 'Rain' "${ram_colors}"
       ;;
     aurora-comet)
-      apply_effects_with_static_ram hugin-rainbow-comet 'Comet' 404040
+      apply_effects_with_static_ram hugin-rainbow-comet 'Comet' "${ram_colors}"
       ;;
     spectrum-wave)
-      apply_effects_with_static_ram hugin-rainbow-wave 'Rainbow Wave' 0033AA
+      apply_effects_with_static_ram hugin-rainbow-wave 'Rainbow Wave' "${ram_colors}"
       ;;
     matte-black-orange)
-      apply_effects_with_static_ram hugin-sunrise-orange-black 'Sunrise' 501000
+      apply_effects_with_static_ram hugin-sunrise-orange-black 'Sunrise' "${ram_colors}"
       ;;
     electric-sunrise)
-      apply_effects_with_static_ram hugin-sunrise-blue-red 'Sunrise' 3C00FF
+      apply_effects_with_static_ram hugin-sunrise-blue-red 'Sunrise' "${ram_colors}"
       ;;
     horde-red)
-      apply_effects_with_static_ram hugin-sunrise-red-black 'Sunrise' 180000
+      apply_effects_with_static_ram hugin-sunrise-red-black 'Sunrise' "${ram_colors}"
       ;;
     alliance-blue)
-      apply_effects_with_static_ram hugin-sunrise-blue-black 'Sunrise' 000B22
+      apply_effects_with_static_ram hugin-sunrise-blue-black 'Sunrise' "${ram_colors}"
       ;;
     black)
       stop_effects
-      apply_static 000000 000000 000000 000000
+      apply_static 000000 000000 000000 000000 "${ram_colors}"
       ;;
   esac
 

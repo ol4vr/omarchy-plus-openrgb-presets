@@ -44,21 +44,6 @@ PRESET_PALETTES: Mapping[str, tuple[str, ...]] = {
     "alliance-blue": ("#0033AA", "#002788", "#001A66", "#000B22"),
 }
 
-STATIC_DDR5_COLORS: Mapping[str, str] = {
-    "deep-red": "#8B0000",
-    "deep-blue": "#000B22",
-    "bright-white": "#FFFFFF",
-    "animated-rainbow": "#0033AA",
-    "neon-rain": "#5500FF",
-    "aurora-comet": "#404040",
-    "spectrum-wave": "#0033AA",
-    "electric-sunrise": "#3C00FF",
-    "matte-black-orange": "#501000",
-    "black": OFF,
-    "horde-red": "#180000",
-    "alliance-blue": "#000B22",
-}
-
 
 @dataclass(frozen=True, order=True)
 class ControllerIdentity:
@@ -95,6 +80,25 @@ def palette_for(preset: str) -> tuple[str, ...]:
     if not palette or OFF in palette:
         raise ValueError(f"invalid illuminated palette: {preset}")
     return palette
+
+
+def static_pattern_for(preset: str) -> tuple[str, ...]:
+    """Return the reviewed six-pair static arrangement for one preset."""
+
+    palette = palette_for(preset)
+    if not palette:
+        pair_colors = (OFF,) * BLOCK_COUNT
+    elif len(palette) == 1:
+        pair_colors = palette * BLOCK_COUNT
+    elif len(palette) == 3:
+        pair_colors = tuple(palette[index] for index in (0, 1, 2, 2, 1, 0))
+    elif len(palette) == 4:
+        pair_colors = tuple(palette[index] for index in (0, 1, 2, 3, 1, 0))
+    elif len(palette) == 5:
+        pair_colors = tuple(palette[index] for index in (0, 1, 2, 3, 4, 0))
+    else:
+        raise ValueError(f"unsupported static palette size: {preset}")
+    return tuple(color for color in pair_colors for _ in range(BLOCK_SIZE))
 
 
 def generate_cycle(preset: str, seed: int) -> tuple[Frame, ...]:

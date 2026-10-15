@@ -26,37 +26,35 @@ effect thread from overwriting the selected state.
 
 ## DDR5 lighting and static fallback
 
-Version 0.4.8 keeps all four Corsair DDR5 modules out of continuously updating
-Effects Plugin assignments. Selecting or restoring a preset writes one static
-Direct-mode color to the shared DDR5 device name after active effects are
-stopped and the non-DDR effect is loaded. The GPU, ST100, and motherboard
-retain the exact existing profile, 60 FPS rate, colors, animation settings,
-and zone mappings. Animated Rainbow
-continues to use the GPU and motherboard hardware rainbow modes plus the ST100
-fallback, while DDR5 receives one static write instead of its former hardware
-rainbow selection.
+All four Corsair DDR5 modules remain outside continuously updating Effects
+Plugin assignments. Version 0.4.15 replaces the former uniform fallback with
+one complete twelve-color Direct-mode array per DIMM after active effects are
+stopped and the non-DDR effect is loaded. The six entries below are paired LED
+groups from logical indices `0-1` through `10-11`; each listed color is sent to
+both LEDs in its group. Every color comes from that preset's accepted RAM
+Tetris palette.
 
-| Preset | Static DDR5 color | Source |
-| --- | --- | --- |
-| Deep Red | `#8B0000` | owner-approved |
-| Deep Blue | `#000B22` | owner-approved |
-| Bright White | `#FFFFFF` | owner-approved |
-| Animated Rainbow | `#0033AA` | owner-approved blue fallback |
-| Neon Rain | `#5500FF` | darkest decoded profile `UserColors` entry |
-| Aurora Comet | `#404040` | owner-approved neutral dim white |
-| Spectrum Wave | `#0033AA` | owner-approved blue fallback |
-| Electric Sunrise | `#3C00FF` | darkest decoded profile `UserColors` entry |
-| Matte Black Orange | `#501000` | owner-approved |
-| Black | `#000000` | owner-approved |
-| Horde Red | `#180000` | owner-approved |
-| Alliance Blue | `#000B22` | owner-approved |
+| Preset | Six paired static groups (`0-1` through `10-11`) |
+| --- | --- |
+| Deep Red | `#8B0000 · #8B0000 · #8B0000 · #8B0000 · #8B0000 · #8B0000` |
+| Deep Blue | `#000B22 · #000B22 · #000B22 · #000B22 · #000B22 · #000B22` |
+| Bright White | `#FFFFFF · #FFFFFF · #FFFFFF · #FFFFFF · #FFFFFF · #FFFFFF` |
+| Animated Rainbow | `#11FF00 · #8A2BE2 · #FFD400 · #FF0040 · #8A2BE2 · #11FF00` |
+| Neon Rain | `#5500FF · #11FF00 · #00FF8C · #FF00F6 · #FFD400 · #5500FF` |
+| Aurora Comet | `#95FF00 · #00D4FF · #8A2BE2 · #8A2BE2 · #00D4FF · #95FF00` |
+| Spectrum Wave | `#11FF00 · #8A2BE2 · #FFD400 · #FF0040 · #8A2BE2 · #11FF00` |
+| Electric Sunrise | `#FF0040 · #FF0051 · #3C00FF · #0044FF · #FF0051 · #FF0040` |
+| Matte Black Orange | `#FF4400 · #E83B00 · #C92B00 · #501000 · #E83B00 · #FF4400` |
+| Black | `#000000 · #000000 · #000000 · #000000 · #000000 · #000000` |
+| Horde Red | `#8B0000 · #680000 · #4A0000 · #180000 · #680000 · #8B0000` |
+| Alliance Blue | `#0033AA · #002788 · #001A66 · #000B22 · #002788 · #0033AA` |
 
-Animated Rainbow, Aurora Comet, and Spectrum Wave do not expose a finite active
-palette from which a unique darkest color can be derived: the two rainbow
-effects generate the spectrum, while Comet has `RandomColors` enabled. Aurora
-Comet retains its neutral dim-white fallback; the two rainbow presets use the
-owner-approved blue fallback. No source palette or non-DDR visual effect is
-changed by this workaround.
+Four-color palettes use the approved `A B C D B A` group order. The
+three-color Aurora palette uses `A B C C B A`; five-color Neon Rain uses
+`A B C D E A`, repeating only its first existing color. Single-color presets
+remain uniform and Black remains fully off. Animated Rainbow continues to use
+the GPU and motherboard hardware rainbow modes plus the ST100 fallback. No
+non-DDR color, animation setting, profile, or zone mapping changes.
 
 Version 0.4.9 adds a compact **RAM Tetris** toggle without changing the twelve
 preset cards or keyboard navigation. Its separate preference defaults to OFF
@@ -99,10 +97,11 @@ Version 0.4.13 refines only the Animated Rainbow and Spectrum Wave RAM Tetris
 palettes to the accepted green, purple, yellow, and red colors. Their non-DDR
 Effects behavior and neutral static DDR5 fallback remain unchanged.
 
-Version 0.4.14 changes only the Animated Rainbow and Spectrum Wave static DDR5
-fallback from `#404040` to the owner-approved OpenRGB CLI color `#0033AA`.
-Their RAM Tetris palettes, non-DDR Effects, and animation behavior are
-unchanged.
+Version 0.4.14 changed only the Animated Rainbow and Spectrum Wave uniform
+static DDR5 fallback from `#404040` to the owner-approved OpenRGB CLI color
+`#0033AA`. Version 0.4.15 supersedes every uniform fallback with the fixed
+paired arrays documented above while leaving RAM Tetris, non-DDR Effects, and
+animation behavior unchanged.
 
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
@@ -190,7 +189,7 @@ selected preset, and new kernel errors. A failed gate latches a visible panel
 failure in persistent private state and stops without a recovery write or
 automatic restart. The latch survives lifecycle, Quickshell, suspend/resume,
 and application restarts; ordinary OFF and ON actions never clear it. Turning
-the toggle OFF restores the static DDR5 color only after fresh health gates pass.
+the toggle OFF restores the static DDR5 array only after fresh health gates pass.
 Preset changes quiesce the writer under its lock before applying the existing
 preset. Suspend and Quickshell handoff stop it before SDK teardown or adoption;
 a parent-death signal prevents an orphan writer after abrupt shell exit.
