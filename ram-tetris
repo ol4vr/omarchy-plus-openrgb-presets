@@ -190,6 +190,56 @@ def _process_argv(pid: int) -> tuple[str, ...]:
         raise SafetyStop(f"process {pid} command is unreadable") from error
 
 
+def _process_parent(pid: int, proc_root: Path = Path("/proc")) -> int:
+    status = (proc_root / str(pid) / "status").read_text(encoding="utf-8")
+    for line in status.splitlines():
+        if line.startswith("PPid:"):
+            return int(line.split(":", 1)[1].strip())
+    raise ValueError(f"process {pid} parent is unreadable")
+
+
+def _is_descendant(pid: int, owner_pid: int, proc_root: Path) -> bool:
+    current = pid
+    visited: set[int] = set()
+    while current > 1 and current not in visited:
+        visited.add(current)
+        current = _process_parent(current, proc_root)
+        if current == owner_pid:
+            return True
+    return False
+
+
+def _independent_lifecycle_pids(
+    owner_pid: int, proc_root: Path = Path("/proc")
+) -> tuple[int, ...]:
+    """Return the verified owner and any same-argv non-descendant processes."""
+
+    matches: list[int] = []
+    for cmdline_path in proc_root.glob("[0-9]*/cmdline"):
+        try:
+            pid = int(cmdline_path.parent.name)
+            argv = tuple(
+                item.decode("utf-8", errors="surrogateescape")
+                for item in cmdline_path.read_bytes().split(b"\0")[:-1]
+            )
+        except (OSError, ValueError):
+            continue
+        if argv != LIFECYCLE_ARGV:
+            continue
+        if pid == owner_pid:
+            matches.append(pid)
+            continue
+        try:
+            descendant = _is_descendant(pid, owner_pid, proc_root)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            descendant = False
+        if not descendant:
+            matches.append(pid)
+    return tuple(sorted(matches))
+
+
 class _Reader:
     def __init__(self, data: bytes) -> None:
         self.data = data
@@ -433,18 +483,8 @@ class LinuxHealth:
             or _process_argv(self.lifecycle.pid) != LIFECYCLE_ARGV
         ):
             raise SafetyStop("OpenRGB lifecycle process identity changed")
-        lifecycle_matches = []
-        for cmdline_path in glob.glob("/proc/[0-9]*/cmdline"):
-            try:
-                argv = tuple(
-                    item.decode("utf-8", errors="surrogateescape")
-                    for item in Path(cmdline_path).read_bytes().split(b"\0")[:-1]
-                )
-            except OSError:
-                continue
-            if argv == LIFECYCLE_ARGV:
-                lifecycle_matches.append(cmdline_path)
-        if len(lifecycle_matches) != 1:
+        lifecycle_matches = _independent_lifecycle_pids(self.lifecycle.pid)
+        if lifecycle_matches != (self.lifecycle.pid,):
             raise SafetyStop(
                 f"expected one OpenRGB lifecycle, found {len(lifecycle_matches)}"
             )

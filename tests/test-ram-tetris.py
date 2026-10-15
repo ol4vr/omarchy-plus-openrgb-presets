@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Focused offline validation for the v0.4.10 RAM Tetris integration."""
+"""Focused offline validation for the v0.4.11 RAM Tetris integration."""
 
 from __future__ import annotations
 
@@ -226,6 +226,48 @@ class SchedulerTests(unittest.TestCase):
         stream = core.default_streams("horde-red", 24)[0]
         stream.advance(Fraction(10))
         self.assertGreaterEqual(stream.due, Fraction(51, 5))
+
+
+class ProcessIdentityTests(unittest.TestCase):
+    @staticmethod
+    def write_process(
+        proc_root: Path,
+        pid: int,
+        ppid: int,
+        argv: tuple[str, ...] = runtime.LIFECYCLE_ARGV,
+    ) -> None:
+        process = proc_root / str(pid)
+        process.mkdir()
+        process.joinpath("cmdline").write_bytes(
+            b"\0".join(item.encode() for item in argv) + b"\0"
+        )
+        process.joinpath("status").write_text(
+            f"Name:\tbash\nPid:\t{pid}\nPPid:\t{ppid}\n",
+            encoding="utf-8",
+        )
+
+    def test_three_same_argv_processes_reduce_to_the_owned_lifecycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            proc_root = Path(directory)
+            self.write_process(proc_root, 300, 100)
+            self.write_process(proc_root, 301, 300)
+            self.write_process(proc_root, 302, 301)
+
+            self.assertEqual(
+                runtime._independent_lifecycle_pids(300, proc_root), (300,)
+            )
+
+    def test_independent_same_argv_lifecycle_is_still_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            proc_root = Path(directory)
+            self.write_process(proc_root, 100, 1, ("/usr/bin/quickshell",))
+            self.write_process(proc_root, 300, 100)
+            self.write_process(proc_root, 301, 300)
+            self.write_process(proc_root, 400, 100)
+
+            self.assertEqual(
+                runtime._independent_lifecycle_pids(300, proc_root), (300, 400)
+            )
 
 
 class RuntimeSafetyTests(unittest.TestCase):
