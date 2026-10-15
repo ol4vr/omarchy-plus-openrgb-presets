@@ -7,6 +7,7 @@ set -o pipefail
 readonly OPENRGB_BIN="/usr/bin/openrgb"
 readonly SCRIPT_DIR="$(/usr/bin/readlink -f "$(/usr/bin/dirname "${BASH_SOURCE[0]}")")"
 readonly EFFECTS_SDK="${SCRIPT_DIR}/effects-sdk"
+readonly RAM_TETRIS="${RAM_TETRIS:-${SCRIPT_DIR}/ram-tetris}"
 readonly RAM_DEVICE="Corsair Dominator Platinum RGB DDR5"
 readonly GPU_DEVICE="ASUS TUF GeForce RTX 4090 Gaming OG OC"
 readonly ST100_DEVICE="Corsair ST100 RGB"
@@ -16,6 +17,9 @@ readonly STATE_ROOT="${XDG_STATE_HOME:-${HOME}/.local/state}/omarchy-plus/openrg
 readonly STATE_FILE="${STATE_ROOT}/active-preset"
 readonly LAST_LOG="${STATE_ROOT}/last-openrgb.log"
 readonly LOCK_FILE="${STATE_ROOT}/apply.flock"
+readonly USER_ID="$(/usr/bin/id -u)"
+readonly RUNTIME_ROOT="${OPENRGB_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/run/user/${USER_ID}}/omarchy-plus/openrgb-presets}"
+readonly TETRIS_LOCK_FILE="${RUNTIME_ROOT}/ram-tetris.lock"
 readonly PROBE_TIMEOUT="2s"
 readonly COMMAND_TIMEOUT="15s"
 readonly PROBE_ATTEMPTS=15
@@ -368,6 +372,11 @@ main() {
     return 69
   fi
 
+  if [[ ! -x "${RAM_TETRIS}" ]]; then
+    /usr/bin/printf 'RAM Tetris helper is unavailable: %s\n' "${RAM_TETRIS}" >&2
+    return 69
+  fi
+
   /usr/bin/mkdir -p "${STATE_ROOT}"
 
   exec 9>"${LOCK_FILE}"
@@ -376,7 +385,19 @@ main() {
     return 75
   fi
 
+  /usr/bin/mkdir -p "${RUNTIME_ROOT}"
+  "${RAM_TETRIS}" request-stop preset-change
+  exec 8>"${TETRIS_LOCK_FILE}"
+  if ! /usr/bin/flock --wait 10 8; then
+    "${RAM_TETRIS}" fail 'RAM Tetris did not quiesce before preset application'
+    /usr/bin/printf '%s\n' 'RAM Tetris did not stop safely; preset was not changed.' >&2
+    return 75
+  fi
+
+  trap '"${RAM_TETRIS}" fail '\''Preset application failed while RAM Tetris was quiesced'\''' ERR
   apply_preset "${preset}"
+  trap - ERR
+  "${RAM_TETRIS}" clear-stop
 }
 
 main "$@"

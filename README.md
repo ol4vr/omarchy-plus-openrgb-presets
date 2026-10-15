@@ -24,7 +24,7 @@ zones, and the three motherboard zones. Static and hardware presets stop every
 active software effect before changing controller modes, preventing an old
 effect thread from overwriting the selected state.
 
-## Temporary static DDR5 workaround
+## DDR5 lighting and static fallback
 
 Version 0.4.8 keeps all four Corsair DDR5 modules out of continuously updating
 Effects Plugin assignments. Selecting or restoring a preset writes one static
@@ -56,6 +56,28 @@ palette from which a unique darkest color can be derived: the two rainbow
 effects generate the spectrum, while Comet has `RandomColors` enabled. Their
 owner-approved static DDR5 fallback is therefore neutral dim white. No source
 palette or non-DDR visual effect is changed by this workaround.
+
+Version 0.4.9 adds a compact **RAM Tetris** toggle without changing the twelve
+preset cards or keyboard navigation. Its separate preference defaults to OFF
+and is stored as `ram-tetris-enabled` beside the selected preset. OFF retains
+the v0.4.8 static mapping above. ON uses six two-LED blocks per DIMM, preserves
+landed block colors, and independently fills and resets all four modules. Each
+new block draws from the selected preset's reviewed palette with black
+excluded. Single-color presets remain single-color. Black keeps every DDR5 LED
+off and suspends animation while preserving the ON preference.
+
+| Preset | RAM Tetris palette |
+| --- | --- |
+| Animated Rainbow | `#FF4D6D`, `#FFD166`, `#06D6A0`, `#4CC9F0`, `#9B5DE5` |
+| Neon Rain | `#5500FF`, `#11FF00`, `#00FF8C`, `#FF00F6`, `#FFD400` |
+| Aurora Comet | `#95FF00`, `#00D4FF`, `#8A2BE2` |
+| Spectrum Wave | `#FF4D6D`, `#FFD166`, `#06D6A0`, `#4CC9F0`, `#9B5DE5` |
+| Electric Sunrise | `#FF0040`, `#FF0051`, `#3C00FF`, `#0044FF` |
+| Matte Black Orange | `#FF4400`, `#E83B00`, `#C92B00`, `#501000` |
+| Horde Red | `#8B0000`, `#680000`, `#4A0000`, `#180000` |
+| Alliance Blue | `#0033AA`, `#002788`, `#001A66`, `#000B22` |
+
+Deep Red, Deep Blue, and Bright White use their one accepted static color.
 
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
@@ -127,6 +149,38 @@ lifecycle is killed before its traps complete, the kernel sends each child
 `SIGTERM`. Child processes explicitly close the runtime lock descriptor, so an
 OpenRGB server, preset restoration, inhibitor, or monitor cannot accidentally
 retain lifecycle ownership.
+
+The lifecycle also owns at most one `ram-tetris` writer. A private writer lock
+prevents duplicates across reconciliation and Quickshell handoff. The writer
+uses one non-detecting SDK connection, resolves each DIMM by exact name and
+I801 address before every update, and globally serializes complete twelve-LED
+frames. Seeded 200, 300, or 400 ms intervals enforce at most five updates per
+second per DIMM, 20 globally, 200 ms per DIMM, and 50 ms globally. Delayed
+frames are rescheduled instead of replayed as bursts.
+
+Before each write it rechecks the SDK PID/start token/argv/listener, lifecycle,
+boot and suspend identity, seven-controller inventory, all four SPD5118
+readings, Direct mode and twelve LEDs, the active six-zone Effects contract,
+selected preset, and new kernel errors. A failed gate latches a visible panel
+failure in persistent private state and stops without a recovery write or
+automatic restart. The latch survives lifecycle, Quickshell, suspend/resume,
+and application restarts; ordinary OFF and ON actions never clear it. Turning
+the toggle OFF restores the static DDR5 color only after fresh health gates pass.
+Preset changes quiesce the writer under its lock before applying the existing
+preset. Suspend and Quickshell handoff stop it before SDK teardown or adoption;
+a parent-death signal prevents an orphan writer after abrupt shell exit.
+
+Clearing a hardware-failure latch is deliberately absent from the panel. After
+a separately reviewed recovery establishes healthy hardware, the owner must
+first leave RAM Tetris OFF and then run:
+
+```bash
+~/.config/omarchy/plugins/io.github.ol4vr.openrgb-presets/ram-tetris \
+  clear-failure --acknowledge-reviewed-recovery
+```
+
+The command refuses to run while the preference is ON or while a writer owns
+the singleton lock. A later ON request still passes every normal health gate.
 
 Legacy 0.3.x/0.4.0 inhibitors and logind monitors can be classified for
 one-time cleanup with the read-only `--classify-legacy-inhibitor` and
@@ -204,9 +258,11 @@ qmllint -I "$OMARCHY_PATH/shell" \
 /usr/bin/bash -n "$PLUGIN_DIR/openrgb-lifecycle"
 /usr/bin/bash -n "$PLUGIN_DIR/install-effects-plugin"
 /usr/bin/python3 -m py_compile "$PLUGIN_DIR/effects-sdk"
+/usr/bin/python3 -m py_compile "$PLUGIN_DIR/ram-tetris" "$PLUGIN_DIR/ram_tetris_core.py"
 "$PLUGIN_DIR/tests/test-lifecycle-duplicate-prevention"
 "$PLUGIN_DIR/tests/test-lifecycle-inhibitors"
 /usr/bin/python3 "$PLUGIN_DIR/tests/test-presets.py"
+/usr/bin/python3 "$PLUGIN_DIR/tests/test-ram-tetris.py"
 "$PLUGIN_DIR/openrgb-lifecycle" --check
 "$PLUGIN_DIR/apply-preset" --list
 "$PLUGIN_DIR/apply-preset" --dry-run black
@@ -319,6 +375,19 @@ recovery and seven-controller health check, applying the saved preset restores
 the prior continuously animated DDR5 behavior. Version 0.4.8 changes no panel,
 palette, non-DDR animation, SDK lifecycle, controller identity, or persisted
 preset format.
+
+## Roll back the 0.4.9 RAM Tetris integration
+
+First turn RAM Tetris OFF while all hardware-health gates pass, then verify the
+selected preset's static DDR5 color. Redeploy exact accepted v0.4.8 commit
+`da442105970eff86e669ebc6d72326e23c8e11a8`. The separate
+`ram-tetris-enabled` preference may remain as inert state or be removed only
+after the lifecycle is stopped. The rollback restores accepted static DDR5
+behavior without changing the twelve presets, seven Effects profiles, OpenRGB
+or Effects Plugin binaries, or non-DDR animations. If communication is already
+degraded, do not request a restoration write; stop for hardware-recovery
+review instead. Do not delete `ram-tetris-failure.json` merely to complete a
+rollback; preserve it as failure evidence until that review is complete.
 
 ## Remove
 

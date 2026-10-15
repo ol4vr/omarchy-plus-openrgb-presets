@@ -23,10 +23,17 @@ readonly PROC_ROOT="${PROC_ROOT:-/proc}"
 readonly SCRIPT_PATH="$(/usr/bin/readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_DIR="$(/usr/bin/dirname "${SCRIPT_PATH}")"
 readonly APPLY_PRESET="${APPLY_PRESET:-${SCRIPT_DIR}/apply-preset}"
+readonly RAM_TETRIS="${RAM_TETRIS:-${SCRIPT_DIR}/ram-tetris}"
 readonly USER_ID="${OPENRGB_USER_ID:-$(/usr/bin/id -u)}"
 readonly RUNTIME_DIR="${OPENRGB_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/run/user/${USER_ID}}/omarchy-plus/openrgb-presets}"
 readonly LIFECYCLE_LOCK_FILE="${RUNTIME_DIR}/lifecycle.lock"
 readonly SERVER_LOG_FILE="${OPENRGB_SERVER_LOG:-${RUNTIME_DIR}/openrgb-server.log}"
+readonly TETRIS_LOG_FILE="${OPENRGB_TETRIS_LOG:-${RUNTIME_DIR}/ram-tetris.log}"
+readonly STATE_ROOT="${XDG_STATE_HOME:-${HOME}/.local/state}/omarchy-plus/openrgb-presets"
+readonly TETRIS_PREFERENCE_FILE="${STATE_ROOT}/ram-tetris-enabled"
+readonly ACTIVE_PRESET_FILE="${STATE_ROOT}/active-preset"
+readonly TETRIS_FAILURE_FILE="${STATE_ROOT}/ram-tetris-failure.json"
+readonly TETRIS_STATUS_FILE="${RUNTIME_DIR}/ram-tetris-status.json"
 readonly USER_MANAGER_COMMAND="${USER_MANAGER_COMMAND:-/usr/lib/systemd/systemd --user}"
 readonly RESTORE_TIMEOUT="75s"
 readonly RESUME_DELAY="${OPENRGB_RESUME_DELAY:-3}"
@@ -42,6 +49,8 @@ server_pid=''
 server_start_time=''
 server_origin='none'
 restore_pid=''
+tetris_pid=''
+tetris_start_time=''
 inhibitor_pid=''
 inhibitor_start_time=''
 monitor_pid=''
@@ -253,6 +262,121 @@ stop_restore() {
     stop_process "${restore_pid}" "Preset restore"
   fi
   restore_pid=''
+}
+
+is_tetris_process() {
+  local pid="${1:-}"
+  local start_time="${2:-}"
+  local command=''
+
+  is_same_process "${pid}" "${start_time}" || return 1
+  command="$(process_command "${pid}" 2>/dev/null || true)"
+  [[ "${command}" == "/usr/bin/python3 ${RAM_TETRIS} run --server-pid ${server_pid} --server-start ${server_start_time} --lifecycle-pid $$ --lifecycle-start $(process_start_time $$)" ]]
+}
+
+tetris_preference_enabled() {
+  [[ -r "${TETRIS_PREFERENCE_FILE}" ]] \
+    && [[ "$(/usr/bin/head -n 1 "${TETRIS_PREFERENCE_FILE}")" == on ]]
+}
+
+tetris_selected_preset() {
+  if [[ -r "${ACTIVE_PRESET_FILE}" ]]; then
+    /usr/bin/head -n 1 "${ACTIVE_PRESET_FILE}"
+  else
+    /usr/bin/printf '%s' bright-white
+  fi
+}
+
+clear_tetris_identity() {
+  tetris_pid=''
+  tetris_start_time=''
+}
+
+start_tetris() {
+  local attempt
+  local lifecycle_start=''
+
+  [[ "${suspended}" == false ]] || return 0
+  tetris_preference_enabled || return 0
+  [[ "$(tetris_selected_preset)" != black ]] || return 0
+  [[ ! -e "${TETRIS_FAILURE_FILE}" ]] || return 0
+  is_server_listener "${server_pid}" "${server_start_time}" || return 1
+  if is_tetris_process "${tetris_pid}" "${tetris_start_time}"; then
+    return 0
+  fi
+  clear_tetris_identity
+  lifecycle_start="$(process_start_time $$)"
+  (
+    close_lock_for_child
+    exec "${SETPRIV_BIN}" --pdeathsig TERM "${RAM_TETRIS}" run \
+      --server-pid "${server_pid}" \
+      --server-start "${server_start_time}" \
+      --lifecycle-pid "$$" \
+      --lifecycle-start "${lifecycle_start}" >>"${TETRIS_LOG_FILE}" 2>&1
+  ) &
+  tetris_pid=$!
+  tetris_start_time=''
+  for attempt in {1..20}; do
+    tetris_start_time="$(process_start_time "${tetris_pid}" 2>/dev/null || true)"
+    if is_tetris_process "${tetris_pid}" "${tetris_start_time}"; then
+      log "RAM Tetris started as PID ${tetris_pid} (start ${tetris_start_time})"
+      return 0
+    fi
+    if ! is_running "${tetris_pid}"; then
+      break
+    fi
+    "${SLEEP_BIN}" 0.05
+  done
+  wait "${tetris_pid}" 2>/dev/null || true
+  clear_tetris_identity
+  return 1
+}
+
+stop_tetris() {
+  local reason="${1:-handoff}"
+  local attempt
+
+  "${RAM_TETRIS}" request-stop "${reason}" >/dev/null 2>&1 || true
+  if [[ -z "${tetris_pid}" ]]; then
+    return 0
+  fi
+  for attempt in {1..100}; do
+    if ! is_same_process "${tetris_pid}" "${tetris_start_time}"; then
+      wait "${tetris_pid}" 2>/dev/null || true
+      clear_tetris_identity
+      return 0
+    fi
+    "${SLEEP_BIN}" 0.05
+  done
+  if is_tetris_process "${tetris_pid}" "${tetris_start_time}"; then
+    kill -TERM "${tetris_pid}" 2>/dev/null || true
+    wait "${tetris_pid}" 2>/dev/null || true
+  else
+    log "Refusing to signal changed RAM Tetris PID ${tetris_pid}"
+    return 1
+  fi
+  clear_tetris_identity
+}
+
+reconcile_tetris() {
+  if [[ -n "${tetris_pid}" ]] && ! is_same_process "${tetris_pid}" "${tetris_start_time}"; then
+    wait "${tetris_pid}" 2>/dev/null || true
+    clear_tetris_identity
+    if [[ ! -e "${TETRIS_FAILURE_FILE}" ]] \
+      && [[ -r "${TETRIS_STATUS_FILE}" ]] \
+      && /usr/bin/grep -q '"state": "running"' "${TETRIS_STATUS_FILE}"; then
+      "${RAM_TETRIS}" fail 'RAM Tetris writer exited unexpectedly; static restoration was not attempted' >/dev/null 2>&1 || true
+    fi
+  fi
+  if ! tetris_preference_enabled; then
+    [[ -z "${tetris_pid}" ]] || stop_tetris user-off
+    return 0
+  fi
+  if [[ "$(tetris_selected_preset)" == black ]]; then
+    [[ -z "${tetris_pid}" ]] || stop_tetris preset-change
+    return 0
+  fi
+  [[ -n "${restore_pid}" ]] || start_tetris
 }
 
 expected_server_command() {
@@ -525,6 +649,9 @@ handle_sleep_signal() {
     fi
     suspended=true
     log "PrepareForSleep(true): stopping OpenRGB"
+    if ! stop_tetris suspend; then
+      /usr/bin/printf '%s\n' 'RAM Tetris could not be stopped safely before sleep' >&2
+    fi
     if ! stop_server 'suspend'; then
       /usr/bin/printf '%s\n' 'OpenRGB could not be stopped safely before sleep' >&2
     fi
@@ -549,6 +676,8 @@ cleanup() {
     return 0
   fi
   shutting_down=true
+
+  stop_tetris handoff || true
 
   case "${mode}" in
     handoff)
@@ -585,6 +714,11 @@ check_dependencies() {
       failed=true
     fi
   done
+
+  if [[ ! -x "${RAM_TETRIS}" ]]; then
+    /usr/bin/printf 'Missing executable: %s\n' "${RAM_TETRIS}" >&2
+    failed=true
+  fi
 
   if [[ "${failed}" == true ]]; then
     return 69
@@ -650,8 +784,17 @@ main() {
     fi
 
     if [[ -n "${restore_pid}" ]] && ! is_running "${restore_pid}"; then
-      wait "${restore_pid}" 2>/dev/null || true
+      if wait "${restore_pid}"; then
+        restore_pid=''
+        reconcile_tetris || true
+      else
+        "${RAM_TETRIS}" fail 'Saved preset restoration failed; RAM Tetris was not started' >/dev/null 2>&1 || true
+      fi
       restore_pid=''
+    fi
+
+    if [[ "${suspended}" == false ]]; then
+      reconcile_tetris || true
     fi
 
     if [[ "${suspended}" == false ]] \

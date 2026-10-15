@@ -1,0 +1,970 @@
+#!/usr/bin/python3
+"""Lifecycle-owned Corsair DDR5 Tetris writer for OpenRGB Presets.
+
+The hardware path connects only to the already-running loopback SDK server. It
+never performs local detection, controller-mode changes, retries, or recovery.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import glob
+import json
+import os
+import re
+import signal
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import threading
+import time
+from collections import Counter
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from fractions import Fraction
+from pathlib import Path
+
+import ram_tetris_core as core
+
+HOST = "127.0.0.1"
+PORT = 6742
+EXPECTED_CONTROLLER_COUNT = 7
+PROTOCOL_VERSION = 4
+MAGIC = b"ORGB"
+HEADER = struct.Struct("<4sIII")
+MAX_PACKET_SIZE = 16 * 1024 * 1024
+REQUEST_CONTROLLER_COUNT = 0
+REQUEST_CONTROLLER_DATA = 1
+REQUEST_PLUGIN_LIST = 200
+PLUGIN_SPECIFIC = 201
+REQUEST_EFFECT_LIST = 0
+UPDATE_LEDS = 1050
+EFFECTS_PLUGIN_NAME = "OpenRGB Effects Plugin"
+SPD_ENDPOINTS = ("10-0050", "10-0051", "10-0052", "10-0053")
+RELEVANT_KERNEL_ERROR = re.compile(
+    r"spd5118|i801|smbus|i2c.*(?:error|fail|timeout)|error -[0-9]+", re.IGNORECASE
+)
+SERVER_ARGV = (
+    "/usr/bin/openrgb",
+    "--noautoconnect",
+    "--startminimized",
+    "--server",
+    "--server-host",
+    HOST,
+    "--server-port",
+    str(PORT),
+)
+LIFECYCLE_ARGV = (
+    "/usr/bin/bash",
+    str(Path(__file__).resolve().parent / "openrgb-lifecycle"),
+)
+
+PROFILE_BY_PRESET = {
+    "neon-rain": "hugin-rain",
+    "aurora-comet": "hugin-rainbow-comet",
+    "spectrum-wave": "hugin-rainbow-wave",
+    "electric-sunrise": "hugin-sunrise-blue-red",
+    "matte-black-orange": "hugin-sunrise-orange-black",
+    "horde-red": "hugin-sunrise-red-black",
+    "alliance-blue": "hugin-sunrise-blue-black",
+}
+
+
+class SafetyStop(RuntimeError):
+    """A mandatory health gate failed; no further hardware write is allowed."""
+
+
+class HardwareWriteFailure(SafetyStop):
+    """The SDK write itself failed, so restoration is forbidden."""
+
+
+@dataclass(frozen=True)
+class ServerIdentity:
+    pid: int
+    start_token: str
+
+
+@dataclass(frozen=True)
+class LifecycleIdentity:
+    pid: int
+    start_token: str
+    boot_id: str
+    successful_suspends: int
+
+
+@dataclass(frozen=True)
+class ControllerSnapshot:
+    index: int
+    name: str
+    location: str
+    mode: str
+    led_count: int
+    colors: tuple[str, ...]
+
+
+def _state_root() -> Path:
+    base = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+    return base / "omarchy-plus/openrgb-presets"
+
+
+def _runtime_root() -> Path:
+    value = os.environ.get("OPENRGB_RUNTIME_DIR") or os.environ.get("XDG_RUNTIME_DIR")
+    if not value:
+        value = f"/run/user/{os.getuid()}"
+    return Path(value) / (
+        "" if os.environ.get("OPENRGB_RUNTIME_DIR") else "omarchy-plus/openrgb-presets"
+    )
+
+
+def _private_directory(path: Path) -> None:
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    metadata = path.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+        raise SafetyStop(f"unsafe runtime directory: {path}")
+    path.chmod(0o700)
+
+
+def _atomic_text(path: Path, value: str) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            output.write(value)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _write_json(path: Path, value: object) -> None:
+    _atomic_text(path, json.dumps(value, sort_keys=True) + "\n")
+
+
+def _preference() -> bool:
+    path = _state_root() / "ram-tetris-enabled"
+    try:
+        return path.read_text(encoding="utf-8").strip() == "on"
+    except FileNotFoundError:
+        return False
+
+
+def _selected_preset() -> str:
+    try:
+        preset = (
+            (_state_root() / "active-preset")
+            .read_text(encoding="utf-8")
+            .splitlines()[0]
+            .strip()
+        )
+    except (IndexError, OSError) as error:
+        raise SafetyStop("selected preset state is unreadable") from error
+    if preset not in core.PRESET_PALETTES:
+        raise SafetyStop(f"unknown selected preset: {preset}")
+    return preset
+
+
+def _process_start_token(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+    except (IndexError, OSError) as error:
+        raise SafetyStop(f"process {pid} identity is unreadable") from error
+
+
+def _process_argv(pid: int) -> tuple[str, ...]:
+    try:
+        return tuple(
+            item.decode("utf-8", errors="surrogateescape")
+            for item in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[:-1]
+        )
+    except OSError as error:
+        raise SafetyStop(f"process {pid} command is unreadable") from error
+
+
+class _Reader:
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.offset = 0
+
+    def take(self, size: int) -> bytes:
+        if size < 0 or self.offset + size > len(self.data):
+            raise SafetyStop("OpenRGB returned truncated SDK data")
+        value = self.data[self.offset : self.offset + size]
+        self.offset += size
+        return value
+
+    def u16(self) -> int:
+        return struct.unpack("<H", self.take(2))[0]
+
+    def u32(self) -> int:
+        return struct.unpack("<I", self.take(4))[0]
+
+    def i32(self) -> int:
+        return struct.unpack("<i", self.take(4))[0]
+
+    def string(self) -> str:
+        raw = self.take(self.u16())
+        if not raw or raw[-1] != 0:
+            raise SafetyStop("OpenRGB returned an invalid SDK string")
+        return raw[:-1].decode("utf-8", errors="replace")
+
+
+def _read_exact(connection: socket.socket, size: int) -> bytes:
+    data = bytearray()
+    while len(data) < size:
+        chunk = connection.recv(size - len(data))
+        if not chunk:
+            raise SafetyStop("OpenRGB closed the SDK connection")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def _send_packet(
+    connection: socket.socket, index: int, packet: int, payload: bytes = b""
+) -> None:
+    connection.sendall(HEADER.pack(MAGIC, index, packet, len(payload)) + payload)
+
+
+def _request(
+    connection: socket.socket, index: int, packet: int, payload: bytes = b""
+) -> bytes:
+    _send_packet(connection, index, packet, payload)
+    magic, _index, returned, size = HEADER.unpack(_read_exact(connection, HEADER.size))
+    if magic != MAGIC or returned != packet or size > MAX_PACKET_SIZE:
+        raise SafetyStop("OpenRGB returned an invalid SDK packet")
+    return _read_exact(connection, size)
+
+
+def _unpack_color(color: int) -> str:
+    return f"#{color & 0xFF:02X}{(color >> 8) & 0xFF:02X}{(color >> 16) & 0xFF:02X}"
+
+
+def _pack_color(color: str) -> int:
+    if not re.fullmatch(r"#[0-9A-F]{6}", color):
+        raise SafetyStop(f"invalid RGB color: {color}")
+    return (
+        int(color[1:3], 16) | (int(color[3:5], 16) << 8) | (int(color[5:7], 16) << 16)
+    )
+
+
+def _parse_controller(index: int, data: bytes) -> ControllerSnapshot:
+    reader = _Reader(data)
+    reader.u32()
+    reader.i32()
+    name = reader.string()
+    for _ in range(4):
+        reader.string()
+    location = reader.string()
+    mode_count = reader.u16()
+    active_mode = reader.i32()
+    modes: list[str] = []
+    for _ in range(mode_count):
+        modes.append(reader.string())
+        reader.i32()
+        reader.u32()
+        for _ in range(10):
+            reader.u32()
+        for _ in range(reader.u16()):
+            reader.u32()
+    for _ in range(reader.u16()):
+        reader.string()
+        reader.i32()
+        reader.u32()
+        reader.u32()
+        reader.u32()
+        reader.take(reader.u16())
+        for _ in range(reader.u16()):
+            reader.string()
+            reader.i32()
+            reader.u32()
+            reader.u32()
+    led_count = reader.u16()
+    for _ in range(led_count):
+        reader.string()
+        reader.u32()
+    colors = tuple(_unpack_color(reader.u32()) for _ in range(reader.u16()))
+    mode = modes[active_mode] if 0 <= active_mode < len(modes) else ""
+    return ControllerSnapshot(index, name, location, mode, led_count, colors)
+
+
+class OpenRGBSDK:
+    """One non-detecting SDK connection and one serialized write lock."""
+
+    def __init__(self) -> None:
+        self.connection: socket.socket | None = None
+        self.lock = threading.Lock()
+
+    def open(self) -> None:
+        try:
+            self.connection = socket.create_connection((HOST, PORT), timeout=2)
+            self.connection.settimeout(2)
+        except OSError as error:
+            raise SafetyStop(f"OpenRGB SDK connection failed: {error}") from error
+
+    def close(self) -> None:
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = None
+
+    def _connection(self) -> socket.socket:
+        if self.connection is None:
+            raise SafetyStop("OpenRGB SDK is not connected")
+        return self.connection
+
+    def inventory(self) -> tuple[ControllerSnapshot, ...]:
+        try:
+            with self.lock:
+                connection = self._connection()
+                count_data = _request(connection, 0, REQUEST_CONTROLLER_COUNT)
+                if len(count_data) != 4:
+                    raise SafetyStop("invalid OpenRGB controller count")
+                count = struct.unpack("<I", count_data)[0]
+                return tuple(
+                    _parse_controller(
+                        index,
+                        _request(
+                            connection,
+                            index,
+                            REQUEST_CONTROLLER_DATA,
+                            struct.pack("<I", PROTOCOL_VERSION),
+                        ),
+                    )
+                    for index in range(count)
+                )
+        except OSError as error:
+            raise SafetyStop(f"OpenRGB SDK inventory failed: {error}") from error
+
+    def active_effects(self) -> tuple[str, ...]:
+        try:
+            with self.lock:
+                connection = self._connection()
+                plugins = _Reader(_request(connection, 0, REQUEST_PLUGIN_LIST))
+                plugins.u32()
+                effects_index = None
+                for _ in range(plugins.u16()):
+                    name = plugins.string()
+                    plugins.string()
+                    plugins.string()
+                    index = plugins.u32()
+                    plugins.u32()
+                    if name == EFFECTS_PLUGIN_NAME:
+                        effects_index = index
+                if effects_index is None:
+                    raise SafetyStop("OpenRGB Effects Plugin is not loaded")
+                data = _Reader(
+                    _request(
+                        connection,
+                        effects_index,
+                        PLUGIN_SPECIFIC,
+                        struct.pack("<I", REQUEST_EFFECT_LIST),
+                    )
+                )
+                if data.u32() != REQUEST_EFFECT_LIST:
+                    raise SafetyStop("Effects Plugin returned the wrong packet")
+                data.u32()
+                active: list[str] = []
+                for _ in range(data.u16()):
+                    effect_name = data.string()
+                    data.string()
+                    if data.take(1) != b"\0":
+                        active.append(effect_name)
+                return tuple(active)
+        except OSError as error:
+            raise SafetyStop(f"Effects SDK query failed: {error}") from error
+
+    def update_leds(self, index: int, colors: Sequence[str]) -> None:
+        values = tuple(_pack_color(color) for color in core.validate_colors(colors))
+        payload = struct.pack("<IH", 4 + 2 + 4 * len(values), len(values))
+        payload += struct.pack(f"<{len(values)}I", *values)
+        try:
+            with self.lock:
+                _send_packet(self._connection(), index, UPDATE_LEDS, payload)
+        except OSError as error:
+            raise HardwareWriteFailure(f"OpenRGB UPDATELEDS failed: {error}") from error
+
+
+class LinuxHealth:
+    def __init__(self, server: ServerIdentity, lifecycle: LifecycleIdentity) -> None:
+        self.server = server
+        self.lifecycle = lifecycle
+        self.kernel_cursor = ""
+
+    def begin(self) -> None:
+        output = self._journal(["-n", "0", "--show-cursor"])
+        self.kernel_cursor = self._cursor(output)
+
+    @staticmethod
+    def _journal(extra: Sequence[str]) -> str:
+        try:
+            return subprocess.run(
+                ["journalctl", "-b", "-k", "--no-pager", *extra],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            ).stdout
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise SafetyStop("current-boot kernel journal is unreadable") from error
+
+    @staticmethod
+    def _cursor(output: str) -> str:
+        for line in reversed(output.splitlines()):
+            if line.startswith("-- cursor: "):
+                return line.removeprefix("-- cursor: ")
+        raise SafetyStop("journalctl did not return a cursor")
+
+    def verify_processes(self) -> None:
+        if (
+            _process_start_token(self.server.pid) != self.server.start_token
+            or _process_argv(self.server.pid) != SERVER_ARGV
+        ):
+            raise SafetyStop("OpenRGB SDK process identity changed")
+        if (
+            _process_start_token(self.lifecycle.pid) != self.lifecycle.start_token
+            or _process_argv(self.lifecycle.pid) != LIFECYCLE_ARGV
+        ):
+            raise SafetyStop("OpenRGB lifecycle process identity changed")
+        lifecycle_matches = []
+        for cmdline_path in glob.glob("/proc/[0-9]*/cmdline"):
+            try:
+                argv = tuple(
+                    item.decode("utf-8", errors="surrogateescape")
+                    for item in Path(cmdline_path).read_bytes().split(b"\0")[:-1]
+                )
+            except OSError:
+                continue
+            if argv == LIFECYCLE_ARGV:
+                lifecycle_matches.append(cmdline_path)
+        if len(lifecycle_matches) != 1:
+            raise SafetyStop(
+                f"expected one OpenRGB lifecycle, found {len(lifecycle_matches)}"
+            )
+        try:
+            listeners = (
+                subprocess.run(
+                    ["ss", "-H", "-ltnp", f"sport = :{PORT}"],
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                )
+                .stdout.strip()
+                .splitlines()
+            )
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise SafetyStop("OpenRGB listener ownership is unreadable") from error
+        if (
+            len(listeners) != 1
+            or f"{HOST}:{PORT}" not in listeners[0]
+            or not re.search(rf"\bpid={self.server.pid}(?:,|\))", listeners[0])
+        ):
+            raise SafetyStop("OpenRGB SDK listener ownership changed")
+        try:
+            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+            suspends = int(Path("/sys/power/suspend_stats/success").read_text().strip())
+        except (OSError, ValueError) as error:
+            raise SafetyStop("boot or suspend continuity is unreadable") from error
+        if (
+            boot_id != self.lifecycle.boot_id
+            or suspends != self.lifecycle.successful_suspends
+        ):
+            raise SafetyStop("boot or suspend continuity changed")
+
+    def temperatures(self) -> Mapping[str, int]:
+        values: dict[str, int] = {}
+        for endpoint in SPD_ENDPOINTS:
+            device = Path("/sys/bus/i2c/devices") / endpoint
+            try:
+                if device.joinpath("driver").resolve().name != "spd5118":
+                    raise SafetyStop(f"{endpoint} is not bound to spd5118")
+            except OSError as error:
+                raise SafetyStop(f"{endpoint} driver binding is unreadable") from error
+            paths = glob.glob(str(device / "hwmon/hwmon*/temp1_input"))
+            if len(paths) != 1:
+                raise SafetyStop(f"{endpoint} has {len(paths)} temperature paths")
+            try:
+                value = int(Path(paths[0]).read_text().strip())
+            except (OSError, ValueError) as error:
+                raise SafetyStop(f"{endpoint} temperature is unreadable") from error
+            if value <= 0:
+                raise SafetyStop(f"{endpoint} returned invalid temperature {value}")
+            values[endpoint] = value
+        return values
+
+    def no_new_kernel_errors(self) -> None:
+        output = self._journal(["--after-cursor", self.kernel_cursor, "--show-cursor"])
+        self.kernel_cursor = self._cursor(output)
+        errors = [
+            line for line in output.splitlines() if RELEVANT_KERNEL_ERROR.search(line)
+        ]
+        if errors:
+            raise SafetyStop("new relevant kernel error: " + " | ".join(errors))
+
+
+class EffectsContract:
+    def __init__(self, preset: str, plugin_root: Path) -> None:
+        self.expected: Counter[str] = Counter()
+        profile_name = PROFILE_BY_PRESET.get(preset)
+        if profile_name is None:
+            return
+        try:
+            document = json.loads(
+                (plugin_root / "effects-profiles" / profile_name).read_text()
+            )
+        except (OSError, json.JSONDecodeError) as error:
+            raise SafetyStop(
+                f"Effects profile is unreadable: {profile_name}"
+            ) from error
+        effects = document.get("Effects")
+        if not isinstance(effects, list) or not effects:
+            raise SafetyStop("Effects profile has no effects")
+        zone_count = 0
+        for effect in effects:
+            if not isinstance(effect, dict) or not isinstance(
+                effect.get("ControllerZones"), list
+            ):
+                raise SafetyStop("Effects profile metadata is invalid")
+            name = effect.get("EffectClassName")
+            if not isinstance(name, str):
+                raise SafetyStop("Effects profile effect name is invalid")
+            self.expected[name] += 1
+            for zone in effect["ControllerZones"]:
+                zone_count += 1
+                if not isinstance(zone, dict):
+                    raise SafetyStop("Effects profile zone is invalid")
+                location = zone.get("location", "")
+                if zone.get("name") == core.VERIFIED_DIMMS[0].name or (
+                    isinstance(location, str)
+                    and "/dev/i2c-10" in location
+                    and re.search(r"address 0x1[89ABab]", location)
+                ):
+                    raise SafetyStop("Effects profile assigns a DDR5 controller")
+        if zone_count != 6:
+            raise SafetyStop(f"Effects profile has {zone_count} zones; expected six")
+
+    def verify(self, active: Sequence[str]) -> None:
+        if Counter(active) != self.expected:
+            raise SafetyStop("live Effects instances changed or include DDR5")
+
+
+def _targets(
+    controllers: Sequence[ControllerSnapshot],
+) -> dict[core.ControllerIdentity, ControllerSnapshot]:
+    if len(controllers) != EXPECTED_CONTROLLER_COUNT:
+        raise SafetyStop(f"expected seven controllers, found {len(controllers)}")
+    targets: dict[core.ControllerIdentity, ControllerSnapshot] = {}
+    for identity in core.VERIFIED_DIMMS:
+        matches = [
+            item
+            for item in controllers
+            if item.name == identity.name and item.location == identity.location
+        ]
+        if len(matches) != 1:
+            raise SafetyStop(
+                f"expected one DIMM at {identity.location}, found {len(matches)}"
+            )
+        target = matches[0]
+        if (
+            target.mode != "Direct"
+            or target.led_count != core.LED_COUNT
+            or len(target.colors) != core.LED_COUNT
+        ):
+            raise SafetyStop(f"DIMM is not twelve-LED Direct mode: {identity.location}")
+        targets[identity] = target
+    return targets
+
+
+class RuntimeControl:
+    def __init__(self) -> None:
+        self.root = _runtime_root()
+        _private_directory(self.root)
+        self.stop_path = self.root / "ram-tetris.stop"
+        self.status_path = self.root / "ram-tetris-status.json"
+        self.failure_path = _state_root() / "ram-tetris-failure.json"
+
+    def stop_reason(self) -> str | None:
+        try:
+            value = json.loads(self.stop_path.read_text())
+            return value.get("reason") if isinstance(value, dict) else "unknown"
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError):
+            return "invalid-stop-request"
+
+    def status(self, state: str, message: str, **extra: object) -> None:
+        _write_json(
+            self.status_path,
+            {"state": state, "message": message, "pid": os.getpid(), **extra},
+        )
+
+    def fail(self, message: str) -> None:
+        value = {
+            "state": "failed",
+            "message": message,
+            "pid": os.getpid(),
+            "time": time.time(),
+        }
+        _write_json(self.failure_path, value)
+        _write_json(self.status_path, value)
+
+
+class TetrisWriter:
+    def __init__(
+        self,
+        sdk: OpenRGBSDK,
+        health: LinuxHealth,
+        effects: EffectsContract,
+        control: RuntimeControl,
+        preset: str,
+    ) -> None:
+        self.sdk = sdk
+        self.health = health
+        self.effects = effects
+        self.control = control
+        self.preset = preset
+        self.expected: dict[core.ControllerIdentity, tuple[str, ...]] = {}
+        self.last_global_write: float | None = None
+        self.last_dimm_write: dict[core.ControllerIdentity, float] = {}
+        self.stopping = False
+        self.animation_writes = 0
+
+    def _health_gate(
+        self,
+    ) -> tuple[dict[core.ControllerIdentity, ControllerSnapshot], Mapping[str, int]]:
+        self.health.verify_processes()
+        if not _preference():
+            raise SafetyStop("RAM Tetris preference changed")
+        if _selected_preset() != self.preset:
+            raise SafetyStop("selected preset changed")
+        temperatures = self.health.temperatures()
+        self.health.no_new_kernel_errors()
+        controllers = _targets(self.sdk.inventory())
+        self.effects.verify(self.sdk.active_effects())
+        if self.expected:
+            for identity, colors in self.expected.items():
+                if controllers[identity].colors != colors:
+                    raise SafetyStop(
+                        f"DIMM state changed outside the Tetris writer: {identity.location}"
+                    )
+        return controllers, temperatures
+
+    def _sleep_until(self, target: float) -> None:
+        while True:
+            if self.stopping or self.control.stop_reason() is not None:
+                return
+            delay = target - time.monotonic()
+            if delay <= 0:
+                return
+            time.sleep(min(delay, 0.05))
+
+    def _write(
+        self, identity: core.ControllerIdentity, colors: tuple[str, ...]
+    ) -> None:
+        controllers, temperatures = self._health_gate()
+        if self.stopping or self.control.stop_reason() is not None:
+            return
+        if colors == self.expected[identity]:
+            raise SafetyStop("scheduler produced a redundant frame")
+        self.sdk.update_leds(controllers[identity].index, colors)
+        now = time.monotonic()
+        self.last_global_write = now
+        self.last_dimm_write[identity] = now
+        self.expected[identity] = colors
+        self.animation_writes += 1
+        self.control.status(
+            "running",
+            "RAM Tetris active",
+            preset=self.preset,
+            writes=self.animation_writes,
+            temperatures_mc=dict(temperatures),
+        )
+
+    def _restore_static(self) -> None:
+        color = core.STATIC_DDR5_COLORS[self.preset]
+        static = (color,) * core.LED_COUNT
+        for identity in core.VERIFIED_DIMMS:
+            controllers, _ = self._health_gate_for_restoration()
+            if controllers[identity].colors == static:
+                self.expected[identity] = static
+                continue
+            self.sdk.update_leds(controllers[identity].index, static)
+            self.expected[identity] = static
+            self._health_gate_for_restoration()
+
+    def _health_gate_for_restoration(
+        self,
+    ) -> tuple[dict[core.ControllerIdentity, ControllerSnapshot], Mapping[str, int]]:
+        self.health.verify_processes()
+        if _selected_preset() != self.preset:
+            raise SafetyStop("selected preset changed before restoration")
+        temperatures = self.health.temperatures()
+        self.health.no_new_kernel_errors()
+        controllers = _targets(self.sdk.inventory())
+        self.effects.verify(self.sdk.active_effects())
+        for identity, colors in self.expected.items():
+            if controllers[identity].colors != colors:
+                raise SafetyStop(
+                    f"DIMM state changed before restoration: {identity.location}"
+                )
+        return controllers, temperatures
+
+    def run(self) -> None:
+        self.health.begin()
+        controllers, temperatures = self._health_gate()
+        self.expected = {
+            identity: target.colors for identity, target in controllers.items()
+        }
+        streams = list(core.default_streams(self.preset))
+        origin = time.monotonic()
+        self.control.status(
+            "running",
+            "RAM Tetris active",
+            preset=self.preset,
+            writes=0,
+            temperatures_mc=dict(temperatures),
+        )
+        while not self.stopping:
+            reason = self.control.stop_reason()
+            if reason is not None:
+                break
+            stream = min(streams, key=lambda item: (item.due, item.identity.location))
+            target = origin + float(stream.due)
+            if self.last_global_write is not None:
+                target = max(target, self.last_global_write + 0.05)
+            if stream.identity in self.last_dimm_write:
+                target = max(target, self.last_dimm_write[stream.identity] + 0.2)
+            self._sleep_until(target)
+            if self.stopping or self.control.stop_reason() is not None:
+                break
+            colors = stream.frame.colors
+            self._write(stream.identity, colors)
+            stream.advance(
+                Fraction.from_float(time.monotonic() - origin).limit_denominator(
+                    1_000_000
+                )
+            )
+
+        reason = self.control.stop_reason() or "lifecycle-exit"
+        if reason == "user-off":
+            self._restore_static()
+            self.control.status(
+                "off",
+                "RAM Tetris off; static DDR5 restored",
+                preset=self.preset,
+                writes=self.animation_writes,
+            )
+        else:
+            self.control.status(
+                "stopped",
+                f"RAM Tetris stopped for {reason}",
+                preset=self.preset,
+                writes=self.animation_writes,
+            )
+
+
+def _status_document(control: RuntimeControl) -> dict[str, object]:
+    preference = _preference()
+    if control.failure_path.exists():
+        try:
+            failure = json.loads(control.failure_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            failure = {
+                "state": "failed",
+                "message": "RAM Tetris failure state is unreadable",
+            }
+        failure["preference"] = preference
+        return failure
+    try:
+        preset = _selected_preset()
+    except SafetyStop:
+        preset = "unknown"
+    if not preference:
+        try:
+            status = json.loads(control.status_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            status = {}
+        if control.stop_reason() == "user-off" and status.get("state") == "running":
+            return {
+                "preference": False,
+                "state": "stopping",
+                "message": "Stopping; safe static restoration pending",
+            }
+        return {"preference": False, "state": "off", "message": "Static DDR5 lighting"}
+    if preset == "black":
+        return {
+            "preference": True,
+            "state": "paused-black",
+            "message": "Enabled; paused for Black preset",
+        }
+    try:
+        status = json.loads(control.status_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        status = {"state": "waiting", "message": "Enabled; waiting for safe startup"}
+    status["preference"] = True
+    return status
+
+
+def _request_stop(control: RuntimeControl, reason: str) -> None:
+    _write_json(control.stop_path, {"reason": reason, "time": time.time()})
+
+
+def _lifecycle_identity(pid: int, token: str) -> LifecycleIdentity:
+    if _process_start_token(pid) != token:
+        raise SafetyStop("lifecycle start token does not match")
+    try:
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        suspends = int(Path("/sys/power/suspend_stats/success").read_text().strip())
+    except (OSError, ValueError) as error:
+        raise SafetyStop("boot or suspend baseline is unreadable") from error
+    return LifecycleIdentity(pid, token, boot_id, suspends)
+
+
+def _run(args: argparse.Namespace) -> int:
+    control = RuntimeControl()
+    if (
+        not _preference()
+        or _selected_preset() == "black"
+        or control.failure_path.exists()
+    ):
+        return 0
+    lock_path = control.root / "ram-tetris.lock"
+    lock_fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 75
+        if control.stop_reason() is not None:
+            return 75
+        sdk = OpenRGBSDK()
+        writer: TetrisWriter | None = None
+
+        def stop(_signum: int, _frame: object) -> None:
+            if writer is not None:
+                writer.stopping = True
+
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+        try:
+            lifecycle = _lifecycle_identity(args.lifecycle_pid, args.lifecycle_start)
+            server = ServerIdentity(args.server_pid, args.server_start)
+            sdk.open()
+            preset = _selected_preset()
+            writer = TetrisWriter(
+                sdk,
+                LinuxHealth(server, lifecycle),
+                EffectsContract(preset, Path(__file__).resolve().parent),
+                control,
+                preset,
+            )
+            writer.run()
+        except SafetyStop as error:
+            control.fail(str(error))
+            print(f"RAM Tetris stopped without restoration: {error}", file=sys.stderr)
+            return 1
+        except Exception as error:  # noqa: BLE001 - fail-closed hardware boundary
+            control.fail(f"unexpected writer failure: {error}")
+            print(
+                "RAM Tetris stopped without restoration: "
+                f"unexpected writer failure: {error}",
+                file=sys.stderr,
+            )
+            return 1
+        finally:
+            sdk.close()
+        return 0
+    finally:
+        os.close(lock_fd)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    actions = parser.add_subparsers(dest="action", required=True)
+    run = actions.add_parser("run")
+    run.add_argument("--server-pid", type=int, required=True)
+    run.add_argument("--server-start", required=True)
+    run.add_argument("--lifecycle-pid", type=int, required=True)
+    run.add_argument("--lifecycle-start", required=True)
+    actions.add_parser("status")
+    actions.add_parser("enable")
+    actions.add_parser("disable")
+    stop = actions.add_parser("request-stop")
+    stop.add_argument(
+        "reason",
+        choices=("user-off", "preset-change", "suspend", "handoff", "shutdown"),
+    )
+    actions.add_parser("clear-stop")
+    clear_failure = actions.add_parser("clear-failure")
+    clear_failure.add_argument(
+        "--acknowledge-reviewed-recovery", action="store_true", required=True
+    )
+    fail = actions.add_parser("fail")
+    fail.add_argument("message")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    control = RuntimeControl()
+    if args.action == "status":
+        print(json.dumps(_status_document(control), sort_keys=True))
+        return 0
+    if args.action == "enable":
+        _atomic_text(_state_root() / "ram-tetris-enabled", "on\n")
+        try:
+            control.stop_path.unlink()
+        except FileNotFoundError:
+            pass
+        print("RAM Tetris preference enabled")
+        return 0
+    if args.action == "disable":
+        _atomic_text(_state_root() / "ram-tetris-enabled", "off\n")
+        _request_stop(control, "user-off")
+        print("RAM Tetris preference disabled; safe static restoration requested")
+        return 0
+    if args.action == "request-stop":
+        _request_stop(control, args.reason)
+        return 0
+    if args.action == "clear-stop":
+        try:
+            control.stop_path.unlink()
+        except FileNotFoundError:
+            pass
+        return 0
+    if args.action == "clear-failure":
+        if _preference():
+            raise SystemExit(
+                "failure recovery refused: turn RAM Tetris OFF before the "
+                "separately reviewed recovery action"
+            )
+        lock_path = control.root / "ram-tetris.lock"
+        lock_fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise SystemExit(
+                    "failure recovery refused: RAM Tetris writer still owns the lock"
+                ) from error
+            try:
+                control.failure_path.unlink()
+            except FileNotFoundError:
+                pass
+        finally:
+            os.close(lock_fd)
+        print("Persistent RAM Tetris failure latch cleared after reviewed recovery")
+        return 0
+    if args.action == "fail":
+        control.fail(args.message)
+        return 0
+    return _run(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

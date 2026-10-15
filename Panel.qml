@@ -14,6 +14,8 @@ Panel {
   readonly property var barIdentity: hostWidget || root
   readonly property string helperPath: Quickshell.env("HOME")
     + "/.config/omarchy/plugins/io.github.ol4vr.openrgb-presets/apply-preset"
+  readonly property string tetrisHelperPath: Quickshell.env("HOME")
+    + "/.config/omarchy/plugins/io.github.ol4vr.openrgb-presets/ram-tetris"
   readonly property color contentForeground: bar ? bar.foreground : Color.foreground
   readonly property string contentFontFamily: bar ? bar.fontFamily : Style.font.family
 
@@ -24,6 +26,12 @@ Panel {
   property bool statusError: false
   property string processOutput: ""
   property string processError: ""
+  property bool ramTetrisPreference: false
+  property string ramTetrisState: "off"
+  property string ramTetrisMessage: "Static DDR5 lighting"
+  property string tetrisPendingAction: ""
+  property string tetrisProcessOutput: ""
+  property string tetrisProcessError: ""
 
   readonly property var presets: [
     {
@@ -140,6 +148,7 @@ Panel {
 
   function open() {
     root.controller.show()
+    if (!tetrisStatusProc.running) tetrisStatusProc.running = true
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
@@ -216,7 +225,31 @@ Panel {
     return match ? match[1] : value.match(/^[a-z0-9-]+$/) ? value : ""
   }
 
-  Component.onCompleted: currentProc.running = true
+  function toggleRamTetris() {
+    if (tetrisActionProc.running || tetrisStatusProc.running || actionProc.running)
+      return
+    tetrisPendingAction = ramTetrisPreference ? "disable" : "enable"
+    tetrisProcessOutput = ""
+    tetrisProcessError = ""
+    tetrisActionProc.running = true
+  }
+
+  function applyTetrisStatus(output) {
+    try {
+      var state = JSON.parse(String(output).trim())
+      ramTetrisPreference = state.preference === true
+      ramTetrisState = String(state.state || "waiting")
+      ramTetrisMessage = String(state.message || "RAM Tetris status unavailable")
+    } catch (error) {
+      ramTetrisState = "failed"
+      ramTetrisMessage = "RAM Tetris status response was invalid"
+    }
+  }
+
+  Component.onCompleted: {
+    currentProc.running = true
+    tetrisStatusProc.running = true
+  }
 
   Process {
     id: currentProc
@@ -269,6 +302,63 @@ Panel {
           : "Preset application failed"
       }
       root.pendingPreset = ""
+      if (!tetrisStatusProc.running) tetrisStatusProc.running = true
+    }
+  }
+
+  Process {
+    id: tetrisStatusProc
+    command: [root.tetrisHelperPath, "status"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.tetrisProcessOutput = text.trim()
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.tetrisProcessError = text.trim()
+    }
+    onExited: function(exitCode) {
+      if (exitCode === 0)
+        root.applyTetrisStatus(root.tetrisProcessOutput)
+      else {
+        root.ramTetrisState = "failed"
+        root.ramTetrisMessage = root.tetrisProcessError !== ""
+          ? root.tetrisProcessError
+          : "RAM Tetris status read failed"
+      }
+    }
+  }
+
+  Process {
+    id: tetrisActionProc
+    command: [root.tetrisHelperPath, root.tetrisPendingAction]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.tetrisProcessOutput = text.trim()
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.tetrisProcessError = text.trim()
+    }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) {
+        root.ramTetrisState = "failed"
+        root.ramTetrisMessage = root.tetrisProcessError !== ""
+          ? root.tetrisProcessError
+          : "RAM Tetris toggle failed"
+      }
+      root.tetrisPendingAction = ""
+      if (!tetrisStatusProc.running) tetrisStatusProc.running = true
+    }
+  }
+
+  Timer {
+    interval: 1000
+    repeat: true
+    running: root.opened
+    onTriggered: {
+      if (!tetrisStatusProc.running && !tetrisActionProc.running)
+        tetrisStatusProc.running = true
     }
   }
 
@@ -438,6 +528,82 @@ Panel {
                 }
               }
             }
+          }
+        }
+
+        Rectangle {
+          id: tetrisToggle
+          readonly property bool failed: root.ramTetrisState === "failed"
+          readonly property color accentColor: failed
+            ? "#F7768E"
+            : root.ramTetrisPreference ? "#9ECE6A" : "#565F89"
+
+          width: parent.width
+          height: Style.space(60)
+          radius: Style.cornerRadius
+          color: Qt.rgba(accentColor.r, accentColor.g, accentColor.b, 0.08)
+          border.width: 1
+          border.color: Qt.rgba(accentColor.r, accentColor.g, accentColor.b, 0.34)
+
+          Column {
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(14)
+            anchors.right: toggleTrack.left
+            anchors.rightMargin: Style.space(14)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(2)
+
+            Text {
+              width: parent.width
+              text: "RAM TETRIS"
+              color: root.contentForeground
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.body
+              font.bold: true
+              font.letterSpacing: 0.9
+            }
+
+            Text {
+              width: parent.width
+              text: tetrisActionProc.running ? "UPDATING…" : root.ramTetrisMessage.toUpperCase()
+              color: tetrisToggle.accentColor
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+              font.letterSpacing: 0.6
+              elide: Text.ElideRight
+            }
+          }
+
+          Rectangle {
+            id: toggleTrack
+            width: Style.space(48)
+            height: Style.space(26)
+            radius: height / 2
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(14)
+            anchors.verticalCenter: parent.verticalCenter
+            color: Qt.rgba(tetrisToggle.accentColor.r, tetrisToggle.accentColor.g, tetrisToggle.accentColor.b, 0.26)
+            border.width: 1
+            border.color: tetrisToggle.accentColor
+
+            Rectangle {
+              width: Style.space(20)
+              height: width
+              radius: width / 2
+              anchors.verticalCenter: parent.verticalCenter
+              x: root.ramTetrisPreference
+                ? parent.width - width - Style.space(3)
+                : Style.space(3)
+              color: tetrisToggle.accentColor
+            }
+          }
+
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            enabled: !tetrisActionProc.running && !tetrisStatusProc.running
+              && !actionProc.running && !currentProc.running
+            onClicked: root.toggleRamTetris()
           }
         }
 
