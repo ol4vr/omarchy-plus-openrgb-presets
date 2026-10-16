@@ -2,17 +2,15 @@
   "schemaVersion": 1,
   "id": "io.github.ol4vr.openrgb-presets",
   "name": "OpenRGB Presets",
-  "version": "0.4.18",
+  "version": "0.4.19",
   "author": "Olav Rorvik",
   "license": "MIT",
   "description": "Choose reviewed OpenRGB presets and optional RAM Tetris lighting for Hugin from the Omarchy bar.",
   "kinds": [
-    "bar-widget",
-    "service"
+    "bar-widget"
   ],
   "entryPoints": {
-    "barWidget": "BarWidget.qml",
-    "service": "Service.qml"
+    "barWidget": "BarWidget.qml"
   },
   "barWidget": {
     "displayName": "OpenRGB Presets",

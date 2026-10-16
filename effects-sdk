@@ -10,7 +10,7 @@ import struct
 import sys
 import time
 from dataclasses import dataclass
-
+from typing import Self
 
 HOST = "127.0.0.1"
 PORT = 6742
@@ -67,7 +67,9 @@ def send_packet(
     packet_id: int,
     payload: bytes = b"",
 ) -> None:
-    connection.sendall(HEADER.pack(MAGIC, device_index, packet_id, len(payload)) + payload)
+    connection.sendall(
+        HEADER.pack(MAGIC, device_index, packet_id, len(payload)) + payload
+    )
 
 
 def receive_packet(connection: socket.socket) -> tuple[int, int, bytes]:
@@ -119,7 +121,7 @@ class EffectsClient:
     def close(self) -> None:
         self.connection.close()
 
-    def __enter__(self) -> "EffectsClient":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -225,7 +227,9 @@ class EffectsClient:
         self._send(LOAD_PROFILE, pack_string(profile))
         for _ in range(50):
             effects = self.effects()
-            if any(effect.name == expected_effect and effect.enabled for effect in effects):
+            if any(
+                effect.name == expected_effect and effect.enabled for effect in effects
+            ):
                 return
             time.sleep(0.1)
         raise SDKError(

@@ -63,6 +63,7 @@ SERVER_ARGV = (
 LIFECYCLE_ARGV = (
     "/usr/bin/bash",
     str(Path(__file__).resolve().parent / "openrgb-lifecycle"),
+    "--service",
 )
 
 PROFILE_BY_PRESET = {
@@ -163,8 +164,35 @@ def _atomic_text(path: Path, value: str) -> None:
             pass
 
 
+def _atomic_text_if_absent(path: Path, value: str) -> bool:
+    """Publish private state atomically without replacing retained evidence."""
+
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            output.write(value)
+            output.flush()
+            os.fsync(output.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            return False
+        return True
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _write_json(path: Path, value: object) -> None:
     _atomic_text(path, json.dumps(value, sort_keys=True) + "\n")
+
+
+def _write_json_if_absent(path: Path, value: object) -> bool:
+    return _atomic_text_if_absent(path, json.dumps(value, sort_keys=True) + "\n")
 
 
 def _preference() -> bool:
@@ -722,7 +750,7 @@ class RuntimeControl:
             "pid": os.getpid(),
             "time": time.time(),
         }
-        _write_json(self.failure_path, value)
+        _write_json_if_absent(self.failure_path, value)
         _write_json(self.status_path, value)
 
 
@@ -1036,9 +1064,7 @@ def _run(args: argparse.Namespace) -> int:
         return 0
     lock_path = control.root / "ram-tetris.lock"
     lock_fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
-    write_lock_fd = os.open(
-        control.write_lock_path, os.O_WRONLY | os.O_CREAT, 0o600
-    )
+    write_lock_fd = os.open(control.write_lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
     try:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1089,6 +1115,79 @@ def _run(args: argparse.Namespace) -> int:
         os.close(lock_fd)
 
 
+def _hardware_health(
+    args: argparse.Namespace,
+) -> tuple[LifecycleIdentity, ServerIdentity, Mapping[str, int], int]:
+    """Validate process, listener, controller, SPD, and kernel health read-only."""
+
+    lifecycle = _lifecycle_identity(args.lifecycle_pid, args.lifecycle_start)
+    server = ServerIdentity(args.server_pid, args.server_start)
+    sdk = OpenRGBSDK()
+    try:
+        sdk.open()
+        health = LinuxHealth(server, lifecycle)
+        health.begin()
+        health.verify_processes()
+        temperatures = health.temperatures()
+        controllers = _targets(sdk.inventory())
+        health.no_new_kernel_errors()
+    finally:
+        sdk.close()
+    return lifecycle, server, temperatures, len(controllers)
+
+
+def _validate_hardware(args: argparse.Namespace) -> int:
+    """Run the pre-restore hardware gate without performing an RGB write."""
+
+    lifecycle, server, temperatures, dimm_count = _hardware_health(args)
+    print(
+        json.dumps(
+            {
+                "controller_count": EXPECTED_CONTROLLER_COUNT,
+                "dimm_count": dimm_count,
+                "lifecycle_pid": lifecycle.pid,
+                "lifecycle_start": lifecycle.start_token,
+                "server_pid": server.pid,
+                "server_start": server.start_token,
+                "temperatures_mc": temperatures,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _validate_health(args: argparse.Namespace) -> int:
+    """Run the complete read-only successor gate without starting a writer."""
+
+    lifecycle, server, temperatures, dimm_count = _hardware_health(args)
+    sdk = OpenRGBSDK()
+    try:
+        sdk.open()
+        preset = _selected_preset()
+        EffectsContract(preset, Path(__file__).resolve().parent).verify(
+            sdk.active_effects()
+        )
+    finally:
+        sdk.close()
+    print(
+        json.dumps(
+            {
+                "controller_count": EXPECTED_CONTROLLER_COUNT,
+                "dimm_count": dimm_count,
+                "lifecycle_pid": lifecycle.pid,
+                "lifecycle_start": lifecycle.start_token,
+                "preset": preset,
+                "server_pid": server.pid,
+                "server_start": server.start_token,
+                "temperatures_mc": temperatures,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     actions = parser.add_subparsers(dest="action", required=True)
@@ -1097,6 +1196,16 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--server-start", required=True)
     run.add_argument("--lifecycle-pid", type=int, required=True)
     run.add_argument("--lifecycle-start", required=True)
+    validate = actions.add_parser("validate-health")
+    validate.add_argument("--server-pid", type=int, required=True)
+    validate.add_argument("--server-start", required=True)
+    validate.add_argument("--lifecycle-pid", type=int, required=True)
+    validate.add_argument("--lifecycle-start", required=True)
+    validate_hardware = actions.add_parser("validate-hardware")
+    validate_hardware.add_argument("--server-pid", type=int, required=True)
+    validate_hardware.add_argument("--server-start", required=True)
+    validate_hardware.add_argument("--lifecycle-pid", type=int, required=True)
+    validate_hardware.add_argument("--lifecycle-start", required=True)
     actions.add_parser("status")
     actions.add_parser("enable")
     actions.add_parser("disable")
@@ -1125,6 +1234,10 @@ def main() -> int:
     if args.action == "status":
         print(json.dumps(_status_document(control), sort_keys=True))
         return 0
+    if args.action == "validate-health":
+        return _validate_health(args)
+    if args.action == "validate-hardware":
+        return _validate_hardware(args)
     if args.action == "enable":
         _atomic_text(_state_root() / "ram-tetris-enabled", "on\n")
         try:

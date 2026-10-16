@@ -20,11 +20,13 @@ readonly FLOCK_BIN="${FLOCK_BIN:-/usr/bin/flock}"
 readonly MKDIR_BIN="${MKDIR_BIN:-/usr/bin/mkdir}"
 readonly MV_BIN="${MV_BIN:-/usr/bin/mv}"
 readonly TR_BIN="${TR_BIN:-/usr/bin/tr}"
+readonly SYSTEMD_NOTIFY_BIN="${SYSTEMD_NOTIFY_BIN:-/usr/bin/systemd-notify}"
 readonly PROC_ROOT="${PROC_ROOT:-/proc}"
 readonly SCRIPT_PATH="$(/usr/bin/readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_DIR="$(/usr/bin/dirname "${SCRIPT_PATH}")"
 readonly APPLY_PRESET="${APPLY_PRESET:-${SCRIPT_DIR}/apply-preset}"
 readonly RAM_TETRIS="${RAM_TETRIS:-${SCRIPT_DIR}/ram-tetris}"
+readonly SERVICE_GUARD="${OPENRGB_SERVICE_GUARD:-${SCRIPT_DIR}/openrgb-service-guard}"
 readonly USER_ID="${OPENRGB_USER_ID:-$(/usr/bin/id -u)}"
 readonly RUNTIME_DIR="${OPENRGB_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/run/user/${USER_ID}}/omarchy-plus/openrgb-presets}"
 readonly LIFECYCLE_LOCK_FILE="${RUNTIME_DIR}/lifecycle.lock"
@@ -36,6 +38,7 @@ readonly ACTIVE_PRESET_FILE="${STATE_ROOT}/active-preset"
 readonly TETRIS_FAILURE_FILE="${STATE_ROOT}/ram-tetris-failure.json"
 readonly TETRIS_STATUS_FILE="${RUNTIME_DIR}/ram-tetris-status.json"
 readonly TETRIS_STOP_FILE="${RUNTIME_DIR}/ram-tetris.stop"
+readonly TETRIS_LOCK_FILE="${RUNTIME_DIR}/ram-tetris.lock"
 readonly TETRIS_WRITE_LOCK_FILE="${RUNTIME_DIR}/ram-tetris-write.lock"
 readonly USER_MANAGER_COMMAND="${USER_MANAGER_COMMAND:-/usr/lib/systemd/systemd --user}"
 readonly RESTORE_TIMEOUT="75s"
@@ -62,6 +65,8 @@ monitor_fd=''
 lifecycle_lock_fd=''
 suspended=false
 shutting_down=false
+service_mode=false
+service_ready=false
 
 log() {
   /usr/bin/printf '%s\n' "$*"
@@ -226,6 +231,48 @@ close_lock_for_child() {
   close_fd "${lifecycle_lock_fd}"
 }
 
+mark_service_state() {
+  local state="${1}"
+  local reason="${2:-}"
+  local lifecycle_start=''
+  local -a command
+
+  [[ "${service_mode}" == true ]] || return 0
+  lifecycle_start="$(process_start_time $$)"
+  command=(
+    "${SERVICE_GUARD}" mark "${state}"
+    --lifecycle-pid "$$"
+    --lifecycle-start "${lifecycle_start}"
+  )
+  if [[ -n "${server_pid}" && -n "${server_start_time}" ]]; then
+    command+=(--server-pid "${server_pid}" --server-start "${server_start_time}")
+  fi
+  if [[ -n "${reason}" ]]; then
+    command+=(--reason "${reason}")
+  fi
+  "${command[@]}"
+}
+
+notify_service_status() {
+  [[ "${service_mode}" == true ]] || return 0
+  "${SYSTEMD_NOTIFY_BIN}" --status="$*"
+}
+
+verify_tetris_lock_released() {
+  local verify_fd=''
+  local old_umask=''
+
+  old_umask="$(umask)"
+  umask 077
+  exec {verify_fd}>"${TETRIS_LOCK_FILE}"
+  umask "${old_umask}"
+  if ! "${FLOCK_BIN}" -n "${verify_fd}"; then
+    close_fd "${verify_fd}"
+    return 1
+  fi
+  close_fd "${verify_fd}"
+}
+
 acquire_lifecycle_lock() {
   local old_umask
   old_umask="$(umask)"
@@ -293,6 +340,13 @@ tetris_selected_preset() {
 clear_tetris_identity() {
   tetris_pid=''
   tetris_start_time=''
+}
+
+tetris_local_stop_requested() {
+  [[ -r "${TETRIS_STOP_FILE}" ]] \
+    && /usr/bin/grep -Eq \
+      '"reason"[[:space:]]*:[[:space:]]*"(user-off|preset-change)"' \
+      "${TETRIS_STOP_FILE}"
 }
 
 start_tetris() {
@@ -402,8 +456,7 @@ reconcile_tetris() {
     wait "${tetris_pid}" 2>/dev/null || true
     clear_tetris_identity
     if [[ ! -e "${TETRIS_FAILURE_FILE}" ]] \
-      && [[ -r "${TETRIS_STATUS_FILE}" ]] \
-      && /usr/bin/grep -q '"state": "running"' "${TETRIS_STATUS_FILE}"; then
+      && ! tetris_local_stop_requested; then
       "${RAM_TETRIS}" fail 'RAM Tetris writer exited unexpectedly; static restoration was not attempted' >/dev/null 2>&1 || true
     fi
   fi
@@ -485,7 +538,8 @@ launch_server() {
 
   (
     close_lock_for_child
-    exec "${OPENRGB_BIN}" "${OPENRGB_SERVER_ARGS[@]}" >>"${SERVER_LOG_FILE}" 2>&1
+    exec "${SETPRIV_BIN}" --pdeathsig TERM \
+      "${OPENRGB_BIN}" "${OPENRGB_SERVER_ARGS[@]}" >>"${SERVER_LOG_FILE}" 2>&1
   ) &
   server_pid=$!
   server_start_time=''
@@ -508,9 +562,30 @@ launch_server() {
 }
 
 start_restore() {
+  local attempt
+  local lifecycle_start=''
+  local validated=false
+
+  lifecycle_start="$(process_start_time $$)"
+  for attempt in {1..15}; do
+    if "${RAM_TETRIS}" validate-hardware \
+      --server-pid "${server_pid}" \
+      --server-start "${server_start_time}" \
+      --lifecycle-pid "$$" \
+      --lifecycle-start "${lifecycle_start}" >/dev/null; then
+      validated=true
+      break
+    fi
+    "${SLEEP_BIN}" 1
+  done
+  if [[ "${validated}" == false ]]; then
+    /usr/bin/printf '%s\n' 'Pre-restore hardware health validation failed; refusing preset write' >&2
+    return 1
+  fi
   (
     close_lock_for_child
-    exec "${TIMEOUT_BIN}" --signal=TERM --kill-after=2s "${RESTORE_TIMEOUT}" \
+    exec "${SETPRIV_BIN}" --pdeathsig TERM \
+      "${TIMEOUT_BIN}" --signal=TERM --kill-after=2s "${RESTORE_TIMEOUT}" \
       "${APPLY_PRESET}" --restore
   ) &
   restore_pid=$!
@@ -708,35 +783,106 @@ handle_sleep_signal() {
   start_server
 }
 
+validate_service_health() {
+  local lifecycle_start=''
+
+  [[ "${service_mode}" == true ]] || return 0
+  lifecycle_start="$(process_start_time $$)"
+  is_server_listener "${server_pid}" "${server_start_time}" || return 1
+  is_owned_current_inhibitor "${inhibitor_pid}" "${inhibitor_start_time}" || return 1
+  is_same_process "${monitor_pid}" "${monitor_start_time}" || return 1
+  "${RAM_TETRIS}" validate-health \
+    --server-pid "${server_pid}" \
+    --server-start "${server_start_time}" \
+    --lifecycle-pid "$$" \
+    --lifecycle-start "${lifecycle_start}" >/dev/null
+}
+
+notify_service_ready() {
+  [[ "${service_mode}" == true ]] || return 0
+  validate_service_health
+  if tetris_preference_enabled \
+    && [[ "$(tetris_selected_preset)" != black ]] \
+    && [[ ! -e "${TETRIS_FAILURE_FILE}" ]]; then
+    is_tetris_process "${tetris_pid}" "${tetris_start_time}" || return 1
+  elif [[ -n "${tetris_pid}" ]]; then
+    return 1
+  fi
+  mark_service_state ready 'independent lifecycle health validation complete'
+  "${SYSTEMD_NOTIFY_BIN}" --ready \
+    --status="OpenRGB lifecycle ready: SDK ${server_pid}/${server_start_time}"
+  service_ready=true
+}
+
 cleanup() {
   local mode="${1:-handoff}"
+  local tetris_reason='handoff'
+  local failed=false
 
   if [[ "${shutting_down}" == true ]]; then
     return 0
   fi
   shutting_down=true
+  if [[ "${mode}" == deliberate ]]; then
+    tetris_reason='shutdown'
+  fi
+  mark_service_state stopping "${mode}" || failed=true
+  notify_service_status "Stopping OpenRGB lifecycle (${mode})" || true
 
-  stop_tetris handoff || true
+  stop_tetris "${tetris_reason}" || failed=true
+  verify_tetris_lock_released || failed=true
 
   case "${mode}" in
     handoff)
-      detach_server
+      detach_server || failed=true
       ;;
     deliberate)
-      stop_server 'deliberate lifecycle shutdown'
+      stop_server 'deliberate lifecycle shutdown' || failed=true
       ;;
     *)
       /usr/bin/printf 'Unknown cleanup mode: %s\n' "${mode}" >&2
       return 64
       ;;
   esac
-  release_inhibitor
-  stop_monitor
+  release_inhibitor || failed=true
+  stop_monitor || failed=true
+  if [[ "${failed}" == true ]]; then
+    return 1
+  fi
+  mark_service_state clean-stopped "${mode}"
 }
 
 request_shutdown() {
-  cleanup handoff
-  exit 0
+  local mode='handoff'
+
+  if [[ "${service_mode}" == true ]]; then
+    mode='deliberate'
+  fi
+  if cleanup "${mode}"; then
+    exit 0
+  fi
+  exit 1
+}
+
+request_handoff() {
+  if cleanup handoff; then
+    exit 0
+  fi
+  exit 1
+}
+
+exit_cleanup() {
+  local exit_status=$?
+  local mode='handoff'
+
+  trap - EXIT
+  if [[ "${service_mode}" == true ]]; then
+    mode='deliberate'
+  fi
+  if ! cleanup "${mode}"; then
+    exit_status=1
+  fi
+  exit "${exit_status}"
 }
 
 check_dependencies() {
@@ -747,7 +893,7 @@ check_dependencies() {
     "${OPENRGB_BIN}" "${GDBUS_BIN}" "${STDBUF_BIN}" "${INHIBIT_BIN}" \
     "${SETSID_BIN}" "${SETPRIV_BIN}" "${SS_BIN}" "${PS_BIN}" "${TIMEOUT_BIN}" \
     "${SLEEP_BIN}" "${CAT_BIN}" "${FLOCK_BIN}" "${MKDIR_BIN}" "${MV_BIN}" \
-    "${TR_BIN}" "${APPLY_PRESET}"; do
+      "${TR_BIN}" "${APPLY_PRESET}" "${SERVICE_GUARD}" "${SYSTEMD_NOTIFY_BIN}"; do
     if [[ ! -x "${dependency}" ]]; then
       /usr/bin/printf 'Missing executable: %s\n' "${dependency}" >&2
       failed=true
@@ -788,8 +934,13 @@ main() {
     check_dependencies
     return 0
   fi
-  if [[ "${#}" -ne 0 ]]; then
-    /usr/bin/printf '%s\n' 'Usage: openrgb-lifecycle [--check]' >&2
+  if [[ "${1:-}" == '--service' && "${#}" -eq 1 ]]; then
+    service_mode=true
+  elif [[ "${#}" -ne 0 ]]; then
+    /usr/bin/printf '%s\n' 'Usage: openrgb-lifecycle [--check|--service]' >&2
+    return 64
+  elif [[ "${#}" -eq 0 ]]; then
+    /usr/bin/printf '%s\n' 'Direct startup refused; use the supervised user service' >&2
     return 64
   fi
 
@@ -798,8 +949,11 @@ main() {
     log 'Another OpenRGB lifecycle owns the runtime lock; retrying through the service supervisor'
     return 75
   fi
-  trap cleanup EXIT
+  trap exit_cleanup EXIT
   trap request_shutdown INT TERM HUP
+  trap request_handoff USR1
+  mark_service_state starting 'acquired lifecycle singleton'
+  notify_service_status 'Starting OpenRGB lifecycle'
 
   start_inhibitor
   start_server
@@ -825,9 +979,19 @@ main() {
     if [[ -n "${restore_pid}" ]] && ! is_running "${restore_pid}"; then
       if wait "${restore_pid}"; then
         restore_pid=''
-        reconcile_tetris || true
+        if ! reconcile_tetris; then
+          /usr/bin/printf '%s\n' 'RAM Tetris reconciliation failed during lifecycle startup' >&2
+          return 1
+        fi
+        if [[ "${service_ready}" == false ]] && ! notify_service_ready; then
+          /usr/bin/printf '%s\n' 'Independent lifecycle health validation failed' >&2
+          return 1
+        fi
       else
         "${RAM_TETRIS}" fail 'Saved preset restoration failed; RAM Tetris was not started' >/dev/null 2>&1 || true
+        if [[ "${service_ready}" == false ]]; then
+          return 1
+        fi
       fi
       restore_pid=''
     fi
@@ -838,19 +1002,14 @@ main() {
 
     if [[ "${suspended}" == false ]] \
       && ! is_owned_current_inhibitor "${inhibitor_pid}" "${inhibitor_start_time}"; then
-      /usr/bin/printf '%s\n' 'Sleep delay inhibitor exited unexpectedly; restarting' >&2
-      inhibitor_pid=''
-      inhibitor_start_time=''
-      start_inhibitor
+      /usr/bin/printf '%s\n' 'Sleep delay inhibitor exited unexpectedly; refusing automatic recovery' >&2
+      return 1
     fi
 
     if [[ "${suspended}" == false ]] \
-      && ! is_same_process "${server_pid}" "${server_start_time}"; then
-      /usr/bin/printf '%s\n' 'OpenRGB server exited unexpectedly; restarting' >&2
-      clear_server_identity
-      stop_restore
-      "${SLEEP_BIN}" 2
-      start_server
+      && ! is_server_listener "${server_pid}" "${server_start_time}"; then
+      /usr/bin/printf '%s\n' 'OpenRGB server identity changed unexpectedly; refusing automatic replacement' >&2
+      return 1
     fi
   done
 }

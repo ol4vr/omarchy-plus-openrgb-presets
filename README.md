@@ -131,6 +131,18 @@ parent death, duplicate lifecycle, or changed SDK identity remains a persistent
 fail-closed event; no grace period, automatic recovery, or latch clearing was
 added.
 
+Version 0.4.19 removes lifecycle ownership from Quickshell. The plugin manifest
+now exposes only the bar widget; no QML `Process` starts, restarts, or stops the
+lifecycle. An Omarchy+-owned `systemd --user` service starts with the graphical
+session, reports ready only after preset restoration and the complete read-only
+SDK, seven-controller, four-SPD5118, Effects, preset, lifecycle, and kernel-error
+gate, and stops at graphical-session teardown. It has no automatic restart.
+Normal Quickshell restart, plugin hot reload, and UI failure therefore leave
+the lifecycle, SDK, inhibitor, logind monitor, and optional writer unchanged.
+Bounded service shutdown retains the v0.4.18 authenticated writer stop and
+singleton release. A private persistent service-state guard preserves an
+existing failure latch and creates one if shutdown requires manager escalation.
+
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
 The experimental orange, blue, and red Sunrise gradients are therefore stored
@@ -169,19 +181,32 @@ RAM modules and one each of the GPU, ST100, and motherboard.
 
 ## Runtime architecture
 
-The Omarchy service starts `openrgb-lifecycle`, which maintains one GUI-capable
-OpenRGB process minimized in the background. Before launching OpenRGB, the
-lifecycle reuses the existing `127.0.0.1:6742` listener only when its owner has
-the exact accepted OpenRGB server command. It records whether the server was
-launched or adopted together with its PID and Linux `/proc` start-time token.
-Ordinary Quickshell teardown releases only the lifecycle's tracking state; it
-does not signal either an adopted server or one launched by the outgoing
-lifecycle. The successor validates and adopts the same listener identity, so a
-shell restart does not repeat the hardware scan. OpenRGB output is written to
-the per-session runtime log `openrgb-server.log` rather than a Quickshell pipe
-that closes during handoff. The service restores the last successful preset
-after the SDK and accepted controllers become ready. Preset changes normally
-take about one second rather than repeating the hardware scan.
+`omarchy-plus-openrgb-presets.service` owns `openrgb-lifecycle` independently
+of Quickshell. It is wanted by and part of `graphical-session.target`, uses
+`Type=notify`, and has `Restart=no`. The plugin contains no service entry point
+and no QML lifecycle process; its panel is only a client of persisted state and
+the bounded preset and RAM Tetris commands. Shell restart, plugin hot reload,
+and UI failure cannot terminate or replace a healthy lifecycle.
+
+Before launching OpenRGB, the lifecycle reuses the existing
+`127.0.0.1:6742` listener only when its owner has the exact accepted OpenRGB
+server command. It records whether the server was launched or adopted together
+with its PID and Linux `/proc` start-time token. A server launched by the
+service receives a Linux parent-death signal and remains in the service cgroup;
+an already-running accepted server is identity-guarded during initial migration.
+OpenRGB output is written to the per-session runtime log `openrgb-server.log`.
+The service restores the last successful preset after the SDK and accepted
+controllers become ready. Preset changes normally take about one second rather
+than repeating the hardware scan.
+
+Before any startup or resume restoration write, `ram-tetris validate-hardware`
+independently verifies the lifecycle and SDK identities, exactly seven accepted
+controllers, all four readable SPD5118 temperatures, and no new relevant kernel
+error. The service becomes ready only after the restore succeeds and
+`ram-tetris validate-health` then verifies those gates again together with the
+selected preset's six-zone non-DDR Effects contract. An ON preference with a
+failure latch remains ON but starts no writer. An ON preference without a latch
+requires exactly one validated writer before readiness is published.
 
 `openrgb-lifecycle` monitors logind's `PrepareForSleep` signal and holds a
 standard delay inhibitor while Hugin is awake. Before suspend or hibernation it
@@ -189,13 +214,16 @@ terminates OpenRGB only after revalidating the tracked PID, start-time token,
 exact command, and ownership of the loopback listener. It waits briefly and
 uses SIGKILL only if that complete identity still matches, then releases the
 inhibitor. After resume it reacquires the inhibitor, waits three seconds for
-SMBus devices to settle, starts or adopts exactly one OpenRGB server, and
-restores the saved preset. A stale PID or changed listener is never signaled.
+SMBus devices to settle, starts or adopts exactly one OpenRGB server, validates
+all four SPD endpoints, and only then restores the saved preset. A stale PID or
+changed listener is never signaled. An unexpected SDK or inhibitor loss fails
+the lifecycle and records the incomplete boundary; it is never automatically
+restarted or replaced.
 This prevents the running OpenRGB process from leaving the four Corsair DDR5
 controllers inaccessible across sleep.
 
 One nonblocking per-user runtime lock admits only one lifecycle owner during
-plugin rescans or concurrent shell startup. The inhibitor and logind monitor
+concurrent service startup. The inhibitor and logind monitor
 are launched with Linux parent-death signals through the existing util-linux
 `setpriv` command. Normal shutdown still releases them explicitly; if the
 lifecycle is killed before its traps complete, the kernel sends each child
@@ -204,7 +232,7 @@ OpenRGB server, preset restoration, inhibitor, or monitor cannot accidentally
 retain lifecycle ownership.
 
 The lifecycle also owns at most one `ram-tetris` writer. A private writer lock
-prevents duplicates across reconciliation and Quickshell handoff. A separate
+prevents duplicates across reconciliation and service replacement. A separate
 write gate lets an outgoing lifecycle wait for any already-started frame,
 atomically publish its identity-bound stop request, and exclude every later
 animation or restoration write. It does not release lifecycle ownership until
@@ -221,13 +249,40 @@ readings, Direct mode and twelve LEDs, the active six-zone Effects contract,
 selected preset, and new kernel errors. A failed gate latches a visible panel
 failure in persistent private state and stops without a recovery write or
 automatic restart. The latch survives lifecycle, Quickshell, suspend/resume,
-and application restarts; ordinary OFF and ON actions never clear it. Turning
+and application restarts; later failures cannot overwrite its retained
+evidence, and ordinary OFF and ON actions never clear it. Turning
 the toggle OFF restores the static DDR5 array only after fresh health gates pass.
 Preset changes quiesce the writer under its lock before applying the existing
-preset. Suspend and an explicitly initiated Quickshell handoff stop it before
-SDK teardown or adoption. A parent-death signal without the authenticated stop
-request latches as unexplained ownership loss, so an abrupt shell exit cannot
-authorize a zero-owner interval or leave an orphan writer.
+preset. Suspend and an explicitly initiated lifecycle replacement stop it
+before SDK teardown or adoption. A parent-death signal without the authenticated
+stop request latches as unexplained ownership loss. Quickshell is no longer the
+writer's ancestor, so an abrupt shell exit is irrelevant to writer ownership.
+
+On ordinary service stop, systemd signals only the lifecycle first. The
+lifecycle serializes a `shutdown` stop record against writes, waits for the
+writer and its singleton lock, stops the exact SDK listener, and releases the
+inhibitor and monitor before recording `clean-stopped`. `ExitType=cgroup`,
+`KillMode=mixed`, and parent-death signals keep every launched child within the
+service-manager boundary. `TimeoutStopSec=20` is the outer bound. If cleanup
+does not finish, `ExecStopPost` records a persistent failure latch before a
+later start can create a writer. A manager-mediated `SIGUSR1` is reserved for
+an owner-authorized replacement handoff; it uses the same authenticated writer
+stop but may retain an adopted SDK whose identity remains valid.
+
+The persistent owner record includes the kernel boot ID, lifecycle PID, and
+`/proc` start token. An incomplete stop, power loss, or stale record from an
+earlier boot creates or preserves the failure latch and blocks service startup
+before SDK restoration. After a separately reviewed recovery, leave RAM Tetris
+OFF with zero writer-lock owners, then acknowledge only the service boundary:
+
+```bash
+~/.config/omarchy/plugins/io.github.ol4vr.openrgb-presets/openrgb-service-guard \
+  acknowledge-reviewed-recovery --acknowledge-reviewed-recovery
+```
+
+That command preserves the failure latch. Clear the latch separately with the
+existing reviewed `ram-tetris clear-failure` procedure; neither action starts
+the service or performs a hardware write.
 
 Clearing a hardware-failure latch is deliberately absent from the panel. After
 a separately reviewed recovery establishes healthy hardware, the owner must
@@ -311,18 +366,24 @@ PLUGIN_DIR="$PWD"
 omarchy plugin validate "$PLUGIN_DIR"
 qmllint -I "$OMARCHY_PATH/shell" \
   "$PLUGIN_DIR/BarWidget.qml" \
-  "$PLUGIN_DIR/Panel.qml" \
-  "$PLUGIN_DIR/Service.qml"
+  "$PLUGIN_DIR/Panel.qml"
 /usr/bin/bash -n "$PLUGIN_DIR/apply-preset"
 /usr/bin/bash -n "$PLUGIN_DIR/openrgb-lifecycle"
 /usr/bin/bash -n "$PLUGIN_DIR/install-effects-plugin"
 /usr/bin/python3 -m py_compile "$PLUGIN_DIR/effects-sdk"
-/usr/bin/python3 -m py_compile "$PLUGIN_DIR/ram-tetris" "$PLUGIN_DIR/ram_tetris_core.py"
+/usr/bin/python3 -m py_compile \
+  "$PLUGIN_DIR/ram-tetris" \
+  "$PLUGIN_DIR/ram_tetris_core.py" \
+  "$PLUGIN_DIR/openrgb-service-guard"
+/usr/bin/systemd-analyze --user verify \
+  "$PLUGIN_DIR/systemd/omarchy-plus-openrgb-presets.service"
 "$PLUGIN_DIR/tests/test-lifecycle-duplicate-prevention"
 "$PLUGIN_DIR/tests/test-lifecycle-inhibitors"
 /usr/bin/bash "$PLUGIN_DIR/tests/test-lifecycle-tetris-handoff"
+"$PLUGIN_DIR/tests/test-independent-lifecycle"
 /usr/bin/python3 "$PLUGIN_DIR/tests/test-presets.py"
 /usr/bin/python3 "$PLUGIN_DIR/tests/test-ram-tetris.py"
+/usr/bin/python3 "$PLUGIN_DIR/tests/test-service-guard.py"
 "$PLUGIN_DIR/openrgb-lifecycle" --check
 "$PLUGIN_DIR/apply-preset" --list
 "$PLUGIN_DIR/apply-preset" --dry-run black
@@ -333,20 +394,58 @@ qmllint -I "$OMARCHY_PATH/shell" \
 
 ## Install
 
-Install through Omarchy after the source has been reviewed and committed:
+Install through Omarchy only after the source and the user-service cutover have
+been reviewed. A new installation needs both the plugin checkout and its
+Omarchy+-owned unit:
 
 ```bash
 omarchy plugin add https://github.com/ol4vr/omarchy-plus-openrgb-presets.git --enable
+/usr/bin/install -Dm0644 \
+  ~/.config/omarchy/plugins/io.github.ol4vr.openrgb-presets/systemd/omarchy-plus-openrgb-presets.service \
+  ~/.config/systemd/user/omarchy-plus-openrgb-presets.service
+systemctl --user daemon-reload
+systemctl --user enable --now omarchy-plus-openrgb-presets.service
 ```
 
 The plugin uses the `nf-md-lightbulb_on_50` Nerd Font icon and defaults to the
 left bar section. Hugin's bar configuration places it immediately after Screen
 Time, with the panel opening below the widget.
 
-When enabled, the service performs one background scan and restores the last
+When started, the service performs one background scan and restores the last
 successful preset. The fallback for a missing state file is Static White. The
 removed Tokyo Night Purple identifier migrates to Static White; the internal
 identifier remains `bright-white` for saved-state compatibility.
+
+### Owner-authorized v0.4.18 migration
+
+The v0.4.18-to-v0.4.19 transition is deliberately not automatic. Before
+cutover, record the lifecycle, SDK, inhibitor, monitor, writer, and lock
+identities; verify seven controllers and four readable SPD5118 endpoints; and
+preserve the preference and failure-latch bytes. With the present ON preference
+and historical latch, the required writer count is zero.
+
+1. Stage the reviewed unit under `~/.config/systemd/user/` and run only
+   `systemctl --user daemon-reload`. Do not enable or start it yet.
+2. Reconcile only the plugin checkout to the accepted v0.4.19 revision. Removing
+   the manifest service destroys the old QML owner. Do not continue until that
+   lifecycle has exited, its lock is free, no writer exists, and the accepted
+   SDK PID/start token is unchanged.
+3. Start `omarchy-plus-openrgb-presets.service` once. It must acquire the sole
+   lifecycle lock, adopt the existing listener, complete preset restoration and
+   independent readiness validation, and report `ready`. The existing latch
+   must remain byte-identical, preference must remain ON, and writer count must
+   remain zero.
+4. Only after those checks pass, enable the already-running unit for the next
+   graphical session with
+   `systemctl --user enable omarchy-plus-openrgb-presets.service`. Do not use
+   `Restart=`, retry a failed start, clear the latch, or toggle RAM Tetris
+   during cutover.
+
+If the old lifecycle or writer remains, the SDK identity changes unexpectedly,
+or the new service does not become ready, stop without starting another owner.
+The service's first restoration uses the existing accepted preset path and can
+write that preset; it therefore remains a separately authorized live-hardware
+step even though this source candidate performs no such operation.
 
 ## Roll back to 0.3.1
 
@@ -460,17 +559,47 @@ Quickshell zero-owner interval, so do not perform a shell-restart acceptance
 test with RAM Tetris active after rollback. Never clear an existing failure
 latch merely to complete rollback.
 
+## Roll back the 0.4.19 independent lifecycle
+
+Rollback must reverse ownership before restoring v0.4.18. First perform the
+normal bounded stop of `omarchy-plus-openrgb-presets.service`. It must publish
+the authenticated writer stop, release the writer singleton, stop its verified
+SDK when required, record `clean-stopped`, and leave no lifecycle, inhibitor,
+monitor, or writer process. If the stop times out or a failure latch appears,
+do not continue and do not force a QML owner to start beside it.
+
+After zero ownership is proven, disable the unit without starting or stopping
+anything else, redeploy exact v0.4.18 commit
+`b9210192369e3898b397c315f41b96a4751232e6`, and allow its restored QML service
+to become the sole lifecycle owner. Remove the staged unit only after it is
+disabled and inactive, then reload the user manager. Preserve active preset,
+RAM Tetris preference, failure latch, and all Effects profiles. An ON preference
+with the historical latch remains ON with zero writers after rollback.
+
 ## Remove
 
+First request the bounded stop:
+
 ```bash
+systemctl --user stop omarchy-plus-openrgb-presets.service
+```
+
+Then verify that the unit is inactive, the service-state record is
+`clean-stopped`, and the lifecycle and writer locks are free. If any check
+fails, stop the removal. After a clean stop, remove ownership in this order:
+
+```bash
+systemctl --user disable omarchy-plus-openrgb-presets.service
+/usr/bin/rm -- ~/.config/systemd/user/omarchy-plus-openrgb-presets.service
+systemctl --user daemon-reload
 omarchy plugin remove io.github.ol4vr.openrgb-presets
 ```
 
-Removing the Omarchy plugin stops its lifecycle, inhibitor, and logind monitor
-but leaves the verified OpenRGB SDK host running, just as an ordinary shell
-handoff does. A deliberate SDK stop remains a separate owner-authorized
-operation. The official Effects Plugin binary, saved profiles, and current
-hardware lighting state remain in place.
+Removing the checkout first would remove the unit's executable and stop guard
+while they are still needed. The ordered procedure leaves no enabled or staged
+unit and no competing lifecycle owner. The official Effects Plugin binary,
+saved profiles, current preset, RAM Tetris preference, and persistent failure
+latch remain in place.
 
 ## ST100 rainbow limitation
 

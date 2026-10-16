@@ -1,0 +1,259 @@
+#!/usr/bin/python3
+"""Persist and verify the OpenRGB lifecycle service boundary.
+
+This helper performs no OpenRGB, RGB, SMBus, or I2C operation.  It records
+service ownership in private persistent state and preserves fail-closed RAM
+Tetris behavior when systemd has to finish an incomplete lifecycle stop.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import tempfile
+import time
+from pathlib import Path
+
+
+def state_root() -> Path:
+    return (
+        Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state")))
+        / "omarchy-plus"
+        / "openrgb-presets"
+    )
+
+
+def runtime_root() -> Path:
+    return Path(
+        os.environ.get(
+            "OPENRGB_RUNTIME_DIR",
+            str(
+                Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+                / "omarchy-plus"
+                / "openrgb-presets"
+            ),
+        )
+    )
+
+
+def private_directory(path: Path) -> None:
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.chmod(0o700)
+
+
+def atomic_json(path: Path, value: dict[str, object]) -> None:
+    private_directory(path.parent)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def read_json(path: Path) -> dict[str, object] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit(f"service state is unreadable: {error}") from error
+    if not isinstance(value, dict):
+        raise SystemExit("service state is invalid")
+    return value
+
+
+def process_start_token(pid: int) -> str | None:
+    proc_root = Path(os.environ.get("PROC_ROOT", "/proc"))
+    try:
+        fields = (proc_root / str(pid) / "stat").read_text().split()
+    except OSError:
+        return None
+    return fields[21] if len(fields) > 21 else None
+
+
+def boot_id() -> str:
+    path = Path(os.environ.get("BOOT_ID_PATH", "/proc/sys/kernel/random/boot_id"))
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError as error:
+        raise SystemExit(f"boot identity is unreadable: {error}") from error
+    if not value:
+        raise SystemExit("boot identity is empty")
+    return value
+
+
+def active_identity(value: dict[str, object]) -> bool:
+    pid = value.get("lifecycle_pid")
+    start = value.get("lifecycle_start")
+    return (
+        isinstance(pid, int)
+        and not isinstance(pid, bool)
+        and pid > 0
+        and isinstance(start, str)
+        and bool(start)
+        and value.get("boot_id") == boot_id()
+        and process_start_token(pid) == start
+    )
+
+
+def latch_failure(message: str) -> bool:
+    root = state_root()
+    failure = root / "ram-tetris-failure.json"
+    if failure.exists():
+        return False
+    value: dict[str, object] = {
+        "message": message,
+        "pid": os.getpid(),
+        "state": "failed",
+        "time": time.time(),
+    }
+    atomic_json(failure, value)
+    atomic_json(runtime_root() / "ram-tetris-status.json", value)
+    return True
+
+
+def service_state_path() -> Path:
+    return state_root() / "lifecycle-service-state.json"
+
+
+def prepare_start() -> int:
+    value = read_json(service_state_path())
+    if value is None or value.get("state") == "clean-stopped":
+        return 0
+    if active_identity(value):
+        print("an authenticated OpenRGB lifecycle service is already active")
+        return 75
+    latch_failure(
+        "OpenRGB lifecycle service did not complete its previous bounded shutdown"
+    )
+    return 1
+
+
+def mark(args: argparse.Namespace) -> int:
+    value: dict[str, object] = {
+        "boot_id": boot_id(),
+        "lifecycle_pid": args.lifecycle_pid,
+        "lifecycle_start": args.lifecycle_start,
+        "state": args.state,
+        "time": time.time(),
+    }
+    if args.server_pid is not None:
+        value["server_pid"] = args.server_pid
+        value["server_start"] = args.server_start
+    if args.reason is not None:
+        value["reason"] = args.reason
+    atomic_json(service_state_path(), value)
+    return 0
+
+
+def finalize_stop() -> int:
+    value = read_json(service_state_path())
+    if value is not None and value.get("state") == "clean-stopped":
+        return 0
+    if value is not None and active_identity(value):
+        # ExecStopPost can run after a duplicate ExecStartPre attempt.  The
+        # authenticated incumbent remains the owner and must not be blamed for
+        # the rejected second start.
+        return 0
+    latch_failure(
+        "OpenRGB lifecycle service required manager escalation before clean shutdown"
+    )
+    return 1
+
+
+def acknowledge_reviewed_recovery() -> int:
+    value = read_json(service_state_path())
+    if value is None or value.get("state") == "clean-stopped":
+        return 0
+    if active_identity(value):
+        raise SystemExit("recovery refused: lifecycle identity is still active")
+
+    root = state_root()
+    preference = root / "ram-tetris-enabled"
+    try:
+        enabled = preference.read_text(encoding="utf-8").splitlines()[0] == "on"
+    except (FileNotFoundError, IndexError):
+        enabled = False
+    if enabled:
+        raise SystemExit("recovery refused: turn RAM Tetris OFF first")
+    if not (root / "ram-tetris-failure.json").is_file():
+        raise SystemExit("recovery refused: no preserved failure latch exists")
+
+    private_directory(runtime_root())
+    for name, label in (
+        ("lifecycle.lock", "lifecycle"),
+        ("ram-tetris.lock", "RAM Tetris writer"),
+    ):
+        lock_fd = os.open(runtime_root() / name, os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise SystemExit(f"recovery refused: {label} lock is owned") from error
+        finally:
+            os.close(lock_fd)
+
+    atomic_json(
+        service_state_path(),
+        {
+            "boot_id": boot_id(),
+            "reason": "acknowledged-reviewed-recovery",
+            "state": "clean-stopped",
+            "time": time.time(),
+        },
+    )
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    actions = parser.add_subparsers(dest="action", required=True)
+    actions.add_parser("prepare-start")
+    actions.add_parser("finalize-stop")
+    recovery = actions.add_parser("acknowledge-reviewed-recovery")
+    recovery.add_argument(
+        "--acknowledge-reviewed-recovery", action="store_true", required=True
+    )
+    mark_parser = actions.add_parser("mark")
+    mark_parser.add_argument(
+        "state", choices=("starting", "ready", "stopping", "clean-stopped")
+    )
+    mark_parser.add_argument("--lifecycle-pid", type=int, required=True)
+    mark_parser.add_argument("--lifecycle-start", required=True)
+    mark_parser.add_argument("--server-pid", type=int)
+    mark_parser.add_argument("--server-start")
+    mark_parser.add_argument("--reason")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if args.action == "prepare-start":
+        return prepare_start()
+    if args.action == "finalize-stop":
+        return finalize_stop()
+    if args.action == "acknowledge-reviewed-recovery":
+        return acknowledge_reviewed_recovery()
+    if (args.server_pid is None) != (args.server_start is None):
+        raise SystemExit("server PID and start token must be supplied together")
+    return mark(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

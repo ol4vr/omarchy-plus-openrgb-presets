@@ -1,0 +1,301 @@
+#!/usr/bin/bash
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+readonly REPOSITORY_ROOT="$(/usr/bin/readlink -f "$(/usr/bin/dirname "${BASH_SOURCE[0]}")/..")"
+
+if [[ "${1:-}" == shell ]]; then
+  readonly SHELL_MARKER="${2}"
+  trap 'exit 0' TERM INT
+  /usr/bin/printf '%s\n' "$$" >"${SHELL_MARKER}"
+  while true; do /usr/bin/sleep 0.02; done
+fi
+
+if [[ "${1:-}" == writer ]]; then
+  readonly FIXTURE_ROOT="${2}"
+  readonly WRITER_LOCK="${FIXTURE_ROOT}/writer.lock"
+  readonly STOP_FILE="${FIXTURE_ROOT}/stop"
+  readonly FAILURE_FILE="${FIXTURE_ROOT}/failure"
+  readonly COUNTER_FILE="${FIXTURE_ROOT}/counter"
+  readonly SDK_FILE="${FIXTURE_ROOT}/sdk"
+  readonly EXPECTED_SDK="${3}"
+  exec 8>"${WRITER_LOCK}"
+  /usr/bin/flock -n 8 || exit 75
+  stop_writer() {
+    if [[ ! -e "${STOP_FILE}" ]]; then
+      /usr/bin/printf '%s\n' \
+        'writer termination was not preceded by an authenticated lifecycle stop request' \
+        >"${FAILURE_FILE}"
+    fi
+    exit 0
+  }
+  trap stop_writer TERM INT
+  count=0
+  while true; do
+    if [[ -e "${STOP_FILE}" ]]; then
+      exit 0
+    fi
+    if [[ "$(<"${SDK_FILE}")" != "${EXPECTED_SDK}" ]]; then
+      /usr/bin/printf '%s\n' 'OpenRGB SDK process identity changed' >"${FAILURE_FILE}"
+      exit 1
+    fi
+    count=$((count + 1))
+    /usr/bin/printf '%s\n' "${count}" >"${COUNTER_FILE}"
+    /usr/bin/sleep 0.02
+  done
+fi
+
+if [[ "${1:-}" == lifecycle ]]; then
+  readonly FIXTURE_ROOT="${2}"
+  readonly MODE="${3}"
+  readonly LIFECYCLE_LOCK="${FIXTURE_ROOT}/lifecycle.lock"
+  readonly STOP_FILE="${FIXTURE_ROOT}/stop"
+  readonly FAILURE_FILE="${FIXTURE_ROOT}/failure"
+  readonly MARKER_FILE="${FIXTURE_ROOT}/owner"
+  readonly SDK_ID="sdk-accepted"
+  exec 9>"${LIFECYCLE_LOCK}"
+  /usr/bin/flock -n 9 || exit 75
+  /usr/bin/printf '%s\n' "${SDK_ID}" >"${FIXTURE_ROOT}/sdk"
+  /usr/bin/setpriv --pdeathsig TERM \
+    "${BASH_SOURCE[0]}" writer "${FIXTURE_ROOT}" "${SDK_ID}" &
+  writer_pid=$!
+  /usr/bin/printf '%s %s\n' "$$" "${writer_pid}" >"${MARKER_FILE}"
+
+  clean_stop() {
+    local attempt
+    /usr/bin/printf '%s\n' authenticated >"${STOP_FILE}"
+    for attempt in {1..100}; do
+      if ! kill -0 "${writer_pid}" 2>/dev/null; then
+        wait "${writer_pid}" 2>/dev/null || true
+        exit 0
+      fi
+      /usr/bin/sleep 0.01
+    done
+    exit 1
+  }
+  stalled_stop() {
+    /usr/bin/printf '%s\n' stopping >"${FIXTURE_ROOT}/stopping"
+    trap '' TERM INT
+    while true; do /usr/bin/sleep 1; done
+  }
+  if [[ "${MODE}" == clean ]]; then
+    trap clean_stop TERM INT
+  elif [[ "${MODE}" == stall ]]; then
+    trap stalled_stop TERM INT
+  fi
+
+  while true; do
+    if ! kill -0 "${writer_pid}" 2>/dev/null; then
+      wait "${writer_pid}" 2>/dev/null || true
+      if [[ ! -e "${STOP_FILE}" && ! -e "${FAILURE_FILE}" ]]; then
+        /usr/bin/printf '%s\n' \
+          'RAM Tetris writer exited unexpectedly; static restoration was not attempted' \
+          >"${FAILURE_FILE}"
+      fi
+      while true; do /usr/bin/sleep 1; done
+    fi
+    /usr/bin/sleep 0.02
+  done
+fi
+
+readonly TEST_ROOT="$(/usr/bin/mktemp -d)"
+declare -a OWNED_PIDS=()
+
+test_cleanup() {
+  local pid
+  for pid in "${OWNED_PIDS[@]}"; do
+    kill -KILL "${pid}" 2>/dev/null || true
+  done
+  wait 2>/dev/null || true
+  /usr/bin/rm -rf -- "${TEST_ROOT}"
+}
+trap test_cleanup EXIT
+
+wait_for_file() {
+  local path="${1}"
+  local attempt
+  for attempt in {1..200}; do
+    [[ -s "${path}" ]] && return 0
+    /usr/bin/sleep 0.01
+  done
+  return 1
+}
+
+wait_for_exit() {
+  local pid="${1}"
+  local attempt
+  local state
+  for attempt in {1..200}; do
+    state="$(/usr/bin/awk '{print $3}' "/proc/${pid}/stat" 2>/dev/null || true)"
+    if [[ -z "${state}" || "${state}" == Z ]]; then
+      wait "${pid}" 2>/dev/null || true
+      return 0
+    fi
+    /usr/bin/sleep 0.01
+  done
+  return 1
+}
+
+start_lifecycle() {
+  local root="${1}"
+  local mode="${2:-clean}"
+  /usr/bin/mkdir -p "${root}"
+  "${BASH_SOURCE[0]}" lifecycle "${root}" "${mode}" &
+  lifecycle_pid=$!
+  OWNED_PIDS+=("${lifecycle_pid}")
+  wait_for_file "${root}/owner"
+  read -r recorded_lifecycle writer_pid <"${root}/owner"
+  [[ "${recorded_lifecycle}" == "${lifecycle_pid}" ]]
+  OWNED_PIDS+=("${writer_pid}")
+  wait_for_file "${root}/counter"
+}
+
+assert_locks_free() {
+  local root="${1}"
+  exec 6>"${root}/lifecycle.lock"
+  /usr/bin/flock -n 6
+  exec 7>"${root}/writer.lock"
+  /usr/bin/flock -n 7
+  exec 6>&-
+  exec 7>&-
+}
+
+pass_count=0
+pass() {
+  pass_count=$((pass_count + 1))
+  /usr/bin/printf 'PASS: %s\n' "${1}"
+}
+
+# The old owner receives a graceful request but is destroyed before it can
+# authenticate the writer stop, reproducing the Quickshell QProcess race.
+race_root="${TEST_ROOT}/old-race"
+start_lifecycle "${race_root}" stall
+kill -TERM "${lifecycle_pid}"
+wait_for_file "${race_root}/stopping"
+kill -KILL "${lifecycle_pid}"
+wait "${lifecycle_pid}" 2>/dev/null || true
+wait_for_exit "${writer_pid}"
+wait_for_file "${race_root}/failure"
+[[ "$(<"${race_root}/failure")" == *'not preceded by an authenticated'* ]]
+pass 'old Quickshell terminate/destroy race fails closed'
+
+# Shell exit, hot reload, and shell crash are all unrelated processes now.
+independent_root="${TEST_ROOT}/independent"
+start_lifecycle "${independent_root}" clean
+original_lifecycle="${lifecycle_pid}"
+original_writer="${writer_pid}"
+counter_before="$(<"${independent_root}/counter")"
+for shell_event in normal-exit hot-reload unexpected-crash; do
+  shell_marker="${independent_root}/shell-${shell_event}"
+  "${BASH_SOURCE[0]}" shell "${shell_marker}" &
+  shell_pid=$!
+  OWNED_PIDS+=("${shell_pid}")
+  wait_for_file "${shell_marker}"
+  if [[ "${shell_event}" == unexpected-crash ]]; then
+    kill -KILL "${shell_pid}"
+  else
+    kill -TERM "${shell_pid}"
+  fi
+  wait "${shell_pid}" 2>/dev/null || true
+  kill -0 "${original_lifecycle}"
+  kill -0 "${original_writer}"
+done
+/usr/bin/sleep 0.08
+[[ "$(<"${independent_root}/counter")" -gt "${counter_before}" ]]
+pass 'shell restart, plugin reload, and shell crash preserve lifecycle and writer'
+
+# Changed SDK identity is observed before another simulated frame.
+/usr/bin/printf '%s\n' sdk-replaced >"${independent_root}/sdk"
+wait_for_exit "${original_writer}"
+wait_for_file "${independent_root}/failure"
+[[ "$(<"${independent_root}/failure")" == 'OpenRGB SDK process identity changed' ]]
+pass 'SDK identity change stops the writer fail closed'
+kill -KILL "${original_lifecycle}"
+wait "${original_lifecycle}" 2>/dev/null || true
+
+# Unexpected writer death is detected by the still-live lifecycle.
+writer_death_root="${TEST_ROOT}/writer-death"
+start_lifecycle "${writer_death_root}" clean
+kill -KILL "${writer_pid}"
+wait "${writer_pid}" 2>/dev/null || true
+wait_for_file "${writer_death_root}/failure"
+[[ "$(<"${writer_death_root}/failure")" == *'writer exited unexpectedly'* ]]
+pass 'unexpected writer death is persistently latched'
+kill -KILL "${lifecycle_pid}"
+wait "${lifecycle_pid}" 2>/dev/null || true
+
+# Unexpected lifecycle death reaches the writer through Linux parent death.
+owner_death_root="${TEST_ROOT}/owner-death"
+start_lifecycle "${owner_death_root}" clean
+kill -KILL "${lifecycle_pid}"
+wait "${lifecycle_pid}" 2>/dev/null || true
+wait_for_exit "${writer_pid}"
+wait_for_file "${owner_death_root}/failure"
+[[ "$(<"${owner_death_root}/failure")" == *'not preceded by an authenticated'* ]]
+pass 'unexpected lifecycle death terminates and latches the writer'
+
+# Deliberate stop publishes authentication, waits for the writer, and frees
+# both singleton locks before the owner exits.
+clean_root="${TEST_ROOT}/clean-stop"
+start_lifecycle "${clean_root}" clean
+kill -TERM "${lifecycle_pid}"
+wait_for_exit "${lifecycle_pid}"
+wait_for_exit "${writer_pid}"
+[[ -e "${clean_root}/stop" && ! -e "${clean_root}/failure" ]]
+assert_locks_free "${clean_root}"
+pass 'deliberate service stop authenticates writer exit and releases locks'
+
+# A second owner cannot acquire the lifecycle singleton.  Once the first
+# owner stops, exactly one successor can own both locks.
+transfer_root="${TEST_ROOT}/transfer"
+start_lifecycle "${transfer_root}" clean
+first_lifecycle="${lifecycle_pid}"
+first_writer="${writer_pid}"
+if "${BASH_SOURCE[0]}" lifecycle "${transfer_root}" clean; then
+  exit 1
+else
+  [[ "$?" -eq 75 ]]
+fi
+kill -TERM "${first_lifecycle}"
+wait_for_exit "${first_lifecycle}"
+wait_for_exit "${first_writer}"
+/usr/bin/rm -f -- "${transfer_root}/owner" "${transfer_root}/stop"
+start_lifecycle "${transfer_root}" clean
+[[ "${lifecycle_pid}" != "${first_lifecycle}" ]]
+[[ "${writer_pid}" != "${first_writer}" ]]
+pass 'duplicate lifecycle is rejected and singleton transfers without overlap'
+kill -TERM "${lifecycle_pid}"
+wait_for_exit "${lifecycle_pid}"
+wait_for_exit "${writer_pid}"
+
+# The manager guard records a persistent latch before timeout escalation.
+timeout_root="${TEST_ROOT}/timeout"
+state_home="${timeout_root}/state"
+runtime_home="${timeout_root}/runtime"
+/usr/bin/mkdir -p "${state_home}" "${runtime_home}"
+XDG_STATE_HOME="${state_home}" OPENRGB_RUNTIME_DIR="${runtime_home}" \
+  "${REPOSITORY_ROOT}/openrgb-service-guard" mark ready \
+  --lifecycle-pid 999999 --lifecycle-start manager-timeout
+if XDG_STATE_HOME="${state_home}" OPENRGB_RUNTIME_DIR="${runtime_home}" \
+  "${REPOSITORY_ROOT}/openrgb-service-guard" finalize-stop; then
+  exit 1
+fi
+wait_for_file "${state_home}/omarchy-plus/openrgb-presets/ram-tetris-failure.json"
+pass 'service stop timeout is latched before manager escalation'
+
+# Rollback precondition: after an authenticated stop no fixture process or
+# singleton remains, so the old owner can be restored without an orphan.
+rollback_root="${TEST_ROOT}/rollback"
+start_lifecycle "${rollback_root}" clean
+rollback_lifecycle="${lifecycle_pid}"
+rollback_writer="${writer_pid}"
+kill -TERM "${rollback_lifecycle}"
+wait_for_exit "${rollback_lifecycle}"
+wait_for_exit "${rollback_writer}"
+assert_locks_free "${rollback_root}"
+pass 'rollback leaves no lifecycle or writer orphan'
+
+[[ "${pass_count}" -eq 9 ]]
+/usr/bin/printf 'Independent lifecycle process tests: PASS (%s cases)\n' "${pass_count}"

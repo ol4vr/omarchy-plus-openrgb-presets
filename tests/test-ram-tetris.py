@@ -1,11 +1,12 @@
 #!/usr/bin/python3
-"""Focused offline validation for the v0.4.18 RAM Tetris integration."""
+"""Focused offline validation for the v0.4.19 RAM Tetris integration."""
 
 from __future__ import annotations
 
 import fcntl
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -16,8 +17,10 @@ import tempfile
 import threading
 import unittest
 from collections import Counter
+from contextlib import redirect_stdout
 from fractions import Fraction
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,6 +70,12 @@ class FakeSDK:
             for index in range(4, 7)
         )
 
+    def open(self):
+        return None
+
+    def close(self):
+        return None
+
     def inventory(self):
         return tuple(self.controllers)
 
@@ -90,9 +99,7 @@ class FakeHealth:
         self.process_failure = process_failure
         self.begun = False
         self.server = runtime.ServerIdentity(200, "server-start")
-        self.lifecycle = runtime.LifecycleIdentity(
-            300, "lifecycle-start", "boot", 0
-        )
+        self.lifecycle = runtime.LifecycleIdentity(300, "lifecycle-start", "boot", 0)
 
     def begin(self):
         self.begun = True
@@ -483,9 +490,7 @@ class RuntimeSafetyTests(unittest.TestCase):
         )
         sdk = FakeSDK("#8B0000")
         control = FakeControl(None, request)
-        writer = runtime.TetrisWriter(
-            sdk, health, FakeEffects(), control, "horde-red"
-        )
+        writer = runtime.TetrisWriter(sdk, health, FakeEffects(), control, "horde-red")
 
         writer.run()
 
@@ -546,12 +551,8 @@ class RuntimeSafetyTests(unittest.TestCase):
 
     @mock.patch.object(runtime, "_preference", return_value=True)
     @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
-    def test_mismatched_handoff_identity_is_not_authorized(
-        self, _preset, _preference
-    ):
-        request = runtime.StopRequest(
-            "handoff", 999, "wrong", 200, "server-start"
-        )
+    def test_mismatched_handoff_identity_is_not_authorized(self, _preset, _preference):
+        request = runtime.StopRequest("handoff", 999, "wrong", 200, "server-start")
         sdk = FakeSDK("#8B0000")
         writer = runtime.TetrisWriter(
             sdk,
@@ -1048,6 +1049,25 @@ class RuntimeSafetyTests(unittest.TestCase):
             )
             self.assertFalse(failure_path.exists())
 
+    def test_new_failure_cannot_replace_retained_latch_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {
+                "XDG_STATE_HOME": str(Path(directory, "state")),
+                "OPENRGB_RUNTIME_DIR": str(Path(directory, "runtime")),
+            }
+            failure_path = Path(
+                environment["XDG_STATE_HOME"],
+                "omarchy-plus/openrgb-presets/ram-tetris-failure.json",
+            )
+            failure_path.parent.mkdir(parents=True)
+            original = b'{"message":"October 16 incident","state":"failed"}\n'
+            failure_path.write_bytes(original)
+
+            with mock.patch.dict(os.environ, environment, clear=False):
+                runtime.RuntimeControl().fail("later restoration failure")
+
+            self.assertEqual(failure_path.read_bytes(), original)
+
     def test_sdk_connection_failure_is_persistently_latched(self):
         class FailingSDK:
             def open(self):
@@ -1084,6 +1104,83 @@ class RuntimeSafetyTests(unittest.TestCase):
             failure = json.loads((state / "ram-tetris-failure.json").read_text())
             self.assertEqual(failure["state"], "failed")
             self.assertIn("SDK connection", failure["message"])
+
+
+class ServiceReadinessTests(unittest.TestCase):
+    def test_pre_restore_hardware_gate_covers_spd_without_writes(self):
+        sdk = FakeSDK("#8B0000")
+        health = FakeHealth()
+        output = io.StringIO()
+        arguments = SimpleNamespace(
+            lifecycle_pid=300,
+            lifecycle_start="lifecycle-start",
+            server_pid=200,
+            server_start="server-start",
+        )
+        with (
+            mock.patch.object(runtime, "OpenRGBSDK", return_value=sdk),
+            mock.patch.object(
+                runtime, "_lifecycle_identity", return_value=health.lifecycle
+            ),
+            mock.patch.object(runtime, "LinuxHealth", return_value=health),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(runtime._validate_hardware(arguments), 0)
+
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["controller_count"], 7)
+        self.assertEqual(result["dimm_count"], 4)
+        self.assertEqual(len(result["temperatures_mc"]), 4)
+        self.assertEqual(sdk.writes, [])
+
+    def test_pre_restore_hardware_gate_refuses_unreadable_spd(self):
+        sdk = FakeSDK("#8B0000")
+        health = FakeHealth(fail_spd=True)
+        arguments = SimpleNamespace(
+            lifecycle_pid=300,
+            lifecycle_start="lifecycle-start",
+            server_pid=200,
+            server_start="server-start",
+        )
+        with (
+            mock.patch.object(runtime, "OpenRGBSDK", return_value=sdk),
+            mock.patch.object(
+                runtime, "_lifecycle_identity", return_value=health.lifecycle
+            ),
+            mock.patch.object(runtime, "LinuxHealth", return_value=health),
+            self.assertRaisesRegex(runtime.SafetyStop, "temperature"),
+        ):
+            runtime._validate_hardware(arguments)
+        self.assertEqual(sdk.writes, [])
+
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_read_only_health_gate_covers_all_four_dimms_without_writes(self, _preset):
+        sdk = FakeSDK("#8B0000")
+        health = FakeHealth()
+        output = io.StringIO()
+        arguments = SimpleNamespace(
+            lifecycle_pid=300,
+            lifecycle_start="lifecycle-start",
+            server_pid=200,
+            server_start="server-start",
+        )
+        with (
+            mock.patch.object(runtime, "OpenRGBSDK", return_value=sdk),
+            mock.patch.object(
+                runtime, "_lifecycle_identity", return_value=health.lifecycle
+            ),
+            mock.patch.object(runtime, "LinuxHealth", return_value=health),
+            mock.patch.object(runtime, "EffectsContract", return_value=FakeEffects()),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(runtime._validate_health(arguments), 0)
+
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["controller_count"], 7)
+        self.assertEqual(result["dimm_count"], 4)
+        self.assertEqual(len(result["temperatures_mc"]), 4)
+        self.assertEqual(result["preset"], "horde-red")
+        self.assertEqual(sdk.writes, [])
 
 
 class EffectsContractTests(unittest.TestCase):
@@ -1136,7 +1233,7 @@ class IntegrationSourceTests(unittest.TestCase):
         runner = (ROOT / "ram-tetris").read_text()
         self.assertIn('--pdeathsig TERM "${RAM_TETRIS}" run', lifecycle)
         self.assertIn("stop_tetris suspend", lifecycle)
-        self.assertIn("stop_tetris handoff", lifecycle)
+        self.assertIn('stop_tetris "${tetris_reason}"', lifecycle)
         self.assertIn("reconcile_tetris", lifecycle)
         self.assertIn("ram-tetris.lock", (ROOT / "apply-preset").read_text())
         sleep_handler = lifecycle.split("handle_sleep_signal() {", 1)[1].split(
@@ -1150,13 +1247,19 @@ class IntegrationSourceTests(unittest.TestCase):
             0
         ]
         self.assertLess(
-            cleanup.index("stop_tetris handoff"), cleanup.index("detach_server")
+            cleanup.index('stop_tetris "${tetris_reason}"'),
+            cleanup.index("detach_server"),
         )
         stop = lifecycle.split("stop_tetris() {", 1)[1].split(
             "reconcile_tetris() {", 1
         )[0]
-        self.assertLess(stop.index('"${FLOCK_BIN}" "${stop_lock_fd}"'), stop.index("TETRIS_STOP_FILE"))
-        self.assertLess(stop.index("TETRIS_STOP_FILE"), stop.index("for attempt in {1..100}"))
+        self.assertLess(
+            stop.index('"${FLOCK_BIN}" "${stop_lock_fd}"'),
+            stop.index("TETRIS_STOP_FILE"),
+        )
+        self.assertLess(
+            stop.index("TETRIS_STOP_FILE"), stop.index("for attempt in {1..100}")
+        )
         for field in (
             "lifecycle_pid",
             "lifecycle_start",
@@ -1166,6 +1269,35 @@ class IntegrationSourceTests(unittest.TestCase):
             self.assertIn(field, stop)
         self.assertIn("self.health.verify_processes()", runner)
         self.assertIn("OpenRGB SDK process identity changed", runner)
+        self.assertEqual(runtime.LIFECYCLE_ARGV[-1], "--service")
+        restore = lifecycle.split("start_restore() {", 1)[1].split(
+            "start_server() {", 1
+        )[0]
+        self.assertLess(
+            restore.index('"${RAM_TETRIS}" validate-hardware'),
+            restore.index('"${APPLY_PRESET}" --restore'),
+        )
+        self.assertIn('"${SETPRIV_BIN}" --pdeathsig TERM', restore)
+        self.assertIn("--server-start", restore)
+        self.assertIn("--lifecycle-start", restore)
+        self.assertIn("for attempt in {1..15}", restore)
+        self.assertIn("refusing preset write", restore)
+        reconcile = lifecycle.split("reconcile_tetris() {", 1)[1].split(
+            "expected_server_command() {", 1
+        )[0]
+        self.assertIn("! tetris_local_stop_requested", reconcile)
+        self.assertNotIn('"state": "running"', reconcile)
+
+    def test_unexpected_sdk_or_inhibitor_loss_has_no_recovery_branch(self):
+        lifecycle = (ROOT / "openrgb-lifecycle").read_text()
+        loop = lifecycle.split("while true; do", 1)[1]
+        self.assertIn("refusing automatic recovery", loop)
+        self.assertIn("refusing automatic replacement", loop)
+        self.assertNotIn("exited unexpectedly; restarting", loop)
+        self.assertNotIn('"${SLEEP_BIN}" 2\n      start_server', loop)
+        self.assertIn(
+            '! is_server_listener "${server_pid}" "${server_start_time}"', loop
+        )
 
     def test_preset_transition_owns_stop_marker_until_static_apply_finishes(self):
         apply = (ROOT / "apply-preset").read_text()

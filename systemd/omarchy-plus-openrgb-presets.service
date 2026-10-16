@@ -1,0 +1,31 @@
+[Unit]
+Description=Omarchy+ OpenRGB lifecycle
+Documentation=https://github.com/ol4vr/omarchy-plus-openrgb-presets
+After=graphical-session.target
+PartOf=graphical-session.target
+StartLimitIntervalSec=60
+StartLimitBurst=1
+
+[Service]
+Type=notify
+NotifyAccess=all
+ExitType=cgroup
+Environment=PYTHONDONTWRITEBYTECODE=1
+SyslogIdentifier=omarchy-plus-openrgb-presets
+StandardOutput=journal
+StandardError=journal
+ExecStartPre=%h/.config/omarchy/plugins/io.github.ol4vr.openrgb-presets/openrgb-service-guard prepare-start
+ExecStart=%h/.config/omarchy/plugins/io.github.ol4vr.openrgb-presets/openrgb-lifecycle --service
+ExecStopPost=%h/.config/omarchy/plugins/io.github.ol4vr.openrgb-presets/openrgb-service-guard finalize-stop
+Restart=no
+KillMode=mixed
+TimeoutStartSec=120
+TimeoutStopSec=20
+RuntimeDirectory=omarchy-plus/openrgb-presets
+RuntimeDirectoryMode=0700
+StateDirectory=omarchy-plus/openrgb-presets
+StateDirectoryMode=0700
+UMask=0077
+
+[Install]
+WantedBy=graphical-session.target

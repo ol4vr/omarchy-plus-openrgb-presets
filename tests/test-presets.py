@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-"""Focused source-only validation for OpenRGB Presets 0.4.18."""
+"""Focused source-only validation for OpenRGB Presets 0.4.19."""
 
 from __future__ import annotations
 
@@ -291,7 +290,9 @@ class PresetTests(unittest.TestCase):
     def test_new_profiles_clone_electric_sunrise_except_for_four_colors(self) -> None:
         original = load_profile("hugin-sunrise-blue-red")
         original_effect = original["Effects"][0]
-        self.assertEqual(original_effect["UserColors"], [4194559, 5308671, 16711740, 16729088])
+        self.assertEqual(
+            original_effect["UserColors"], [4194559, 5308671, 16711740, 16729088]
+        )
 
         for name, specification in NEW_PROFILES.items():
             packed_colors = specification["packed_rgbcolor"]
@@ -305,24 +306,52 @@ class PresetTests(unittest.TestCase):
             previous_colors = specification["v044_packed_rgbcolor"]
             self.assertEqual(packed_colors[:3], previous_colors[:3], name)
             self.assertNotEqual(packed_colors[3], previous_colors[3], name)
-            self.assertEqual(profile["Effects"][0]["ControllerZones"], original_effect["ControllerZones"], name)
+            self.assertEqual(
+                profile["Effects"][0]["ControllerZones"],
+                original_effect["ControllerZones"],
+                name,
+            )
             self.assertEqual(len(profile["Effects"][0]["ControllerZones"]), 6, name)
             self.assertEqual(profile["Effects"][0]["EffectClassName"], "Sunrise", name)
-            self.assertEqual(profile["Effects"][0]["CustomSettings"], original_effect["CustomSettings"], name)
-            self.assertEqual(profile["Effects"][0]["Speed"], original_effect["Speed"], name)
+            self.assertEqual(
+                profile["Effects"][0]["CustomSettings"],
+                original_effect["CustomSettings"],
+                name,
+            )
+            self.assertEqual(
+                profile["Effects"][0]["Speed"], original_effect["Speed"], name
+            )
             self.assertEqual(profile["Effects"][0]["FPS"], original_effect["FPS"], name)
             self.assertEqual(sha256(PROFILES / name), specification["sha256"], name)
 
     def test_manifest_and_panel_order(self) -> None:
         manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.4.18")
+        self.assertEqual(manifest["version"], "0.4.19")
+        self.assertEqual(manifest["kinds"], ["bar-widget"])
+        self.assertNotIn("service", manifest["entryPoints"])
+        self.assertFalse((ROOT / "Service.qml").exists())
+
+        unit = (ROOT / "systemd/omarchy-plus-openrgb-presets.service").read_text()
+        self.assertIn("Type=notify", unit)
+        self.assertIn("NotifyAccess=all", unit)
+        self.assertIn("ExitType=cgroup", unit)
+        self.assertIn("KillMode=mixed", unit)
+        self.assertIn("Restart=no", unit)
+        self.assertIn("TimeoutStartSec=120", unit)
+        self.assertIn("TimeoutStopSec=20", unit)
+        self.assertIn("PartOf=graphical-session.target", unit)
+        self.assertIn("ExecStopPost=", unit)
+        self.assertNotIn("NotifyAccess=main", unit)
 
         panel = PANEL.read_text(encoding="utf-8")
-        library = panel.split(
-            "readonly property var presets: [", 1
-        )[1].split("readonly property var activePresetData:", 1)[0]
-        self.assertEqual(re.findall(r'^\s+id: "([a-z0-9-]+)",$', library, re.MULTILINE), VISIBLE_ORDER)
-        self.assertIn('columns: 2', panel)
+        library = panel.split("readonly property var presets: [", 1)[1].split(
+            "readonly property var activePresetData:", 1
+        )[0]
+        self.assertEqual(
+            re.findall(r'^\s+id: "([a-z0-9-]+)",$', library, re.MULTILINE),
+            VISIBLE_ORDER,
+        )
+        self.assertIn("columns: 2", panel)
         self.assertIn("function moveSelection(dx, dy)", panel)
         self.assertIn("var rows = Math.ceil(presets.length / columns)", panel)
         self.assertIn("while (nextIndex >= presets.length)", panel)
@@ -330,7 +359,14 @@ class PresetTests(unittest.TestCase):
         self.assertIn('id: "bright-white"', panel)
         self.assertNotIn("brightWhitePreset", panel)
 
-        for preset, (label, kind, mode, detail, accent, swatches) in PANEL_INDICATORS.items():
+        for preset, (
+            label,
+            kind,
+            mode,
+            detail,
+            accent,
+            swatches,
+        ) in PANEL_INDICATORS.items():
             block = library.split(f'id: "{preset}"', 1)[1].split("\n    }", 1)[0]
             self.assertIn(f'label: "{label}"', block, preset)
             self.assertIn(f'kind: "{kind}"', block, preset)
@@ -395,7 +431,9 @@ class PresetTests(unittest.TestCase):
                 "horde-red",
                 "alliance-blue",
             ):
-                (state_dir / "active-preset").write_text(preset + "\n", encoding="utf-8")
+                (state_dir / "active-preset").write_text(
+                    preset + "\n", encoding="utf-8"
+                )
                 current = subprocess.run(
                     [str(APPLY), "--current"],
                     check=True,
@@ -507,15 +545,21 @@ class PresetTests(unittest.TestCase):
                     ]
                     self.assertEqual(
                         devices,
-                        [RAM_DEVICE, GPU_DEVICE, ST100_DEVICE, ST100_DEVICE, MAINBOARD_DEVICE],
+                        [
+                            RAM_DEVICE,
+                            GPU_DEVICE,
+                            ST100_DEVICE,
+                            ST100_DEVICE,
+                            MAINBOARD_DEVICE,
+                        ],
                         preset,
                     )
 
     def test_installer_registers_all_profiles_with_exact_hashes(self) -> None:
         installer = INSTALLER.read_text(encoding="utf-8")
-        names_block = installer.split(
-            "readonly -a PROFILE_NAMES=(", 1
-        )[1].split("\n)", 1)[0]
+        names_block = installer.split("readonly -a PROFILE_NAMES=(", 1)[1].split(
+            "\n)", 1
+        )[0]
         names = re.findall(r"^\s+(hugin-[a-z0-9-]+)$", names_block, re.MULTILINE)
         expected_names = [
             "hugin-rain",
