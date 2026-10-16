@@ -24,6 +24,7 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -77,6 +78,9 @@ PROFILE_BY_PRESET = {
 LIVE_EFFECT_NAME_BY_CLASS = {
     "RainbowWave": "Rainbow Wave",
 }
+LIFECYCLE_STOP_REASONS = frozenset(("handoff", "suspend", "shutdown"))
+LOCAL_STOP_REASONS = frozenset(("user-off", "preset-change"))
+STOP_REASONS = LIFECYCLE_STOP_REASONS | LOCAL_STOP_REASONS
 
 
 class SafetyStop(RuntimeError):
@@ -99,6 +103,15 @@ class LifecycleIdentity:
     start_token: str
     boot_id: str
     successful_suspends: int
+
+
+@dataclass(frozen=True)
+class StopRequest:
+    reason: str
+    lifecycle_pid: int | None = None
+    lifecycle_start: str | None = None
+    server_pid: int | None = None
+    server_start: str | None = None
 
 
 @dataclass(frozen=True)
@@ -631,17 +644,70 @@ class RuntimeControl:
         self.root = _runtime_root()
         _private_directory(self.root)
         self.stop_path = self.root / "ram-tetris.stop"
+        self.write_lock_path = self.root / "ram-tetris-write.lock"
         self.status_path = self.root / "ram-tetris-status.json"
         self.failure_path = _state_root() / "ram-tetris-failure.json"
 
-    def stop_reason(self) -> str | None:
+    def stop_request(self) -> StopRequest | None:
         try:
             value = json.loads(self.stop_path.read_text())
-            return value.get("reason") if isinstance(value, dict) else "unknown"
         except FileNotFoundError:
             return None
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as error:
+            raise SafetyStop("RAM Tetris stop request is unreadable") from error
+        if not isinstance(value, dict) or value.get("reason") not in STOP_REASONS:
+            raise SafetyStop("RAM Tetris stop request is invalid")
+        reason = value["reason"]
+        if reason in LOCAL_STOP_REASONS:
+            return StopRequest(reason)
+        lifecycle_pid = value.get("lifecycle_pid")
+        lifecycle_start = value.get("lifecycle_start")
+        server_pid = value.get("server_pid")
+        server_start = value.get("server_start")
+        if (
+            not isinstance(lifecycle_pid, int)
+            or isinstance(lifecycle_pid, bool)
+            or lifecycle_pid <= 0
+            or not isinstance(lifecycle_start, str)
+            or not lifecycle_start
+            or not isinstance(server_pid, int)
+            or isinstance(server_pid, bool)
+            or server_pid <= 0
+            or not isinstance(server_start, str)
+            or not server_start
+        ):
+            raise SafetyStop("lifecycle stop request is not authenticated")
+        return StopRequest(
+            reason,
+            lifecycle_pid,
+            lifecycle_start,
+            server_pid,
+            server_start,
+        )
+
+    def stop_reason(self) -> str | None:
+        try:
+            request = self.stop_request()
+            return request.reason if request is not None else None
+        except SafetyStop:
             return "invalid-stop-request"
+
+    def publish_stop(self, request: StopRequest) -> None:
+        value: dict[str, object] = {"reason": request.reason, "time": time.time()}
+        if request.reason in LIFECYCLE_STOP_REASONS:
+            value.update(
+                lifecycle_pid=request.lifecycle_pid,
+                lifecycle_start=request.lifecycle_start,
+                server_pid=request.server_pid,
+                server_start=request.server_start,
+            )
+        lock_fd = os.open(self.write_lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            _write_json(self.stop_path, value)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
 
     def status(self, state: str, message: str, **extra: object) -> None:
         _write_json(
@@ -668,24 +734,65 @@ class TetrisWriter:
         effects: EffectsContract,
         control: RuntimeControl,
         preset: str,
+        write_lock_fd: int | None = None,
     ) -> None:
         self.sdk = sdk
         self.health = health
         self.effects = effects
         self.control = control
         self.preset = preset
+        self.write_lock_fd = write_lock_fd
         self.expected: dict[core.ControllerIdentity, tuple[str, ...]] = {}
         self.last_global_write: float | None = None
         self.last_dimm_write: dict[core.ControllerIdentity, float] = {}
         self.stopping = False
+        self.termination_signal: int | None = None
+        self.requested_stop: str | None = None
         self.animation_writes = 0
+
+    @contextmanager
+    def _write_guard(self):
+        if self.write_lock_fd is None:
+            yield
+            return
+        fcntl.flock(self.write_lock_fd, fcntl.LOCK_SH)
+        try:
+            yield
+        finally:
+            fcntl.flock(self.write_lock_fd, fcntl.LOCK_UN)
+
+    def request_termination(self, signum: int) -> None:
+        self.termination_signal = signum
+        self.stopping = True
+
+    def _validated_stop_request(self) -> StopRequest | None:
+        request = self.control.stop_request()
+        if self.termination_signal is not None and (
+            request is None or request.reason not in LIFECYCLE_STOP_REASONS
+        ):
+            raise SafetyStop(
+                "writer termination was not preceded by an authenticated "
+                "lifecycle stop request"
+            )
+        if request is None:
+            return None
+        if request.reason in LIFECYCLE_STOP_REASONS and (
+            request.lifecycle_pid != self.health.lifecycle.pid
+            or request.lifecycle_start != self.health.lifecycle.start_token
+            or request.server_pid != self.health.server.pid
+            or request.server_start != self.health.server.start_token
+        ):
+            raise SafetyStop("lifecycle stop request identity does not match writer")
+        self.requested_stop = request.reason
+        self.stopping = True
+        return request
 
     def _health_gate(
         self,
     ) -> tuple[dict[core.ControllerIdentity, ControllerSnapshot], Mapping[str, int]]:
         self.health.verify_processes()
         if not _preference():
-            if self.control.stop_reason() == "user-off":
+            if self.requested_stop == "user-off":
                 self.stopping = True
             else:
                 raise SafetyStop("RAM Tetris preference changed")
@@ -714,13 +821,16 @@ class TetrisWriter:
 
     def _write(
         self, identity: core.ControllerIdentity, colors: tuple[str, ...]
-    ) -> None:
-        controllers, temperatures = self._health_gate()
-        if self.stopping or self.control.stop_reason() is not None:
-            return
-        if colors == self.expected[identity]:
-            raise SafetyStop("scheduler produced a redundant frame")
-        self.sdk.update_leds(controllers[identity].index, colors)
+    ) -> bool:
+        with self._write_guard():
+            if self._validated_stop_request() is not None:
+                return False
+            controllers, temperatures = self._health_gate()
+            if self._validated_stop_request() is not None:
+                return False
+            if colors == self.expected[identity]:
+                raise SafetyStop("scheduler produced a redundant frame")
+            self.sdk.update_leds(controllers[identity].index, colors)
         now = time.monotonic()
         self.last_global_write = now
         self.last_dimm_write[identity] = now
@@ -733,17 +843,26 @@ class TetrisWriter:
             writes=self.animation_writes,
             temperatures_mc=dict(temperatures),
         )
+        return True
 
-    def _restore_static(self) -> None:
+    def _restore_static(self) -> bool:
         static = core.static_pattern_for(self.preset)
         for identity in core.VERIFIED_DIMMS:
-            controllers, _ = self._health_gate_for_restoration()
-            if controllers[identity].colors == static:
+            with self._write_guard():
+                request = self._validated_stop_request()
+                if request is None or request.reason != "user-off":
+                    return False
+                controllers, _ = self._health_gate_for_restoration()
+                request = self._validated_stop_request()
+                if request is None or request.reason != "user-off":
+                    return False
+                if controllers[identity].colors == static:
+                    self.expected[identity] = static
+                    continue
+                self.sdk.update_leds(controllers[identity].index, static)
                 self.expected[identity] = static
-                continue
-            self.sdk.update_leds(controllers[identity].index, static)
-            self.expected[identity] = static
-            self._health_gate_for_restoration()
+                self._health_gate_for_restoration()
+        return True
 
     def _health_gate_for_restoration(
         self,
@@ -764,7 +883,17 @@ class TetrisWriter:
 
     def run(self) -> None:
         self.health.begin()
-        controllers, temperatures = self._health_gate()
+        with self._write_guard():
+            initial_request = self._validated_stop_request()
+            if initial_request is not None and initial_request.reason != "user-off":
+                self.control.status(
+                    "stopped",
+                    f"RAM Tetris stopped for {initial_request.reason}",
+                    preset=self.preset,
+                    writes=0,
+                )
+                return
+            controllers, temperatures = self._health_gate()
         self.expected = {
             identity: target.colors for identity, target in controllers.items()
         }
@@ -778,8 +907,7 @@ class TetrisWriter:
             temperatures_mc=dict(temperatures),
         )
         while not self.stopping:
-            reason = self.control.stop_reason()
-            if reason is not None:
+            if self._validated_stop_request() is not None:
                 break
             stream = min(streams, key=lambda item: (item.due, item.identity.location))
             target = origin + float(stream.due)
@@ -788,25 +916,35 @@ class TetrisWriter:
             if stream.identity in self.last_dimm_write:
                 target = max(target, self.last_dimm_write[stream.identity] + 0.2)
             self._sleep_until(target)
-            if self.stopping or self.control.stop_reason() is not None:
+            if self.stopping:
                 break
             colors = stream.frame.colors
-            self._write(stream.identity, colors)
-            stream.advance(
-                Fraction.from_float(time.monotonic() - origin).limit_denominator(
-                    1_000_000
+            if self._write(stream.identity, colors):
+                stream.advance(
+                    Fraction.from_float(time.monotonic() - origin).limit_denominator(
+                        1_000_000
+                    )
                 )
-            )
 
-        reason = self.control.stop_reason() or "lifecycle-exit"
+        request = self._validated_stop_request()
+        reason = request.reason if request is not None else "lifecycle-exit"
         if reason == "user-off":
-            self._restore_static()
-            self.control.status(
-                "off",
-                "RAM Tetris off; static DDR5 restored",
-                preset=self.preset,
-                writes=self.animation_writes,
-            )
+            if self._restore_static():
+                self.control.status(
+                    "off",
+                    "RAM Tetris off; static DDR5 restored",
+                    preset=self.preset,
+                    writes=self.animation_writes,
+                )
+            else:
+                request = self._validated_stop_request()
+                reason = request.reason if request is not None else "lifecycle-exit"
+                self.control.status(
+                    "stopped",
+                    f"RAM Tetris stopped for {reason}",
+                    preset=self.preset,
+                    writes=self.animation_writes,
+                )
         else:
             self.control.status(
                 "stopped",
@@ -858,8 +996,23 @@ def _status_document(control: RuntimeControl) -> dict[str, object]:
     return status
 
 
-def _request_stop(control: RuntimeControl, reason: str) -> None:
-    _write_json(control.stop_path, {"reason": reason, "time": time.time()})
+def _request_stop(
+    control: RuntimeControl,
+    reason: str,
+    lifecycle_pid: int | None = None,
+    lifecycle_start: str | None = None,
+    server_pid: int | None = None,
+    server_start: str | None = None,
+) -> None:
+    control.publish_stop(
+        StopRequest(
+            reason,
+            lifecycle_pid,
+            lifecycle_start,
+            server_pid,
+            server_start,
+        )
+    )
 
 
 def _lifecycle_identity(pid: int, token: str) -> LifecycleIdentity:
@@ -883,6 +1036,9 @@ def _run(args: argparse.Namespace) -> int:
         return 0
     lock_path = control.root / "ram-tetris.lock"
     lock_fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    write_lock_fd = os.open(
+        control.write_lock_path, os.O_WRONLY | os.O_CREAT, 0o600
+    )
     try:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -895,7 +1051,7 @@ def _run(args: argparse.Namespace) -> int:
 
         def stop(_signum: int, _frame: object) -> None:
             if writer is not None:
-                writer.stopping = True
+                writer.request_termination(_signum)
 
         signal.signal(signal.SIGTERM, stop)
         signal.signal(signal.SIGINT, stop)
@@ -910,6 +1066,7 @@ def _run(args: argparse.Namespace) -> int:
                 EffectsContract(preset, Path(__file__).resolve().parent),
                 control,
                 preset,
+                write_lock_fd,
             )
             writer.run()
         except SafetyStop as error:
@@ -928,6 +1085,7 @@ def _run(args: argparse.Namespace) -> int:
             sdk.close()
         return 0
     finally:
+        os.close(write_lock_fd)
         os.close(lock_fd)
 
 
@@ -947,6 +1105,10 @@ def build_parser() -> argparse.ArgumentParser:
         "reason",
         choices=("user-off", "preset-change", "suspend", "handoff", "shutdown"),
     )
+    stop.add_argument("--server-pid", type=int)
+    stop.add_argument("--server-start")
+    stop.add_argument("--lifecycle-pid", type=int)
+    stop.add_argument("--lifecycle-start")
     actions.add_parser("clear-stop")
     clear_failure = actions.add_parser("clear-failure")
     clear_failure.add_argument(
@@ -977,7 +1139,30 @@ def main() -> int:
         print("RAM Tetris preference disabled; safe static restoration requested")
         return 0
     if args.action == "request-stop":
-        _request_stop(control, args.reason)
+        identity = (
+            args.lifecycle_pid,
+            args.lifecycle_start,
+            args.server_pid,
+            args.server_start,
+        )
+        if args.reason in LIFECYCLE_STOP_REASONS and any(
+            item is None for item in identity
+        ):
+            raise SystemExit(
+                "lifecycle stop request requires lifecycle and server identities"
+            )
+        if args.reason in LOCAL_STOP_REASONS and any(
+            item is not None for item in identity
+        ):
+            raise SystemExit("local stop request must not carry lifecycle identity")
+        _request_stop(
+            control,
+            args.reason,
+            args.lifecycle_pid,
+            args.lifecycle_start,
+            args.server_pid,
+            args.server_start,
+        )
         return 0
     if args.action == "clear-stop":
         try:

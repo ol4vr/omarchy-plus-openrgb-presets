@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused source-only validation for OpenRGB Presets 0.4.17."""
+"""Focused source-only validation for OpenRGB Presets 0.4.18."""
 
 from __future__ import annotations
 
@@ -315,7 +315,7 @@ class PresetTests(unittest.TestCase):
 
     def test_manifest_and_panel_order(self) -> None:
         manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.4.17")
+        self.assertEqual(manifest["version"], "0.4.18")
 
         panel = PANEL.read_text(encoding="utf-8")
         library = panel.split(

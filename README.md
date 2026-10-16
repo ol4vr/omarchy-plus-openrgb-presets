@@ -120,6 +120,17 @@ Static White, For the Horde!, and For the Alliance! are display-label changes
 only; their stable preset identifiers, saved-state compatibility, palettes, and
 restoration paths are unchanged.
 
+Version 0.4.18 makes an intentional lifecycle handoff race-free. The outgoing
+lifecycle serializes an authenticated stop record against every RGB write,
+then waits for the writer to terminate and release its singleton before
+releasing lifecycle ownership. The record is bound to the lifecycle and SDK
+PID/start-token identities. A successor still performs its own SDK listener,
+seven-controller, SPD5118, Effects, preset, and kernel-error validation before
+starting a writer. A zero-owner interval without the matching record, abrupt
+parent death, duplicate lifecycle, or changed SDK identity remains a persistent
+fail-closed event; no grace period, automatic recovery, or latch clearing was
+added.
+
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
 The experimental orange, blue, and red Sunrise gradients are therefore stored
@@ -193,7 +204,11 @@ OpenRGB server, preset restoration, inhibitor, or monitor cannot accidentally
 retain lifecycle ownership.
 
 The lifecycle also owns at most one `ram-tetris` writer. A private writer lock
-prevents duplicates across reconciliation and Quickshell handoff. The writer
+prevents duplicates across reconciliation and Quickshell handoff. A separate
+write gate lets an outgoing lifecycle wait for any already-started frame,
+atomically publish its identity-bound stop request, and exclude every later
+animation or restoration write. It does not release lifecycle ownership until
+the writer has safely terminated and released its singleton. The writer
 uses one non-detecting SDK connection, resolves each DIMM by exact name and
 I801 address before every update, and globally serializes complete twelve-LED
 frames. Seeded 200, 300, or 400 ms intervals enforce at most five updates per
@@ -209,8 +224,10 @@ automatic restart. The latch survives lifecycle, Quickshell, suspend/resume,
 and application restarts; ordinary OFF and ON actions never clear it. Turning
 the toggle OFF restores the static DDR5 array only after fresh health gates pass.
 Preset changes quiesce the writer under its lock before applying the existing
-preset. Suspend and Quickshell handoff stop it before SDK teardown or adoption;
-a parent-death signal prevents an orphan writer after abrupt shell exit.
+preset. Suspend and an explicitly initiated Quickshell handoff stop it before
+SDK teardown or adoption. A parent-death signal without the authenticated stop
+request latches as unexplained ownership loss, so an abrupt shell exit cannot
+authorize a zero-owner interval or leave an orphan writer.
 
 Clearing a hardware-failure latch is deliberately absent from the panel. After
 a separately reviewed recovery establishes healthy hardware, the owner must
@@ -303,6 +320,7 @@ qmllint -I "$OMARCHY_PATH/shell" \
 /usr/bin/python3 -m py_compile "$PLUGIN_DIR/ram-tetris" "$PLUGIN_DIR/ram_tetris_core.py"
 "$PLUGIN_DIR/tests/test-lifecycle-duplicate-prevention"
 "$PLUGIN_DIR/tests/test-lifecycle-inhibitors"
+/usr/bin/bash "$PLUGIN_DIR/tests/test-lifecycle-tetris-handoff"
 /usr/bin/python3 "$PLUGIN_DIR/tests/test-presets.py"
 /usr/bin/python3 "$PLUGIN_DIR/tests/test-ram-tetris.py"
 "$PLUGIN_DIR/openrgb-lifecycle" --check
@@ -431,6 +449,16 @@ or Effects Plugin binaries, or non-DDR animations. If communication is already
 degraded, do not request a restoration write; stop for hardware-recovery
 review instead. Do not delete `ram-tetris-failure.json` merely to complete a
 rollback; preserve it as failure evidence until that review is complete.
+
+## Roll back the 0.4.18 lifecycle handoff repair
+
+First leave RAM Tetris OFF after a reviewed healthy static restoration, then
+redeploy exact accepted v0.4.17 commit
+`a1e72a287c3d2b22fc2dcbc26e0310a79e8c2b6b`. Version 0.4.17 does not serialize
+an authenticated handoff against RGB writes and can latch a legitimate
+Quickshell zero-owner interval, so do not perform a shell-restart acceptance
+test with RAM Tetris active after rollback. Never clear an existing failure
+latch merely to complete rollback.
 
 ## Remove
 

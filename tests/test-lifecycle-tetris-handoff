@@ -1,0 +1,90 @@
+#!/usr/bin/bash
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+readonly REPOSITORY_ROOT="$(/usr/bin/readlink -f "$(/usr/bin/dirname "${BASH_SOURCE[0]}")/..")"
+readonly TEST_ROOT="$(/usr/bin/mktemp -d)"
+
+test_cleanup() {
+  if [[ -n "${writer_pid:-}" ]]; then
+    wait "${writer_pid}" 2>/dev/null || true
+  fi
+  /usr/bin/rm -rf -- "${TEST_ROOT}"
+}
+trap test_cleanup EXIT
+
+/usr/bin/mkdir -p "${TEST_ROOT}/runtime"
+export OPENRGB_RUNTIME_DIR="${TEST_ROOT}/runtime"
+
+# shellcheck source=../openrgb-lifecycle
+source "${REPOSITORY_ROOT}/openrgb-lifecycle"
+
+# The fixture writer uses a real process and real flock but no SDK or hardware.
+# Process identity and listener checks are bounded fakes for the lifecycle seam.
+is_same_process() {
+  [[ "${1:-}" == "${writer_pid:-}" && "${2:-}" == writer-start ]] \
+    && kill -0 "${writer_pid}" 2>/dev/null
+}
+
+is_tetris_process() {
+  is_same_process "${1:-}" "${2:-}"
+}
+
+is_server_listener() {
+  [[ "${1:-}" == 4242 && "${2:-}" == server-start ]]
+}
+
+process_start_time() {
+  if [[ "${1:-}" == "$$" ]]; then
+    /usr/bin/printf '%s' lifecycle-start
+  elif [[ "${1:-}" == 4242 ]]; then
+    /usr/bin/printf '%s' server-start
+  elif [[ "${1:-}" == "${writer_pid:-}" ]]; then
+    /usr/bin/printf '%s' writer-start
+  else
+    return 1
+  fi
+}
+
+(
+  exec 9>"${RUNTIME_DIR}/ram-tetris.lock"
+  "${FLOCK_BIN}" 9
+  while [[ ! -e "${TETRIS_STOP_FILE}" ]]; do
+    "${SLEEP_BIN}" 0.01
+  done
+  "${SLEEP_BIN}" 0.05
+) &
+writer_pid=$!
+tetris_pid="${writer_pid}"
+tetris_start_time=writer-start
+server_pid=4242
+server_start_time=server-start
+
+stop_tetris handoff >/dev/null
+
+[[ -z "${tetris_pid}" ]]
+! kill -0 "${writer_pid}" 2>/dev/null
+exec 8>"${RUNTIME_DIR}/ram-tetris.lock"
+"${FLOCK_BIN}" -n 8
+
+/usr/bin/python3 - "${TETRIS_STOP_FILE}" "$$" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+stop_time = value.pop("time")
+assert isinstance(stop_time, float) and stop_time > 0
+assert value == {
+    "lifecycle_pid": int(sys.argv[2]),
+    "lifecycle_start": "lifecycle-start",
+    "reason": "handoff",
+    "server_pid": 4242,
+    "server_start": "server-start",
+}
+PY
+
+/usr/bin/printf '%s\n' \
+  'PASS: authenticated handoff stops writer and releases singleton before return'

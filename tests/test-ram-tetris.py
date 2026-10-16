@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Focused offline validation for the v0.4.17 RAM Tetris integration."""
+"""Focused offline validation for the v0.4.18 RAM Tetris integration."""
 
 from __future__ import annotations
 
@@ -9,9 +9,11 @@ import importlib.util
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from collections import Counter
 from fractions import Fraction
@@ -81,15 +83,23 @@ class FakeSDK:
 
 
 class FakeHealth:
-    def __init__(self, fail_spd: bool = False) -> None:
+    def __init__(
+        self, fail_spd: bool = False, process_failure: str | None = None
+    ) -> None:
         self.fail_spd = fail_spd
+        self.process_failure = process_failure
         self.begun = False
+        self.server = runtime.ServerIdentity(200, "server-start")
+        self.lifecycle = runtime.LifecycleIdentity(
+            300, "lifecycle-start", "boot", 0
+        )
 
     def begin(self):
         self.begun = True
 
     def verify_processes(self):
-        return None
+        if self.process_failure is not None:
+            raise runtime.SafetyStop(self.process_failure)
 
     def temperatures(self):
         if self.fail_spd:
@@ -107,12 +117,19 @@ class FakeEffects:
 
 
 class FakeControl:
-    def __init__(self, reason: str | None) -> None:
-        self.reason = reason
+    def __init__(
+        self, reason: str | None, request: runtime.StopRequest | None = None
+    ) -> None:
+        self.request = request
+        if request is None and reason is not None:
+            self.request = runtime.StopRequest(reason)
         self.states: list[str] = []
 
     def stop_reason(self):
-        return self.reason
+        return self.request.reason if self.request is not None else None
+
+    def stop_request(self):
+        return self.request
 
     def status(self, state, _message, **_extra):
         self.states.append(state)
@@ -457,6 +474,205 @@ class RuntimeSafetyTests(unittest.TestCase):
 
     @mock.patch.object(runtime, "_preference", return_value=True)
     @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_authenticated_handoff_accepts_real_zero_owner_interval(
+        self, _preset, _preference
+    ):
+        health = FakeHealth(process_failure="expected one OpenRGB lifecycle, found 0")
+        request = runtime.StopRequest(
+            "handoff", 300, "lifecycle-start", 200, "server-start"
+        )
+        sdk = FakeSDK("#8B0000")
+        control = FakeControl(None, request)
+        writer = runtime.TetrisWriter(
+            sdk, health, FakeEffects(), control, "horde-red"
+        )
+
+        writer.run()
+
+        self.assertEqual(sdk.writes, [])
+        self.assertEqual(control.states, ["stopped"])
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_persistent_missing_lifecycle_without_handoff_still_fails_closed(
+        self, _preset, _preference
+    ):
+        sdk = FakeSDK("#8B0000")
+        writer = runtime.TetrisWriter(
+            sdk,
+            FakeHealth(process_failure="expected one OpenRGB lifecycle, found 0"),
+            FakeEffects(),
+            FakeControl(None),
+            "horde-red",
+        )
+
+        with self.assertRaisesRegex(runtime.SafetyStop, "found 0"):
+            writer.run()
+        self.assertEqual(sdk.writes, [])
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_unexpected_parent_death_without_handoff_still_fails_closed(
+        self, _preset, _preference
+    ):
+        writer, sdk, _control = self.writer(None)
+        writer.request_termination(signal.SIGTERM)
+
+        with self.assertRaisesRegex(runtime.SafetyStop, "not preceded"):
+            writer.run()
+        self.assertEqual(sdk.writes, [])
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_duplicate_lifecycle_and_sdk_identity_changes_still_fail_closed(
+        self, _preset, _preference
+    ):
+        for failure in (
+            "expected one OpenRGB lifecycle, found 2",
+            "OpenRGB SDK process identity changed",
+        ):
+            with self.subTest(failure=failure):
+                sdk = FakeSDK("#8B0000")
+                writer = runtime.TetrisWriter(
+                    sdk,
+                    FakeHealth(process_failure=failure),
+                    FakeEffects(),
+                    FakeControl(None),
+                    "horde-red",
+                )
+                with self.assertRaisesRegex(runtime.SafetyStop, failure):
+                    writer.run()
+                self.assertEqual(sdk.writes, [])
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_mismatched_handoff_identity_is_not_authorized(
+        self, _preset, _preference
+    ):
+        request = runtime.StopRequest(
+            "handoff", 999, "wrong", 200, "server-start"
+        )
+        sdk = FakeSDK("#8B0000")
+        writer = runtime.TetrisWriter(
+            sdk,
+            FakeHealth(),
+            FakeEffects(),
+            FakeControl(None, request),
+            "horde-red",
+        )
+
+        with self.assertRaisesRegex(runtime.SafetyStop, "does not match"):
+            writer.run()
+        self.assertEqual(sdk.writes, [])
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_stop_publication_excludes_writes_and_blocks_later_frames(
+        self, _preset, _preference
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {
+                "XDG_STATE_HOME": f"{directory}/state",
+                "XDG_RUNTIME_DIR": f"{directory}/runtime",
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                control = runtime.RuntimeControl()
+                gate_fd = os.open(
+                    control.write_lock_path, os.O_WRONLY | os.O_CREAT, 0o600
+                )
+                fcntl.flock(gate_fd, fcntl.LOCK_SH)
+                published = threading.Event()
+                request = runtime.StopRequest(
+                    "handoff", 300, "lifecycle-start", 200, "server-start"
+                )
+
+                def publish():
+                    control.publish_stop(request)
+                    published.set()
+
+                publisher = threading.Thread(target=publish)
+                publisher.start()
+                self.assertFalse(published.wait(0.05))
+                self.assertFalse(control.stop_path.exists())
+                fcntl.flock(gate_fd, fcntl.LOCK_UN)
+                os.close(gate_fd)
+                publisher.join(timeout=1)
+                self.assertTrue(published.is_set())
+
+                sdk = FakeSDK("#8B0000")
+                writer_fd = os.open(control.write_lock_path, os.O_WRONLY)
+                try:
+                    writer = runtime.TetrisWriter(
+                        sdk,
+                        FakeHealth(),
+                        FakeEffects(),
+                        control,
+                        "horde-red",
+                        writer_fd,
+                    )
+                    writer.expected = {
+                        identity: sdk.controllers[index].colors
+                        for index, identity in enumerate(core.VERIFIED_DIMMS)
+                    }
+                    wrote = writer._write(
+                        core.VERIFIED_DIMMS[0],
+                        core.generate_cycle("horde-red", 24)[0].colors,
+                    )
+                finally:
+                    os.close(writer_fd)
+
+                self.assertFalse(wrote)
+                self.assertEqual(sdk.writes, [])
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_handoff_interrupts_user_off_restoration_without_later_writes(
+        self, _preset, _preference
+    ):
+        control = FakeControl("user-off")
+        sdk = FakeSDK("#8B0000")
+        original_update = sdk.update_leds
+
+        def update_then_handoff(index, colors):
+            original_update(index, colors)
+            control.request = runtime.StopRequest(
+                "handoff", 300, "lifecycle-start", 200, "server-start"
+            )
+
+        sdk.update_leds = update_then_handoff
+        writer = runtime.TetrisWriter(
+            sdk, FakeHealth(), FakeEffects(), control, "horde-red"
+        )
+
+        writer.run()
+
+        self.assertEqual(len(sdk.writes), 1)
+        self.assertEqual(control.states[-1], "stopped")
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_parent_loss_during_restoration_stops_without_later_writes(
+        self, _preset, _preference
+    ):
+        control = FakeControl("user-off")
+        sdk = FakeSDK("#8B0000")
+        original_update = sdk.update_leds
+        writer = runtime.TetrisWriter(
+            sdk, FakeHealth(), FakeEffects(), control, "horde-red"
+        )
+
+        def update_then_lose_parent(index, colors):
+            original_update(index, colors)
+            writer.request_termination(signal.SIGTERM)
+
+        sdk.update_leds = update_then_lose_parent
+
+        with self.assertRaisesRegex(runtime.SafetyStop, "not preceded"):
+            writer.run()
+        self.assertEqual(len(sdk.writes), 1)
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
     def test_spd_failure_writes_nothing_and_does_not_restore(
         self, _preset, _preference
     ):
@@ -464,6 +680,74 @@ class RuntimeSafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(runtime.SafetyStop, "temperature"):
             writer.run()
         self.assertEqual(sdk.writes, [])
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_successor_runs_every_health_gate_before_writer_startup(
+        self, _preset, _preference
+    ):
+        events: list[str] = []
+
+        class RecordingHealth(FakeHealth):
+            def begin(inner_self):
+                events.append("kernel-baseline")
+
+            def verify_processes(inner_self):
+                events.append("sdk-listener-and-lifecycle")
+
+            def temperatures(inner_self):
+                events.append("spd")
+                return super().temperatures()
+
+            def no_new_kernel_errors(inner_self):
+                events.append("kernel-errors")
+
+        class RecordingSDK(FakeSDK):
+            def inventory(inner_self):
+                events.append("controllers")
+                return super().inventory()
+
+            def active_effects(inner_self):
+                events.append("effects")
+                return super().active_effects()
+
+            def update_leds(inner_self, index, colors):
+                events.append("write")
+                super().update_leds(index, colors)
+
+        class StopAfterStartup(FakeControl):
+            def status(inner_self, state, _message, **_extra):
+                events.append(f"status-{state}")
+                inner_self.states.append(state)
+                if state == "running":
+                    inner_self.request = runtime.StopRequest(
+                        "handoff", 300, "lifecycle-start", 200, "server-start"
+                    )
+
+        sdk = RecordingSDK("#8B0000")
+        writer = runtime.TetrisWriter(
+            sdk,
+            RecordingHealth(),
+            FakeEffects(),
+            StopAfterStartup(None),
+            "horde-red",
+        )
+
+        writer.run()
+
+        self.assertEqual(
+            events[:7],
+            [
+                "kernel-baseline",
+                "sdk-listener-and-lifecycle",
+                "spd",
+                "kernel-errors",
+                "controllers",
+                "effects",
+                "status-running",
+            ],
+        )
+        self.assertNotIn("write", events)
 
     def test_default_off_and_separate_persistence(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -528,18 +812,26 @@ class RuntimeSafetyTests(unittest.TestCase):
     def test_disable_publishes_stop_before_preference_off(self):
         calls = []
 
-        def record_stop(_control, reason):
+        def record_stop(_control, reason, *_identity):
             calls.append(("stop", reason))
 
         def record_preference(path, value):
             calls.append(("preference", path.name, value))
 
-        with (
-            mock.patch.object(runtime, "_request_stop", side_effect=record_stop),
-            mock.patch.object(runtime, "_atomic_text", side_effect=record_preference),
-            mock.patch.object(sys, "argv", ["ram-tetris", "disable"]),
-        ):
-            self.assertEqual(runtime.main(), 0)
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {
+                "XDG_STATE_HOME": f"{directory}/state",
+                "XDG_RUNTIME_DIR": f"{directory}/runtime",
+            }
+            with (
+                mock.patch.dict(os.environ, environment, clear=False),
+                mock.patch.object(runtime, "_request_stop", side_effect=record_stop),
+                mock.patch.object(
+                    runtime, "_atomic_text", side_effect=record_preference
+                ),
+                mock.patch.object(sys, "argv", ["ram-tetris", "disable"]),
+            ):
+                self.assertEqual(runtime.main(), 0)
 
         self.assertEqual(
             calls,
@@ -630,6 +922,29 @@ class RuntimeSafetyTests(unittest.TestCase):
                     check=False,
                 )
             self.assertEqual(result.returncode, 75)
+
+    def test_lifecycle_stop_cli_requires_bound_process_identities(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime_home = Path(directory, "runtime")
+            env = os.environ | {
+                "XDG_STATE_HOME": str(Path(directory, "state")),
+                "XDG_RUNTIME_DIR": str(runtime_home),
+            }
+            result = subprocess.run(
+                [ROOT / "ram-tetris", "request-stop", "handoff"],
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("requires lifecycle and server identities", result.stderr)
+            self.assertFalse(
+                runtime_home.joinpath(
+                    "omarchy-plus/openrgb-presets/ram-tetris.stop"
+                ).exists()
+            )
 
     def test_failure_latch_persists_and_toggle_cannot_clear_it(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -837,6 +1152,18 @@ class IntegrationSourceTests(unittest.TestCase):
         self.assertLess(
             cleanup.index("stop_tetris handoff"), cleanup.index("detach_server")
         )
+        stop = lifecycle.split("stop_tetris() {", 1)[1].split(
+            "reconcile_tetris() {", 1
+        )[0]
+        self.assertLess(stop.index('"${FLOCK_BIN}" "${stop_lock_fd}"'), stop.index("TETRIS_STOP_FILE"))
+        self.assertLess(stop.index("TETRIS_STOP_FILE"), stop.index("for attempt in {1..100}"))
+        for field in (
+            "lifecycle_pid",
+            "lifecycle_start",
+            "server_pid",
+            "server_start",
+        ):
+            self.assertIn(field, stop)
         self.assertIn("self.health.verify_processes()", runner)
         self.assertIn("OpenRGB SDK process identity changed", runner)
 

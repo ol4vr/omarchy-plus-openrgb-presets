@@ -18,6 +18,7 @@ readonly SLEEP_BIN="${SLEEP_BIN:-/usr/bin/sleep}"
 readonly CAT_BIN="${CAT_BIN:-/usr/bin/cat}"
 readonly FLOCK_BIN="${FLOCK_BIN:-/usr/bin/flock}"
 readonly MKDIR_BIN="${MKDIR_BIN:-/usr/bin/mkdir}"
+readonly MV_BIN="${MV_BIN:-/usr/bin/mv}"
 readonly TR_BIN="${TR_BIN:-/usr/bin/tr}"
 readonly PROC_ROOT="${PROC_ROOT:-/proc}"
 readonly SCRIPT_PATH="$(/usr/bin/readlink -f "${BASH_SOURCE[0]}")"
@@ -34,6 +35,8 @@ readonly TETRIS_PREFERENCE_FILE="${STATE_ROOT}/ram-tetris-enabled"
 readonly ACTIVE_PRESET_FILE="${STATE_ROOT}/active-preset"
 readonly TETRIS_FAILURE_FILE="${STATE_ROOT}/ram-tetris-failure.json"
 readonly TETRIS_STATUS_FILE="${RUNTIME_DIR}/ram-tetris-status.json"
+readonly TETRIS_STOP_FILE="${RUNTIME_DIR}/ram-tetris.stop"
+readonly TETRIS_WRITE_LOCK_FILE="${RUNTIME_DIR}/ram-tetris-write.lock"
 readonly USER_MANAGER_COMMAND="${USER_MANAGER_COMMAND:-/usr/lib/systemd/systemd --user}"
 readonly RESTORE_TIMEOUT="75s"
 readonly RESUME_DELAY="${OPENRGB_RESUME_DELAY:-3}"
@@ -335,11 +338,47 @@ start_tetris() {
 stop_tetris() {
   local reason="${1:-handoff}"
   local attempt
+  local lifecycle_start=''
+  local stop_lock_fd=''
+  local stop_temp=''
+  local stop_time=''
+  local old_umask=''
 
-  "${RAM_TETRIS}" request-stop "${reason}" >/dev/null 2>&1 || true
   if [[ -z "${tetris_pid}" ]]; then
     return 0
   fi
+  if ! is_tetris_process "${tetris_pid}" "${tetris_start_time}"; then
+    log "Refusing stop request for changed RAM Tetris PID ${tetris_pid}"
+    return 1
+  fi
+
+  if [[ "${reason}" == @(handoff|suspend|shutdown) ]]; then
+    lifecycle_start="$(process_start_time $$)"
+    is_server_listener "${server_pid}" "${server_start_time}" || return 1
+    old_umask="$(umask)"
+    umask 077
+    exec {stop_lock_fd}>"${TETRIS_WRITE_LOCK_FILE}"
+    umask "${old_umask}"
+    "${FLOCK_BIN}" "${stop_lock_fd}"
+    stop_temp="${TETRIS_STOP_FILE}.$$"
+    stop_time="${EPOCHREALTIME}"
+    if ! (
+      umask 077
+      /usr/bin/printf \
+        '{"lifecycle_pid":%s,"lifecycle_start":"%s","reason":"%s","server_pid":%s,"server_start":"%s","time":%s}\n' \
+        "$$" "${lifecycle_start}" "${reason}" \
+        "${server_pid}" "${server_start_time}" "${stop_time}" >"${stop_temp}"
+    ) || ! "${MV_BIN}" -f -- "${stop_temp}" "${TETRIS_STOP_FILE}"; then
+      close_fd "${stop_lock_fd}"
+      log "Failed to establish authenticated RAM Tetris ${reason} stop"
+      return 1
+    fi
+    close_fd "${stop_lock_fd}"
+  elif ! "${RAM_TETRIS}" request-stop "${reason}" >/dev/null 2>&1; then
+    log "Failed to establish RAM Tetris ${reason} stop"
+    return 1
+  fi
+
   for attempt in {1..100}; do
     if ! is_same_process "${tetris_pid}" "${tetris_start_time}"; then
       wait "${tetris_pid}" 2>/dev/null || true
@@ -707,7 +746,7 @@ check_dependencies() {
   for dependency in \
     "${OPENRGB_BIN}" "${GDBUS_BIN}" "${STDBUF_BIN}" "${INHIBIT_BIN}" \
     "${SETSID_BIN}" "${SETPRIV_BIN}" "${SS_BIN}" "${PS_BIN}" "${TIMEOUT_BIN}" \
-    "${SLEEP_BIN}" "${CAT_BIN}" "${FLOCK_BIN}" "${MKDIR_BIN}" \
+    "${SLEEP_BIN}" "${CAT_BIN}" "${FLOCK_BIN}" "${MKDIR_BIN}" "${MV_BIN}" \
     "${TR_BIN}" "${APPLY_PRESET}"; do
     if [[ ! -x "${dependency}" ]]; then
       /usr/bin/printf 'Missing executable: %s\n' "${dependency}" >&2
