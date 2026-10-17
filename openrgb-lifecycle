@@ -562,23 +562,14 @@ launch_server() {
 }
 
 start_restore() {
-  local attempt
   local lifecycle_start=''
-  local validated=false
 
   lifecycle_start="$(process_start_time $$)"
-  for attempt in {1..15}; do
-    if "${RAM_TETRIS}" validate-hardware \
-      --server-pid "${server_pid}" \
-      --server-start "${server_start_time}" \
-      --lifecycle-pid "$$" \
-      --lifecycle-start "${lifecycle_start}" >/dev/null; then
-      validated=true
-      break
-    fi
-    "${SLEEP_BIN}" 1
-  done
-  if [[ "${validated}" == false ]]; then
+  if ! "${RAM_TETRIS}" validate-hardware \
+    --server-pid "${server_pid}" \
+    --server-start "${server_start_time}" \
+    --lifecycle-pid "$$" \
+    --lifecycle-start "${lifecycle_start}" >/dev/null; then
     /usr/bin/printf '%s\n' 'Pre-restore hardware health validation failed; refusing preset write' >&2
     return 1
   fi

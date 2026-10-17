@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline validation for the v0.4.19 systemd service-state guard."""
+"""Offline validation for the v0.4.20 systemd service-state guard."""
 
 from __future__ import annotations
 

@@ -35,6 +35,8 @@ core = importlib.import_module("ram_tetris_core")
 HOST = "127.0.0.1"
 PORT = 6742
 EXPECTED_CONTROLLER_COUNT = 7
+HARDWARE_GATE_ATTEMPTS = 15
+HARDWARE_GATE_RETRY_SECONDS = 1.0
 PROTOCOL_VERSION = 4
 MAGIC = b"ORGB"
 HEADER = struct.Struct("<4sIII")
@@ -47,8 +49,15 @@ REQUEST_EFFECT_LIST = 0
 UPDATE_LEDS = 1050
 EFFECTS_PLUGIN_NAME = "OpenRGB Effects Plugin"
 SPD_ENDPOINTS = ("10-0050", "10-0051", "10-0052", "10-0053")
+# Hugin's stable bus-to-controller mapping does not establish which accepted
+# RGB controller emitted a generic I2C transport failure.  During the narrow
+# startup/resume discovery window, treat any I2C/SMBus/SPD failure as relevant
+# without attributing it specifically to DDR5.  Unrelated USB, GPU, network,
+# and filesystem errors remain outside this gate.
 RELEVANT_KERNEL_ERROR = re.compile(
-    r"spd5118|i801|smbus|i2c.*(?:error|fail|timeout)|error -[0-9]+", re.IGNORECASE
+    r"(?:spd5118|i801|smbus|i2c).*"
+    r"(?:error|fail|timed out|timeout|error -[0-9]+)",
+    re.IGNORECASE,
 )
 SERVER_ARGV = (
     "/usr/bin/openrgb",
@@ -491,11 +500,14 @@ class LinuxHealth:
     def __init__(self, server: ServerIdentity, lifecycle: LifecycleIdentity) -> None:
         self.server = server
         self.lifecycle = lifecycle
+        self.kernel_baseline = ""
         self.kernel_cursor = ""
 
     def begin(self) -> None:
         output = self._journal(["-n", "0", "--show-cursor"])
-        self.kernel_cursor = self._cursor(output)
+        cursor = self._cursor(output)
+        self.kernel_baseline = cursor
+        self.kernel_cursor = cursor
 
     @staticmethod
     def _journal(extra: Sequence[str]) -> str:
@@ -584,14 +596,27 @@ class LinuxHealth:
             values[endpoint] = value
         return values
 
-    def no_new_kernel_errors(self) -> None:
-        output = self._journal(["--after-cursor", self.kernel_cursor, "--show-cursor"])
-        self.kernel_cursor = self._cursor(output)
+    def _verify_kernel_errors_after(self, cursor: str) -> str:
+        if not cursor:
+            raise SafetyStop("kernel journal baseline is missing")
+        output = self._journal(["--after-cursor", cursor, "--show-cursor"])
+        next_cursor = self._cursor(output)
         errors = [
             line for line in output.splitlines() if RELEVANT_KERNEL_ERROR.search(line)
         ]
         if errors:
             raise SafetyStop("new relevant kernel error: " + " | ".join(errors))
+        return next_cursor
+
+    def no_new_kernel_errors(self) -> None:
+        """Check and advance the writer's incremental journal cursor."""
+
+        self.kernel_cursor = self._verify_kernel_errors_after(self.kernel_cursor)
+
+    def no_kernel_errors_since_baseline(self) -> None:
+        """Check the complete startup/resume window without moving its baseline."""
+
+        self._verify_kernel_errors_after(self.kernel_baseline)
 
 
 class EffectsContract:
@@ -1117,29 +1142,59 @@ def _run(args: argparse.Namespace) -> int:
 
 def _hardware_health(
     args: argparse.Namespace,
+    *,
+    attempts: int = 1,
+    retry_delay: float = 0.0,
 ) -> tuple[LifecycleIdentity, ServerIdentity, Mapping[str, int], int]:
-    """Validate process, listener, controller, SPD, and kernel health read-only."""
+    """Validate one complete, bounded hardware-discovery window read-only."""
+
+    if attempts < 1 or retry_delay < 0:
+        raise ValueError("hardware health retry bounds are invalid")
 
     lifecycle = _lifecycle_identity(args.lifecycle_pid, args.lifecycle_start)
     server = ServerIdentity(args.server_pid, args.server_start)
-    sdk = OpenRGBSDK()
-    try:
-        sdk.open()
-        health = LinuxHealth(server, lifecycle)
-        health.begin()
-        health.verify_processes()
-        temperatures = health.temperatures()
-        controllers = _targets(sdk.inventory())
-        health.no_new_kernel_errors()
-    finally:
-        sdk.close()
-    return lifecycle, server, temperatures, len(controllers)
+    health = LinuxHealth(server, lifecycle)
+    health.begin()
+    last_error: SafetyStop | None = None
+
+    for attempt in range(attempts):
+        sdk = OpenRGBSDK()
+        attempt_error: SafetyStop | None = None
+        temperatures: Mapping[str, int] = {}
+        dimm_count = 0
+        try:
+            sdk.open()
+            health.verify_processes()
+            temperatures = health.temperatures()
+            dimm_count = len(_targets(sdk.inventory()))
+        except SafetyStop as error:
+            attempt_error = error
+        finally:
+            sdk.close()
+
+        # Always check from the original pre-discovery cursor.  A clean later
+        # inventory must never erase an error emitted by an earlier attempt.
+        health.no_kernel_errors_since_baseline()
+        if attempt_error is None:
+            return lifecycle, server, temperatures, dimm_count
+
+        last_error = attempt_error
+        if attempt + 1 < attempts:
+            time.sleep(retry_delay)
+
+    if last_error is None:  # pragma: no cover - guarded by attempts >= 1
+        raise SafetyStop("hardware health validation did not run")
+    raise last_error
 
 
 def _validate_hardware(args: argparse.Namespace) -> int:
     """Run the pre-restore hardware gate without performing an RGB write."""
 
-    lifecycle, server, temperatures, dimm_count = _hardware_health(args)
+    lifecycle, server, temperatures, dimm_count = _hardware_health(
+        args,
+        attempts=HARDWARE_GATE_ATTEMPTS,
+        retry_delay=HARDWARE_GATE_RETRY_SECONDS,
+    )
     print(
         json.dumps(
             {

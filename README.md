@@ -143,6 +143,15 @@ Bounded service shutdown retains the v0.4.18 authenticated writer stop and
 singleton release. A private persistent service-state guard preserves an
 existing failure latch and creates one if shutdown requires manager escalation.
 
+Version 0.4.20 makes the startup and resume kernel-journal gate cover the whole
+bounded controller-discovery window. One immutable journal cursor is captured
+before the first of at most fifteen read-only attempts. Every attempt checks
+all communication errors after that cursor, so a later seven-controller result
+cannot erase an earlier failure. Missing or incomplete journal access and any
+matching error fail closed before `apply-preset` can run. The retry count,
+delay, ownership checks, SPD5118 checks, presets, Effects profiles, colors, and
+writer behavior are unchanged.
+
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
 The experimental orange, blue, and red Sunrise gradients are therefore stored
@@ -200,13 +209,22 @@ controllers become ready. Preset changes normally take about one second rather
 than repeating the hardware scan.
 
 Before any startup or resume restoration write, `ram-tetris validate-hardware`
-independently verifies the lifecycle and SDK identities, exactly seven accepted
-controllers, all four readable SPD5118 temperatures, and no new relevant kernel
-error. The service becomes ready only after the restore succeeds and
+captures one kernel-journal baseline, then independently verifies the lifecycle
+and SDK identities, exactly seven accepted controllers, all four readable
+SPD5118 temperatures, and the complete post-baseline error window across every
+bounded discovery retry. The service becomes ready only after the restore succeeds and
 `ram-tetris validate-health` then verifies those gates again together with the
 selected preset's six-zone non-DDR Effects contract. An ON preference with a
 failure latch remains ON but starts no writer. An ON preference without a latch
 requires exactly one validated writer before readiness is published.
+
+Hugin does not currently provide a stable mapping from generic DesignWare I2C
+controller numbers to individual accepted RGB devices. The bounded gate
+therefore treats `i2c_designware` timeouts, and other I2C, I801, SMBus, or
+SPD5118 communication failures, as relevant without claiming that they are
+DDR5-specific. USB, GPU, network, storage, and other unrelated kernel errors do
+not match this policy. The retained kernel line is the evidence for later bus
+classification.
 
 `openrgb-lifecycle` monitors logind's `PrepareForSleep` signal and holds a
 standard delay inhibitor while Hugin is awake. Before suspend or hibernation it
@@ -575,6 +593,17 @@ to become the sole lifecycle owner. Remove the staged unit only after it is
 disabled and inactive, then reload the user manager. Preserve active preset,
 RAM Tetris preference, failure latch, and all Effects profiles. An ON preference
 with the historical latch remains ON with zero writers after rollback.
+
+## Roll back the 0.4.20 journal-window correction
+
+Perform the normal bounded service stop and require a `clean-stopped` boundary
+with no lifecycle or writer owner. Then redeploy exact v0.4.19 commit
+`0d34d294d092f93433d527d6a4375725b47ba57f` and start it only through the
+existing user-service procedure. Version 0.4.19 resets the kernel-journal
+baseline between discovery retries, so do not treat its startup or resume gate
+as proof that earlier retry-window communication errors were absent. Preserve
+the active preset, Tetris preference, historical failure latch, and Effects
+profiles throughout rollback.
 
 ## Remove
 

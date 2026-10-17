@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Focused offline validation for the v0.4.19 RAM Tetris integration."""
+"""Focused offline validation for the v0.4.20 RAM Tetris integration."""
 
 from __future__ import annotations
 
@@ -98,6 +98,7 @@ class FakeHealth:
         self.fail_spd = fail_spd
         self.process_failure = process_failure
         self.begun = False
+        self.window_checks = 0
         self.server = runtime.ServerIdentity(200, "server-start")
         self.lifecycle = runtime.LifecycleIdentity(300, "lifecycle-start", "boot", 0)
 
@@ -115,6 +116,33 @@ class FakeHealth:
 
     def no_new_kernel_errors(self):
         return None
+
+    def no_kernel_errors_since_baseline(self):
+        self.window_checks += 1
+
+
+class WindowHealth(FakeHealth):
+    def __init__(self, window_events: list[str | None]) -> None:
+        super().__init__()
+        self.window_events = list(window_events)
+
+    def no_kernel_errors_since_baseline(self):
+        super().no_kernel_errors_since_baseline()
+        event = self.window_events.pop(0)
+        if event is not None:
+            raise runtime.SafetyStop(f"new relevant kernel error: {event}")
+
+
+class SequencedSDK(FakeSDK):
+    def __init__(self, controller_counts: list[int]) -> None:
+        super().__init__("#8B0000")
+        self.controller_counts = list(controller_counts)
+        self.inventory_calls = 0
+
+    def inventory(self):
+        count = self.controller_counts[self.inventory_calls]
+        self.inventory_calls += 1
+        return tuple(self.controllers[:count])
 
 
 class FakeEffects:
@@ -1107,6 +1135,246 @@ class RuntimeSafetyTests(unittest.TestCase):
 
 
 class ServiceReadinessTests(unittest.TestCase):
+    @staticmethod
+    def arguments():
+        return SimpleNamespace(
+            lifecycle_pid=300,
+            lifecycle_start="lifecycle-start",
+            server_pid=200,
+            server_start="server-start",
+        )
+
+    def run_discovery_window(self, counts, events):
+        sdk = SequencedSDK(counts)
+        health = WindowHealth(events)
+        with (
+            mock.patch.object(runtime, "OpenRGBSDK", return_value=sdk),
+            mock.patch.object(
+                runtime, "_lifecycle_identity", return_value=health.lifecycle
+            ),
+            mock.patch.object(runtime, "LinuxHealth", return_value=health),
+            mock.patch.object(runtime.time, "sleep") as sleep,
+        ):
+            result = runtime._hardware_health(
+                self.arguments(), attempts=len(counts), retry_delay=1.0
+            )
+        return result, sdk, health, sleep
+
+    def test_clean_startup_with_immediate_controller_discovery(self):
+        result, sdk, health, sleep = self.run_discovery_window([7], [None])
+
+        self.assertEqual(result[3], 4)
+        self.assertTrue(health.begun)
+        self.assertEqual(health.window_checks, 1)
+        self.assertEqual(sdk.inventory_calls, 1)
+        sleep.assert_not_called()
+        self.assertEqual(sdk.writes, [])
+
+    def test_clean_startup_preserves_one_window_across_retries(self):
+        result, sdk, health, sleep = self.run_discovery_window(
+            [0, 4, 7], [None, None, None]
+        )
+
+        self.assertEqual(result[3], 4)
+        self.assertTrue(health.begun)
+        self.assertEqual(health.window_checks, 3)
+        self.assertEqual(sdk.inventory_calls, 3)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(sdk.writes, [])
+
+    def test_first_retry_error_survives_later_successful_enumeration(self):
+        sdk = SequencedSDK([0, 7])
+        health = WindowHealth(
+            [None, "i2c_designware.2: controller timed out during first retry"]
+        )
+        with (
+            mock.patch.object(runtime, "OpenRGBSDK", return_value=sdk),
+            mock.patch.object(
+                runtime, "_lifecycle_identity", return_value=health.lifecycle
+            ),
+            mock.patch.object(runtime, "LinuxHealth", return_value=health),
+            mock.patch.object(runtime.time, "sleep"),
+            self.assertRaisesRegex(runtime.SafetyStop, "first retry"),
+        ):
+            runtime._hardware_health(self.arguments(), attempts=2, retry_delay=1.0)
+
+        self.assertEqual(sdk.inventory_calls, 2)
+        self.assertEqual(health.window_checks, 2)
+        self.assertEqual(sdk.writes, [])
+
+    def test_error_between_retries_fails_closed(self):
+        sdk = SequencedSDK([0, 0, 7])
+        health = WindowHealth(
+            [None, "i2c_designware.0: controller timed out between retries", None]
+        )
+        with (
+            mock.patch.object(runtime, "OpenRGBSDK", return_value=sdk),
+            mock.patch.object(
+                runtime, "_lifecycle_identity", return_value=health.lifecycle
+            ),
+            mock.patch.object(runtime, "LinuxHealth", return_value=health),
+            mock.patch.object(runtime.time, "sleep"),
+            self.assertRaisesRegex(runtime.SafetyStop, "between retries"),
+        ):
+            runtime._hardware_health(self.arguments(), attempts=3, retry_delay=1.0)
+
+        self.assertEqual(sdk.inventory_calls, 2)
+        self.assertEqual(health.window_checks, 2)
+        self.assertEqual(sdk.writes, [])
+
+    def test_error_on_final_successful_retry_fails_closed(self):
+        sdk = SequencedSDK([0, 4, 7])
+        health = WindowHealth(
+            [None, None, "i2c_designware.2: controller timed out on final retry"]
+        )
+        with (
+            mock.patch.object(runtime, "OpenRGBSDK", return_value=sdk),
+            mock.patch.object(
+                runtime, "_lifecycle_identity", return_value=health.lifecycle
+            ),
+            mock.patch.object(runtime, "LinuxHealth", return_value=health),
+            mock.patch.object(runtime.time, "sleep"),
+            self.assertRaisesRegex(runtime.SafetyStop, "final retry"),
+        ):
+            runtime._hardware_health(self.arguments(), attempts=3, retry_delay=1.0)
+
+        self.assertEqual(sdk.inventory_calls, 3)
+        self.assertEqual(health.window_checks, 3)
+        self.assertEqual(sdk.writes, [])
+
+    def test_complete_window_always_uses_original_journal_cursor(self):
+        health = runtime.LinuxHealth(
+            runtime.ServerIdentity(200, "server-start"),
+            runtime.LifecycleIdentity(300, "lifecycle-start", "boot", 0),
+        )
+        with mock.patch.object(
+            health,
+            "_journal",
+            side_effect=(
+                "-- cursor: baseline\n",
+                "-- cursor: after-first\n",
+                "-- cursor: after-second\n",
+            ),
+        ) as journal:
+            health.begin()
+            health.no_kernel_errors_since_baseline()
+            health.no_kernel_errors_since_baseline()
+
+        self.assertEqual(health.kernel_baseline, "baseline")
+        self.assertEqual(health.kernel_cursor, "baseline")
+        self.assertEqual(
+            journal.call_args_list[1:],
+            [
+                mock.call(["--after-cursor", "baseline", "--show-cursor"]),
+                mock.call(["--after-cursor", "baseline", "--show-cursor"]),
+            ],
+        )
+
+    def test_missing_or_incomplete_journal_access_fails_closed(self):
+        health = runtime.LinuxHealth(
+            runtime.ServerIdentity(200, "server-start"),
+            runtime.LifecycleIdentity(300, "lifecycle-start", "boot", 0),
+        )
+        with (
+            mock.patch.object(
+                runtime.subprocess,
+                "run",
+                side_effect=subprocess.CalledProcessError(1, ["journalctl"]),
+            ),
+            mock.patch.object(runtime, "LinuxHealth", return_value=health),
+            mock.patch.object(
+                runtime, "_lifecycle_identity", return_value=health.lifecycle
+            ),
+            mock.patch.object(runtime, "OpenRGBSDK") as sdk_factory,
+            self.assertRaisesRegex(
+                runtime.SafetyStop, "current-boot kernel journal is unreadable"
+            ),
+        ):
+            runtime._hardware_health(self.arguments(), attempts=3, retry_delay=1.0)
+        sdk_factory.assert_not_called()
+
+        incomplete_health = runtime.LinuxHealth(
+            runtime.ServerIdentity(200, "server-start"),
+            runtime.LifecycleIdentity(300, "lifecycle-start", "boot", 0),
+        )
+        with (
+            mock.patch.object(
+                incomplete_health,
+                "_journal",
+                return_value="journal output without a cursor\n",
+            ),
+            mock.patch.object(runtime, "LinuxHealth", return_value=incomplete_health),
+            mock.patch.object(
+                runtime,
+                "_lifecycle_identity",
+                return_value=incomplete_health.lifecycle,
+            ),
+            mock.patch.object(runtime, "OpenRGBSDK") as sdk_factory,
+            self.assertRaisesRegex(runtime.SafetyStop, "did not return a cursor"),
+        ):
+            runtime._hardware_health(self.arguments(), attempts=3, retry_delay=1.0)
+        sdk_factory.assert_not_called()
+
+    def test_kernel_error_policy_includes_designware_without_unrelated_failures(self):
+        relevant = (
+            "i2c_designware i2c_designware.2: controller timed out",
+            "i801_smbus 0000:00:1f.4: transaction failed",
+            "spd5118 10-0050: probe error -6",
+        )
+        unrelated = (
+            "NVRM: GPU error during modeset",
+            "usb 1-2: device descriptor read failed",
+            "EXT4-fs error: unrelated storage failure",
+        )
+
+        self.assertTrue(
+            all(runtime.RELEVANT_KERNEL_ERROR.search(line) for line in relevant)
+        )
+        self.assertTrue(
+            all(not runtime.RELEVANT_KERNEL_ERROR.search(line) for line in unrelated)
+        )
+
+    def test_startup_and_resume_refuse_restore_after_failed_gate(self):
+        lifecycle = ROOT / "openrgb-lifecycle"
+        for phase, invocation in (
+            ("startup", "start_restore"),
+            (
+                "resume",
+                (
+                    "suspended=true; start_inhibitor() { :; }; "
+                    "start_server() { start_restore; }; handle_sleep_signal false"
+                ),
+            ),
+        ):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                marker = Path(directory, "rgb-write")
+                apply = Path(directory, "apply-preset")
+                apply.write_text(
+                    f"#!/usr/bin/bash\nprintf '%s\\n' write >{marker!s}\n",
+                    encoding="utf-8",
+                )
+                apply.chmod(0o700)
+                script = (
+                    f"source {lifecycle!s}; "
+                    "process_start_time() { printf '%s' lifecycle-start; }; "
+                    "server_pid=200; server_start_time=server-start; "
+                    f"if {invocation}; then exit 99; fi"
+                )
+                result = subprocess.run(
+                    ["/usr/bin/bash", "-c", script],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=os.environ
+                    | {
+                        "APPLY_PRESET": str(apply),
+                        "OPENRGB_RESUME_DELAY": "0",
+                        "RAM_TETRIS": "/usr/bin/false",
+                    },
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(marker.exists())
+
     def test_pre_restore_hardware_gate_covers_spd_without_writes(self):
         sdk = FakeSDK("#8B0000")
         health = FakeHealth()
@@ -1148,6 +1416,7 @@ class ServiceReadinessTests(unittest.TestCase):
                 runtime, "_lifecycle_identity", return_value=health.lifecycle
             ),
             mock.patch.object(runtime, "LinuxHealth", return_value=health),
+            mock.patch.object(runtime.time, "sleep"),
             self.assertRaisesRegex(runtime.SafetyStop, "temperature"),
         ):
             runtime._validate_hardware(arguments)
@@ -1280,7 +1549,9 @@ class IntegrationSourceTests(unittest.TestCase):
         self.assertIn('"${SETPRIV_BIN}" --pdeathsig TERM', restore)
         self.assertIn("--server-start", restore)
         self.assertIn("--lifecycle-start", restore)
-        self.assertIn("for attempt in {1..15}", restore)
+        self.assertNotIn("for attempt in {1..15}", restore)
+        self.assertIn("HARDWARE_GATE_ATTEMPTS = 15", runner)
+        self.assertIn("no_kernel_errors_since_baseline", runner)
         self.assertIn("refusing preset write", restore)
         reconcile = lifecycle.split("reconcile_tetris() {", 1)[1].split(
             "expected_server_command() {", 1
