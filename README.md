@@ -152,6 +152,16 @@ matching error fail closed before `apply-preset` can run. The retry count,
 delay, ownership checks, SPD5118 checks, presets, Effects profiles, colors, and
 writer behavior are unchanged.
 
+Version 0.4.21 bounds deliberate service shutdown inside systemd's existing
+20-second stop budget. One 15-second lifecycle deadline now covers the
+authenticated writer stop, SDK termination, inhibitor release, and logind
+monitor cleanup. Child reaping occurs only after the tracked PID/start-token
+identity has exited or become a zombie; a live child can no longer enter an
+unbounded shell `wait`. The SDK still receives TERM first and SIGKILL only
+after its listener identity is revalidated. A surviving or transferred SDK
+listener, exhausted deadline, or incomplete writer stop remains fail closed
+and leaves the service boundary incomplete for the existing guard to latch.
+
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
 The experimental orange, blue, and red Sunrise gradients are therefore stored
@@ -282,10 +292,13 @@ writer and its singleton lock, stops the exact SDK listener, and releases the
 inhibitor and monitor before recording `clean-stopped`. `ExitType=cgroup`,
 `KillMode=mixed`, and parent-death signals keep every launched child within the
 service-manager boundary. `TimeoutStopSec=20` is the outer bound. If cleanup
-does not finish, `ExecStopPost` records a persistent failure latch before a
-later start can create a writer. A manager-mediated `SIGUSR1` is reserved for
-an owner-authorized replacement handoff; it uses the same authenticated writer
-stop but may retain an adopted SDK whose identity remains valid.
+does not finish inside the lifecycle's 15-second internal deadline, the main
+process exits failed and `KillMode=mixed` gives the manager five seconds to
+kill any remaining cgroup process before its outer deadline. `ExecStopPost`
+records a persistent failure latch before a later start can create a writer. A
+manager-mediated `SIGUSR1` is reserved for an owner-authorized replacement
+handoff; it uses the same authenticated writer stop but may retain an adopted
+SDK whose identity remains valid.
 
 The persistent owner record includes the kernel boot ID, lifecycle PID, and
 `/proc` start token. An incomplete stop, power loss, or stale record from an

@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Focused offline validation for the v0.4.20 RAM Tetris integration."""
+"""Focused offline validation for the v0.4.21 RAM Tetris integration."""
 
 from __future__ import annotations
 
@@ -1523,11 +1523,12 @@ class IntegrationSourceTests(unittest.TestCase):
             "reconcile_tetris() {", 1
         )[0]
         self.assertLess(
-            stop.index('"${FLOCK_BIN}" "${stop_lock_fd}"'),
+            stop.index('"${FLOCK_BIN}" --wait "${lock_wait}" "${stop_lock_fd}"'),
             stop.index("TETRIS_STOP_FILE"),
         )
         self.assertLess(
-            stop.index("TETRIS_STOP_FILE"), stop.index("for attempt in {1..100}")
+            stop.index("TETRIS_STOP_FILE"),
+            stop.index('wait_for_process_exit "${tetris_pid}"'),
         )
         for field in (
             "lifecycle_pid",

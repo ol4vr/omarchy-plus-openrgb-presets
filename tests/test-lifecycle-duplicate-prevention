@@ -10,6 +10,7 @@ readonly PROC_FIXTURE="${TEST_ROOT}/proc"
 readonly BIN_DIR="${TEST_ROOT}/bin"
 readonly LISTENER_STATE="${TEST_ROOT}/listener"
 readonly SIGNAL_LOG="${TEST_ROOT}/signals"
+readonly UNSAFE_WAIT_LOG="${TEST_ROOT}/unsafe-waits"
 
 test_cleanup() {
   /usr/bin/rm -rf -- "${TEST_ROOT}"
@@ -19,6 +20,7 @@ trap test_cleanup EXIT
 /usr/bin/mkdir -p "${PROC_FIXTURE}" "${BIN_DIR}" "${TEST_ROOT}/runtime"
 : >"${LISTENER_STATE}"
 : >"${SIGNAL_LOG}"
+: >"${UNSAFE_WAIT_LOG}"
 
 for command in openrgb apply-preset timeout; do
   /usr/bin/install -m 0755 /dev/null "${BIN_DIR}/${command}"
@@ -48,6 +50,7 @@ launch_count=0
 restore_count=0
 next_pid=5000
 next_start=9000
+signal_behavior=immediate
 
 write_server_process() {
   local pid="${1}"
@@ -89,7 +92,49 @@ kill() {
   fi
   [[ "${operation}" == @(-TERM|-KILL) && "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
   /usr/bin/printf '%s %s\n' "${operation}" "${pid}" >>"${SIGNAL_LOG}"
-  remove_server_process "${pid}"
+  case "${signal_behavior}" in
+    immediate)
+      remove_server_process "${pid}"
+      ;;
+    slow-term)
+      if [[ "${operation}" == -TERM ]]; then
+        (
+          /usr/bin/sleep 0.15
+          remove_server_process "${pid}"
+        ) &
+      else
+        remove_server_process "${pid}"
+      fi
+      ;;
+    ignore-term)
+      if [[ "${operation}" == -KILL ]]; then
+        remove_server_process "${pid}"
+      fi
+      ;;
+    stubborn)
+      ;;
+    lingering-listener)
+      if [[ "${operation}" == -TERM ]]; then
+        remove_server_process "${pid}"
+        write_server_process 4999 8999
+        set_listener 4999
+      fi
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+wait() {
+  local pid="${1:-}"
+  if [[ "${pid}" =~ ^[1-9][0-9]*$ ]] \
+    && [[ -r "${PROC_FIXTURE}/${pid}/stat" ]] \
+    && [[ "$(/usr/bin/awk '{print $3}' "${PROC_FIXTURE}/${pid}/stat")" != Z ]]; then
+    /usr/bin/printf '%s\n' "${pid}" >>"${UNSAFE_WAIT_LOG}"
+    return 99
+  fi
+  builtin wait "$@"
 }
 
 launch_server() {
@@ -144,9 +189,12 @@ reset_fixture() {
   /usr/bin/rm -rf -- "${PROC_FIXTURE:?}/"*
   set_listener ''
   : >"${SIGNAL_LOG}"
+  : >"${UNSAFE_WAIT_LOG}"
   reset_lifecycle_state
   launch_count=0
   restore_count=0
+  signal_behavior=immediate
+  shutdown_deadline=0
 }
 
 adopt_fixture_server() {
@@ -289,7 +337,56 @@ test_deliberate_cleanup_stops_verified_server() {
   cleanup deliberate >/dev/null
   [[ "$(<"${SIGNAL_LOG}")" == "-TERM ${owned_pid}" ]]
   [[ ! -d "${PROC_FIXTURE}/${owned_pid}" ]]
+  [[ -z "$(<"${LISTENER_STATE}")" ]]
   [[ "${server_origin}" == none ]]
+}
+
+test_slow_sdk_exit_is_reaped_within_bound() {
+  start_server >/dev/null
+  local owned_pid="${server_pid}"
+  signal_behavior=slow-term
+  stop_server 'slow SDK test' >/dev/null
+  [[ "$(<"${SIGNAL_LOG}")" == "-TERM ${owned_pid}" ]]
+  [[ ! -d "${PROC_FIXTURE}/${owned_pid}" ]]
+  [[ -z "$(<"${LISTENER_STATE}")" ]]
+}
+
+test_sdk_ignoring_term_is_killed_within_bound() {
+  start_server >/dev/null
+  local owned_pid="${server_pid}"
+  signal_behavior=ignore-term
+  stop_server 'ignored TERM test' >/dev/null
+  [[ "$(<"${SIGNAL_LOG}")" == $'-TERM '"${owned_pid}"$'\n-KILL '"${owned_pid}" ]]
+  [[ ! -d "${PROC_FIXTURE}/${owned_pid}" ]]
+  [[ -z "$(<"${LISTENER_STATE}")" ]]
+}
+
+test_overall_deadline_fails_closed() {
+  start_server >/dev/null
+  local owned_pid="${server_pid}"
+  signal_behavior=stubborn
+  shutdown_deadline="${SECONDS}"
+  if stop_server 'deadline test' >/dev/null; then
+    return 1
+  fi
+  [[ "$(<"${SIGNAL_LOG}")" == $'-TERM '"${owned_pid}"$'\n-KILL '"${owned_pid}" ]]
+  [[ -d "${PROC_FIXTURE}/${owned_pid}" ]]
+  [[ "${server_pid}" == "${owned_pid}" ]]
+  [[ ! -s "${UNSAFE_WAIT_LOG}" ]]
+}
+
+test_lingering_sdk_listener_fails_closed() {
+  start_server >/dev/null
+  local owned_pid="${server_pid}"
+  signal_behavior=lingering-listener
+  if stop_server 'lingering listener test' >/dev/null; then
+    return 1
+  fi
+  [[ "$(<"${SIGNAL_LOG}")" == "-TERM ${owned_pid}" ]]
+  [[ ! -d "${PROC_FIXTURE}/${owned_pid}" ]]
+  [[ -d "${PROC_FIXTURE}/4999" ]]
+  [[ "$(<"${LISTENER_STATE}")" == 4999 ]]
+  [[ "${server_pid}" == "${owned_pid}" ]]
 }
 
 run_test 'adopted SDK survives ordinary lifecycle cleanup' test_adopted_server_survives_handoff
@@ -302,6 +399,10 @@ run_test 'command identity mismatch prevents signaling' test_command_mismatch_pr
 run_test 'repeated shell reloads do not launch duplicates' test_repeated_handoffs_do_not_duplicate
 run_test 'existing duplicate-server prevention remains active' test_duplicate_start_reuses_listener
 run_test 'deliberate cleanup stops only the verified SDK' test_deliberate_cleanup_stops_verified_server
+run_test 'slow SDK exit remains inside the bounded wait' test_slow_sdk_exit_is_reaped_within_bound
+run_test 'SDK ignoring TERM receives bounded SIGKILL escalation' test_sdk_ignoring_term_is_killed_within_bound
+run_test 'overall shutdown deadline fails closed without an unbounded wait' test_overall_deadline_fails_closed
+run_test 'an SDK child retaining the listener prevents clean shutdown' test_lingering_sdk_listener_fails_closed
 
-[[ "${pass_count}" -eq 10 ]]
+[[ "${pass_count}" -eq 14 ]]
 /usr/bin/printf 'SDK ownership lifecycle: PASS (%s signal-free cases)\n' "${pass_count}"

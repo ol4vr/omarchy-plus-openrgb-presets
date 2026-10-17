@@ -43,6 +43,7 @@ readonly TETRIS_WRITE_LOCK_FILE="${RUNTIME_DIR}/ram-tetris-write.lock"
 readonly USER_MANAGER_COMMAND="${USER_MANAGER_COMMAND:-/usr/lib/systemd/systemd --user}"
 readonly RESTORE_TIMEOUT="75s"
 readonly RESUME_DELAY="${OPENRGB_RESUME_DELAY:-3}"
+readonly SHUTDOWN_BUDGET_SECONDS=15
 readonly -a OPENRGB_SERVER_ARGS=(
   --noautoconnect
   --startminimized
@@ -55,6 +56,7 @@ server_pid=''
 server_start_time=''
 server_origin='none'
 restore_pid=''
+restore_start_time=''
 tetris_pid=''
 tetris_start_time=''
 inhibitor_pid=''
@@ -67,6 +69,7 @@ suspended=false
 shutting_down=false
 service_mode=false
 service_ready=false
+shutdown_deadline=0
 
 log() {
   /usr/bin/printf '%s\n' "$*"
@@ -92,6 +95,73 @@ is_same_process() {
   [[ -n "${expected_start}" ]] || return 1
   actual_start="$(process_start_time "${pid}" 2>/dev/null || true)"
   [[ -n "${actual_start}" && "${actual_start}" == "${expected_start}" ]]
+}
+
+process_state() {
+  local pid="${1:-}"
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ -r "${PROC_ROOT}/${pid}/stat" ]] || return 1
+  /usr/bin/awk '{print $3}' "${PROC_ROOT}/${pid}/stat"
+}
+
+process_has_exited() {
+  local pid="${1:-}"
+  local expected_start="${2:-}"
+  local state=''
+
+  state="$(process_state "${pid}" 2>/dev/null || true)"
+  if [[ -z "${expected_start}" ]]; then
+    [[ -z "${state}" || "${state}" == Z ]]
+    return
+  fi
+  if ! is_same_process "${pid}" "${expected_start}"; then
+    return 0
+  fi
+  [[ -z "${state}" || "${state}" == Z ]]
+}
+
+begin_shutdown_deadline() {
+  if ((shutdown_deadline == 0)); then
+    shutdown_deadline=$((SECONDS + SHUTDOWN_BUDGET_SECONDS))
+  fi
+}
+
+shutdown_time_available() {
+  ((shutdown_deadline == 0 || SECONDS < shutdown_deadline))
+}
+
+shutdown_seconds_remaining() {
+  local remaining=0
+
+  if ((shutdown_deadline == 0)); then
+    /usr/bin/printf '%s' "${SHUTDOWN_BUDGET_SECONDS}"
+    return 0
+  fi
+  remaining=$((shutdown_deadline - SECONDS))
+  ((remaining > 0)) || return 1
+  /usr/bin/printf '%s' "${remaining}"
+}
+
+wait_for_process_exit() {
+  local pid="${1:-}"
+  local expected_start="${2:-}"
+  local attempts="${3:-1}"
+  local delay="${4:-0.1}"
+  local attempt
+
+  for ((attempt = 0; attempt < attempts; attempt++)); do
+    if process_has_exited "${pid}" "${expected_start}"; then
+      wait "${pid}" 2>/dev/null || true
+      return 0
+    fi
+    shutdown_time_available || return 1
+    "${SLEEP_BIN}" "${delay}"
+  done
+  if process_has_exited "${pid}" "${expected_start}"; then
+    wait "${pid}" 2>/dev/null || true
+    return 0
+  fi
+  return 1
 }
 
 process_command() {
@@ -285,33 +355,43 @@ acquire_lifecycle_lock() {
 
 stop_process() {
   local pid="${1:-}"
-  local name="${2}"
-  local attempt
+  local start_time="${2:-}"
+  local name="${3}"
 
-  if ! is_running "${pid}"; then
+  if process_has_exited "${pid}" "${start_time}"; then
+    wait "${pid}" 2>/dev/null || true
     return 0
+  fi
+  if ! is_same_process "${pid}" "${start_time}"; then
+    log "Refusing to signal changed ${name} PID ${pid}"
+    return 1
   fi
 
   kill -TERM "${pid}" 2>/dev/null || true
-  for attempt in {1..20}; do
-    if ! is_running "${pid}"; then
-      wait "${pid}" 2>/dev/null || true
-      log "${name} stopped"
-      return 0
-    fi
-    "${SLEEP_BIN}" 0.1
-  done
+  if wait_for_process_exit "${pid}" "${start_time}" 20 0.1; then
+    log "${name} stopped"
+    return 0
+  fi
 
+  is_same_process "${pid}" "${start_time}" || return 0
   kill -KILL "${pid}" 2>/dev/null || true
-  wait "${pid}" 2>/dev/null || true
-  log "${name} required SIGKILL"
+  if wait_for_process_exit "${pid}" "${start_time}" 20 0.1; then
+    log "${name} required SIGKILL"
+    return 0
+  fi
+  log "${name} did not exit before the lifecycle shutdown deadline"
+  return 1
 }
 
 stop_restore() {
-  if is_running "${restore_pid}"; then
-    stop_process "${restore_pid}" "Preset restore"
+  if [[ -n "${restore_pid}" ]] \
+    && ! process_has_exited "${restore_pid}" "${restore_start_time}"; then
+    stop_process "${restore_pid}" "${restore_start_time}" "Preset restore" || return 1
+  elif [[ -n "${restore_pid}" ]]; then
+    wait "${restore_pid}" 2>/dev/null || true
   fi
   restore_pid=''
+  restore_start_time=''
 }
 
 is_tetris_process() {
@@ -384,19 +464,23 @@ start_tetris() {
     fi
     "${SLEEP_BIN}" 0.05
   done
-  wait "${tetris_pid}" 2>/dev/null || true
+  if process_has_exited "${tetris_pid}" "${tetris_start_time}"; then
+    wait "${tetris_pid}" 2>/dev/null || true
+  else
+    log "Refusing to wait without a verified RAM Tetris child identity"
+  fi
   clear_tetris_identity
   return 1
 }
 
 stop_tetris() {
   local reason="${1:-handoff}"
-  local attempt
   local lifecycle_start=''
   local stop_lock_fd=''
   local stop_temp=''
   local stop_time=''
   local old_umask=''
+  local lock_wait=''
 
   if [[ -z "${tetris_pid}" ]]; then
     return 0
@@ -413,7 +497,20 @@ stop_tetris() {
     umask 077
     exec {stop_lock_fd}>"${TETRIS_WRITE_LOCK_FILE}"
     umask "${old_umask}"
-    "${FLOCK_BIN}" "${stop_lock_fd}"
+    lock_wait="$(shutdown_seconds_remaining 2>/dev/null || true)"
+    if [[ -z "${lock_wait}" ]]; then
+      close_fd "${stop_lock_fd}"
+      log "Lifecycle shutdown deadline expired before the RAM Tetris write gate was acquired"
+      return 1
+    fi
+    if ((lock_wait > 2)); then
+      lock_wait=2
+    fi
+    if ! "${FLOCK_BIN}" --wait "${lock_wait}" "${stop_lock_fd}"; then
+      close_fd "${stop_lock_fd}"
+      log "Timed out acquiring the RAM Tetris write gate for ${reason}"
+      return 1
+    fi
     stop_temp="${TETRIS_STOP_FILE}.$$"
     stop_time="${EPOCHREALTIME}"
     if ! (
@@ -433,17 +530,16 @@ stop_tetris() {
     return 1
   fi
 
-  for attempt in {1..100}; do
-    if ! is_same_process "${tetris_pid}" "${tetris_start_time}"; then
-      wait "${tetris_pid}" 2>/dev/null || true
-      clear_tetris_identity
-      return 0
-    fi
-    "${SLEEP_BIN}" 0.05
-  done
+  if wait_for_process_exit "${tetris_pid}" "${tetris_start_time}" 100 0.05; then
+    clear_tetris_identity
+    return 0
+  fi
   if is_tetris_process "${tetris_pid}" "${tetris_start_time}"; then
     kill -TERM "${tetris_pid}" 2>/dev/null || true
-    wait "${tetris_pid}" 2>/dev/null || true
+    if ! wait_for_process_exit "${tetris_pid}" "${tetris_start_time}" 20 0.1; then
+      log "RAM Tetris did not exit before the lifecycle shutdown deadline"
+      return 1
+    fi
   else
     log "Refusing to signal changed RAM Tetris PID ${tetris_pid}"
     return 1
@@ -580,6 +676,7 @@ start_restore() {
       "${APPLY_PRESET}" --restore
   ) &
   restore_pid=$!
+  restore_start_time="$(process_start_time "${restore_pid}" 2>/dev/null || true)"
 }
 
 start_server() {
@@ -618,9 +715,9 @@ detach_server() {
 
 stop_server() {
   local reason="${1:-deliberate shutdown}"
-  local attempt
+  local listener_owner=''
 
-  stop_restore
+  stop_restore || return 1
   if [[ -z "${server_pid}" ]]; then
     clear_server_identity
     return 0
@@ -637,22 +734,31 @@ stop_server() {
   fi
 
   kill -TERM "${server_pid}" 2>/dev/null || true
-  for attempt in {1..20}; do
-    if ! is_same_process "${server_pid}" "${server_start_time}"; then
-      wait "${server_pid}" 2>/dev/null || true
-      log "OpenRGB server stopped for ${reason}"
-      clear_server_identity
-      return 0
+  if wait_for_process_exit "${server_pid}" "${server_start_time}" 20 0.1; then
+    listener_owner="$(listener_owner_pid 2>/dev/null || true)"
+    if [[ -n "${listener_owner}" ]]; then
+      log "OpenRGB SDK PID ${server_pid} exited but listener 127.0.0.1:6742 remained owned by PID ${listener_owner}"
+      return 1
     fi
-    "${SLEEP_BIN}" 0.1
-  done
+    log "OpenRGB server stopped for ${reason}"
+    clear_server_identity
+    return 0
+  fi
 
   if ! is_server_listener "${server_pid}" "${server_start_time}"; then
     log "Refusing to escalate OpenRGB PID ${server_pid} for ${reason}: listener ownership changed"
     return 1
   fi
   kill -KILL "${server_pid}" 2>/dev/null || true
-  wait "${server_pid}" 2>/dev/null || true
+  if ! wait_for_process_exit "${server_pid}" "${server_start_time}" 20 0.1; then
+    log "OpenRGB server did not exit before the lifecycle shutdown deadline"
+    return 1
+  fi
+  listener_owner="$(listener_owner_pid 2>/dev/null || true)"
+  if [[ -n "${listener_owner}" ]]; then
+    log "OpenRGB SDK PID ${server_pid} exited after SIGKILL but listener 127.0.0.1:6742 remained owned by PID ${listener_owner}"
+    return 1
+  fi
   log "OpenRGB server required SIGKILL for ${reason}"
   clear_server_identity
 }
@@ -690,7 +796,7 @@ start_inhibitor() {
   done
 
   if is_same_process "${inhibitor_pid}" "${inhibitor_start_time}"; then
-    stop_process "${inhibitor_pid}" "Unrecognized inhibitor"
+    stop_process "${inhibitor_pid}" "${inhibitor_start_time}" "Unrecognized inhibitor"
   else
     wait "${inhibitor_pid}" 2>/dev/null || true
   fi
@@ -712,7 +818,15 @@ release_inhibitor() {
 
   if is_owned_current_inhibitor "${inhibitor_pid}" "${inhibitor_start_time}"; then
     kill -TERM -- "-${inhibitor_pid}" 2>/dev/null || true
-    wait "${inhibitor_pid}" 2>/dev/null || true
+    if ! wait_for_process_exit "${inhibitor_pid}" "${inhibitor_start_time}" 20 0.1; then
+      if is_owned_current_inhibitor "${inhibitor_pid}" "${inhibitor_start_time}"; then
+        kill -KILL -- "-${inhibitor_pid}" 2>/dev/null || true
+      fi
+      if ! wait_for_process_exit "${inhibitor_pid}" "${inhibitor_start_time}" 20 0.1; then
+        log "Sleep delay inhibitor did not exit before the lifecycle shutdown deadline"
+        return 1
+      fi
+    fi
   else
     log "Refusing to signal changed inhibitor PID ${inhibitor_pid}"
   fi
@@ -738,7 +852,7 @@ start_monitor() {
 
 stop_monitor() {
   if is_same_process "${monitor_pid}" "${monitor_start_time}"; then
-    stop_process "${monitor_pid}" "logind sleep monitor"
+    stop_process "${monitor_pid}" "${monitor_start_time}" "logind sleep monitor" || return 1
   fi
   monitor_pid=''
   monitor_start_time=''
@@ -814,6 +928,7 @@ cleanup() {
     return 0
   fi
   shutting_down=true
+  begin_shutdown_deadline
   if [[ "${mode}" == deliberate ]]; then
     tetris_reason='shutdown'
   fi
@@ -970,6 +1085,7 @@ main() {
     if [[ -n "${restore_pid}" ]] && ! is_running "${restore_pid}"; then
       if wait "${restore_pid}"; then
         restore_pid=''
+        restore_start_time=''
         if ! reconcile_tetris; then
           /usr/bin/printf '%s\n' 'RAM Tetris reconciliation failed during lifecycle startup' >&2
           return 1
@@ -985,6 +1101,7 @@ main() {
         fi
       fi
       restore_pid=''
+      restore_start_time=''
     fi
 
     if [[ "${suspended}" == false ]]; then

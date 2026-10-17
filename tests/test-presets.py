@@ -326,7 +326,7 @@ class PresetTests(unittest.TestCase):
 
     def test_manifest_and_panel_order(self) -> None:
         manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.4.20")
+        self.assertEqual(manifest["version"], "0.4.21")
         self.assertEqual(manifest["kinds"], ["bar-widget"])
         self.assertNotIn("service", manifest["entryPoints"])
         self.assertFalse((ROOT / "Service.qml").exists())
@@ -342,6 +342,11 @@ class PresetTests(unittest.TestCase):
         self.assertIn("PartOf=graphical-session.target", unit)
         self.assertIn("ExecStopPost=", unit)
         self.assertNotIn("NotifyAccess=main", unit)
+
+        lifecycle = (ROOT / "openrgb-lifecycle").read_text()
+        self.assertIn("readonly SHUTDOWN_BUDGET_SECONDS=15", lifecycle)
+        self.assertIn("begin_shutdown_deadline", lifecycle)
+        self.assertIn("wait_for_process_exit", lifecycle)
 
         panel = PANEL.read_text(encoding="utf-8")
         library = panel.split("readonly property var presets: [", 1)[1].split(
