@@ -16,6 +16,8 @@ Panel {
     + "/.config/omarchy/plugins/io.github.ol4vr.openrgb-presets/apply-preset"
   readonly property string tetrisHelperPath: Quickshell.env("HOME")
     + "/.config/omarchy/plugins/io.github.ol4vr.openrgb-presets/ram-tetris"
+  readonly property string recoveryHelperPath: Quickshell.env("HOME")
+    + "/.config/omarchy/plugins/io.github.ol4vr.openrgb-presets/lighting-recovery"
   readonly property color contentForeground: bar ? bar.foreground : Color.foreground
   readonly property string contentFontFamily: bar ? bar.fontFamily : Style.font.family
 
@@ -32,6 +34,23 @@ Panel {
   property string tetrisPendingAction: ""
   property string tetrisProcessOutput: ""
   property string tetrisProcessError: ""
+  property bool lightingFailure: false
+  property string failureScope: ""
+  property string failureCode: ""
+  property string failureDescription: ""
+  property string failureReason: ""
+  property string failureReference: ""
+  property string failureTimestamp: ""
+  property string failureSubsystem: ""
+  property string recoveryStatus: ""
+  property string recoverySummary: ""
+  property string recoveryAction: ""
+  property string recoveryToken: ""
+  property string recoveryFeedback: ""
+  property bool recoveryConfirmationPending: false
+  property bool diagnosticsExpanded: false
+  property string recoveryProcessOutput: ""
+  property string recoveryProcessError: ""
 
   readonly property var presets: [
     {
@@ -238,7 +257,8 @@ Panel {
   }
 
   function toggleRamTetris() {
-    if (tetrisActionProc.running || tetrisStatusProc.running || actionProc.running)
+    if (lightingFailure || tetrisActionProc.running || tetrisStatusProc.running
+        || recoveryProc.running || actionProc.running)
       return
     tetrisPendingAction = ramTetrisPreference ? "disable" : "enable"
     tetrisProcessOutput = ""
@@ -249,13 +269,77 @@ Panel {
   function applyTetrisStatus(output) {
     try {
       var state = JSON.parse(String(output).trim())
+      var previousReference = failureReference
       ramTetrisPreference = state.preference === true
       ramTetrisState = String(state.state || "waiting")
       ramTetrisMessage = String(state.message || "RAM Tetris status unavailable")
+      lightingFailure = state.failure === true
+      failureScope = String(state.scope || "")
+      failureCode = String(state.code || "")
+      failureDescription = String(state.description || "")
+      failureReason = String(state.message || "")
+      failureReference = String(state.incident_reference || "")
+      failureTimestamp = String(state.first_detected || "Unknown")
+      failureSubsystem = String(state.subsystem || "unknown")
+      recoveryStatus = String(state.recovery_status || "")
+      recoverySummary = String(state.recovery_summary || "")
+      if (previousReference !== "" && previousReference !== failureReference)
+        recoveryFeedback = ""
+      if (!lightingFailure) {
+        recoveryConfirmationPending = false
+        recoveryToken = ""
+      }
     } catch (error) {
       ramTetrisState = "failed"
       ramTetrisMessage = "RAM Tetris status response was invalid"
+      lightingFailure = true
+      failureScope = "lighting"
+      failureCode = "LGT-UNK-000"
+      failureDescription = "Lighting status could not be read."
+      failureReason = ramTetrisMessage
+      failureReference = "Unavailable"
+      failureTimestamp = "Unknown"
+      failureSubsystem = "unknown"
+      recoveryStatus = "manual-review"
+      recoverySummary = "Manual review is required."
     }
+  }
+
+  function beginRecovery() {
+    if (!lightingFailure || recoveryProc.running || recoveryConfirmationPending)
+      return
+    recoveryAction = "prepare"
+    recoveryFeedback = "Checking recovery safety…"
+    recoveryProcessOutput = ""
+    recoveryProcessError = ""
+    recoveryProc.running = true
+  }
+
+  function confirmRecovery() {
+    if (!recoveryConfirmationPending || recoveryToken === ""
+        || recoveryProc.running)
+      return
+    recoveryAction = "recover"
+    recoveryFeedback = "Recovering safely…"
+    recoveryProcessOutput = ""
+    recoveryProcessError = ""
+    recoveryProc.running = true
+  }
+
+  function cancelRecovery() {
+    recoveryConfirmationPending = false
+    recoveryToken = ""
+    recoveryFeedback = "Recovery confirmation cancelled."
+    confirmationTimer.stop()
+  }
+
+  function copyDiagnostics() {
+    if (!lightingFailure || recoveryProc.running) return
+    recoveryAction = "copy-diagnostics"
+    recoveryFeedback = "Copying diagnostics…"
+    recoveryProcessOutput = ""
+    recoveryProcessError = ""
+    recoveryProc.running = true
   }
 
   Component.onCompleted: {
@@ -320,7 +404,7 @@ Panel {
 
   Process {
     id: tetrisStatusProc
-    command: [root.tetrisHelperPath, "status"]
+    command: [root.recoveryHelperPath, "status"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.tetrisProcessOutput = text.trim()
@@ -336,9 +420,76 @@ Panel {
         root.ramTetrisState = "failed"
         root.ramTetrisMessage = root.tetrisProcessError !== ""
           ? root.tetrisProcessError
-          : "RAM Tetris status read failed"
+          : "Lighting status read failed"
+        root.lightingFailure = true
+        root.failureScope = "lighting"
+        root.failureCode = "LGT-UNK-000"
+        root.failureDescription = "Lighting status could not be read."
+        root.failureReason = root.ramTetrisMessage
+        root.failureReference = "Unavailable"
+        root.failureTimestamp = "Unknown"
+        root.failureSubsystem = "unknown"
+        root.recoveryStatus = "manual-review"
+        root.recoverySummary = "Manual review is required."
       }
     }
+  }
+
+  Process {
+    id: recoveryProc
+    command: root.recoveryAction === "recover"
+      ? [root.recoveryHelperPath, "recover", "--confirm", root.recoveryToken]
+      : root.recoveryAction === "copy-diagnostics"
+        ? [root.recoveryHelperPath, "copy-diagnostics"]
+        : [root.recoveryHelperPath, "prepare"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.recoveryProcessOutput = text.trim()
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.recoveryProcessError = text.trim()
+    }
+    onExited: function(exitCode) {
+      var action = root.recoveryAction
+      if (exitCode !== 0) {
+        root.recoveryConfirmationPending = false
+        root.recoveryToken = ""
+        root.recoveryFeedback = root.recoveryProcessError !== ""
+          ? root.recoveryProcessError
+          : "Recovery check failed."
+      } else {
+        try {
+          var result = JSON.parse(root.recoveryProcessOutput)
+          if (action === "prepare") {
+            root.recoveryToken = String(result.confirmation_token || "")
+            root.recoveryConfirmationPending = root.recoveryToken !== ""
+            root.recoveryFeedback = String(result.message || "Confirm recovery.")
+            if (root.recoveryConfirmationPending) confirmationTimer.restart()
+          } else if (action === "recover") {
+            root.recoveryConfirmationPending = false
+            root.recoveryToken = ""
+            root.recoveryFeedback = String(result.message || "Recovery complete.")
+            confirmationTimer.stop()
+            if (!tetrisStatusProc.running) tetrisStatusProc.running = true
+          } else {
+            root.recoveryFeedback = String(result.message || "Diagnostics copied.")
+          }
+        } catch (error) {
+          root.recoveryConfirmationPending = false
+          root.recoveryToken = ""
+          root.recoveryFeedback = "Recovery response was invalid."
+        }
+      }
+      root.recoveryAction = ""
+    }
+  }
+
+  Timer {
+    id: confirmationTimer
+    interval: 15000
+    repeat: false
+    onTriggered: root.cancelRecovery()
   }
 
   Process {
@@ -369,7 +520,8 @@ Panel {
     repeat: true
     running: root.opened
     onTriggered: {
-      if (!tetrisStatusProc.running && !tetrisActionProc.running)
+      if (!tetrisStatusProc.running && !tetrisActionProc.running
+          && !recoveryProc.running && !root.recoveryConfirmationPending)
         tetrisStatusProc.running = true
     }
   }
@@ -560,13 +712,20 @@ Panel {
 
         Rectangle {
           id: tetrisToggle
-          readonly property bool failed: root.ramTetrisState === "failed"
+          readonly property bool failed: root.lightingFailure
           readonly property color accentColor: failed
             ? "#F7768E"
             : root.ramTetrisPreference ? "#9ECE6A" : "#565F89"
+          readonly property string compactStatus: root.recoveryFeedback !== ""
+            ? root.recoveryFeedback + " · " + root.failureCode
+              + " · " + root.failureDescription
+            : root.failureScope === "lighting"
+              ? "Recovery needed · " + root.failureCode + " · " + root.failureDescription
+              : "Animation stopped · Recovery required · " + root.failureCode
+                + " · " + root.failureDescription
 
           width: parent.width
-          height: Style.space(46)
+          height: Style.space(failed ? 58 : 46)
           radius: Style.cornerRadius
           color: Qt.rgba(accentColor.r, accentColor.g, accentColor.b, 0.08)
           border.width: 1
@@ -583,35 +742,46 @@ Panel {
             font.pixelSize: Style.space(20)
           }
 
-          Text {
-            id: tetrisTitle
+          Column {
+            id: tetrisLabels
             anchors.left: tetrisIcon.right
             anchors.leftMargin: Style.space(8)
+            anchors.right: failed ? recoveryControls.left : toggleTrack.left
+            anchors.rightMargin: Style.space(10)
             anchors.verticalCenter: parent.verticalCenter
-            text: "RAM TETRIS"
-            color: root.contentForeground
-            font.family: root.contentFontFamily
-            font.pixelSize: Style.font.body
-            font.bold: true
-            font.letterSpacing: 0.9
-          }
+            spacing: Style.space(1)
 
-          Text {
-            anchors.left: tetrisTitle.right
-            anchors.leftMargin: Style.space(12)
-            anchors.right: toggleTrack.left
-            anchors.rightMargin: Style.space(12)
-            anchors.verticalCenter: parent.verticalCenter
-            text: tetrisActionProc.running ? "UPDATING…" : root.ramTetrisMessage.toUpperCase()
-            color: tetrisToggle.accentColor
-            font.family: root.contentFontFamily
-            font.pixelSize: Style.font.caption
-            font.letterSpacing: 0.6
-            elide: Text.ElideRight
+            Text {
+              width: parent.width
+              text: tetrisToggle.failed && root.failureScope === "lighting"
+                ? "Lighting animations stopped"
+                : "RAM TETRIS"
+              color: root.contentForeground
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.body
+              font.bold: true
+              font.letterSpacing: 0.9
+              elide: Text.ElideRight
+            }
+
+            Text {
+              width: parent.width
+              text: tetrisToggle.failed
+                ? tetrisToggle.compactStatus
+                : tetrisActionProc.running
+                  ? "UPDATING…"
+                  : root.ramTetrisPreference ? "Active" : "Static lighting"
+              color: tetrisToggle.accentColor
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+              font.letterSpacing: 0.5
+              elide: Text.ElideRight
+            }
           }
 
           Rectangle {
             id: toggleTrack
+            visible: !tetrisToggle.failed
             width: Style.space(44)
             height: Style.space(24)
             radius: height / 2
@@ -634,12 +804,223 @@ Panel {
             }
           }
 
+          Row {
+            id: recoveryControls
+            visible: tetrisToggle.failed
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(5)
+
+            Rectangle {
+              id: detailsButton
+              width: Style.space(28)
+              height: Style.space(28)
+              radius: Style.cornerRadius
+              color: Qt.rgba(tetrisToggle.accentColor.r, tetrisToggle.accentColor.g, tetrisToggle.accentColor.b, 0.12)
+              border.width: 1
+              border.color: Qt.rgba(tetrisToggle.accentColor.r, tetrisToggle.accentColor.g, tetrisToggle.accentColor.b, 0.40)
+
+              Text {
+                anchors.centerIn: parent
+                text: root.diagnosticsExpanded ? "󰅖" : "󰋼"
+                color: tetrisToggle.accentColor
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.body
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.diagnosticsExpanded = !root.diagnosticsExpanded
+              }
+            }
+
+            Rectangle {
+              visible: root.recoveryConfirmationPending
+              width: visible ? Style.space(28) : 0
+              height: Style.space(28)
+              radius: Style.cornerRadius
+              color: Qt.rgba(tetrisToggle.accentColor.r, tetrisToggle.accentColor.g, tetrisToggle.accentColor.b, 0.08)
+              border.width: visible ? 1 : 0
+              border.color: Qt.rgba(tetrisToggle.accentColor.r, tetrisToggle.accentColor.g, tetrisToggle.accentColor.b, 0.35)
+
+              Text {
+                anchors.centerIn: parent
+                text: "󰜺"
+                color: tetrisToggle.accentColor
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.body
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                enabled: !recoveryProc.running
+                onClicked: root.cancelRecovery()
+              }
+            }
+
+            Rectangle {
+              width: root.recoveryConfirmationPending ? Style.space(82) : Style.space(76)
+              height: Style.space(28)
+              radius: Style.cornerRadius
+              color: Qt.rgba(tetrisToggle.accentColor.r, tetrisToggle.accentColor.g, tetrisToggle.accentColor.b, 0.18)
+              border.width: 1
+              border.color: tetrisToggle.accentColor
+              opacity: recoveryProc.running ? 0.55 : 1
+
+              Row {
+                anchors.centerIn: parent
+                spacing: Style.space(4)
+
+                Text {
+                  text: "󰑐"
+                  color: tetrisToggle.accentColor
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                Text {
+                  text: recoveryProc.running
+                    ? "Checking"
+                    : root.recoveryConfirmationPending ? "Confirm" : "Recover"
+                  color: tetrisToggle.accentColor
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                }
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                enabled: !recoveryProc.running
+                onClicked: root.recoveryConfirmationPending
+                  ? root.confirmRecovery()
+                  : root.beginRecovery()
+              }
+            }
+          }
+
           MouseArea {
             anchors.fill: parent
             cursorShape: Qt.PointingHandCursor
-            enabled: !tetrisActionProc.running && !tetrisStatusProc.running
+            enabled: !tetrisToggle.failed && !tetrisActionProc.running
+              && !tetrisStatusProc.running
               && !actionProc.running && !currentProc.running
             onClicked: root.toggleRamTetris()
+          }
+        }
+
+        Rectangle {
+          id: diagnosticDetails
+          visible: root.lightingFailure && root.diagnosticsExpanded
+          width: parent.width
+          height: visible ? Style.space(188) : 0
+          radius: Style.cornerRadius
+          color: Qt.rgba(0.97, 0.46, 0.56, 0.07)
+          border.width: visible ? 1 : 0
+          border.color: Qt.rgba(0.97, 0.46, 0.56, 0.28)
+          clip: true
+
+          Column {
+            anchors.fill: parent
+            anchors.margins: Style.space(10)
+            spacing: Style.space(4)
+
+            Text {
+              width: parent.width
+              text: root.failureCode + " · " + root.failureDescription
+              color: "#F7768E"
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.body
+              font.bold: true
+              elide: Text.ElideRight
+            }
+
+            Text {
+              width: parent.width
+              text: "Incident " + root.failureReference
+                + "  ·  First detected " + root.failureTimestamp
+              color: root.contentForeground
+              opacity: 0.72
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+            }
+
+            Text {
+              width: parent.width
+              text: "Affected: " + root.failureSubsystem
+                + "  ·  Recovery: " + root.recoveryStatus
+              color: root.contentForeground
+              opacity: 0.72
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+            }
+
+            Flickable {
+              width: parent.width
+              height: Style.space(72)
+              contentWidth: width
+              contentHeight: originalReason.implicitHeight
+              boundsBehavior: Flickable.StopAtBounds
+              clip: true
+
+              Text {
+                id: originalReason
+                width: parent.width
+                text: "Original reason: " + root.failureReason
+                color: root.contentForeground
+                opacity: 0.82
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WrapAnywhere
+              }
+            }
+
+            Row {
+              width: parent.width
+              spacing: Style.space(8)
+
+              Rectangle {
+                width: copyLabel.implicitWidth + Style.space(18)
+                height: Style.space(26)
+                radius: Style.cornerRadius
+                color: Qt.rgba(0.97, 0.46, 0.56, 0.12)
+                border.width: 1
+                border.color: Qt.rgba(0.97, 0.46, 0.56, 0.36)
+
+                Text {
+                  id: copyLabel
+                  anchors.centerIn: parent
+                  text: "󰆏  Copy diagnostics"
+                  color: "#F7768E"
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                }
+
+                MouseArea {
+                  anchors.fill: parent
+                  cursorShape: Qt.PointingHandCursor
+                  enabled: !recoveryProc.running
+                  onClicked: root.copyDiagnostics()
+                }
+              }
+
+              Text {
+                width: parent.width - copyLabel.implicitWidth - Style.space(26)
+                anchors.verticalCenter: parent.verticalCenter
+                text: root.recoverySummary
+                color: "#F7768E"
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+              }
+            }
           }
         }
 

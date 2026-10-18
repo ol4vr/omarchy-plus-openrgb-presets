@@ -1,4 +1,4 @@
-"""Focused source-only validation for OpenRGB Presets 0.4.19."""
+"""Focused source-only validation for OpenRGB Presets 0.4.22."""
 
 from __future__ import annotations
 
@@ -326,7 +326,7 @@ class PresetTests(unittest.TestCase):
 
     def test_manifest_and_panel_order(self) -> None:
         manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.4.21")
+        self.assertEqual(manifest["version"], "0.4.22")
         self.assertEqual(manifest["kinds"], ["bar-widget"])
         self.assertNotIn("service", manifest["entryPoints"])
         self.assertFalse((ROOT / "Service.qml").exists())
@@ -392,6 +392,18 @@ class PresetTests(unittest.TestCase):
         self.assertIn("height: Style.space(60)", panel)
         self.assertIn("rowSpacing: Style.space(7)", panel)
         self.assertIn('text: "󰍛"', panel)
+        self.assertIn('? "Lighting animations stopped"', panel)
+        self.assertIn('"Recovery needed · " + root.failureCode', panel)
+        self.assertIn('"Animation stopped · Recovery required · "', panel)
+        self.assertIn('? "Active" : "Static lighting"', panel)
+        self.assertIn('? "Confirm" : "Recover"', panel)
+        self.assertIn('text: "󰆏  Copy diagnostics"', panel)
+        self.assertIn('text: "Original reason: " + root.failureReason', panel)
+        self.assertIn("root.diagnosticsExpanded = !root.diagnosticsExpanded", panel)
+        self.assertIn("onClicked: root.recoveryConfirmationPending", panel)
+        self.assertIn("onActivateRequested: root.applySelectedPreset()", panel)
+        self.assertNotIn("onActivateRequested: root.beginRecovery()", panel)
+        self.assertNotIn("onActivateRequested: root.confirmRecovery()", panel)
         self.assertIn("root.activePresetData.mode", panel)
         self.assertGreaterEqual(panel.count("fontSizeMode: Text.HorizontalFit"), 2)
         self.assertIn("maximumLineCount: 1", panel)

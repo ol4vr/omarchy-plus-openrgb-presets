@@ -162,6 +162,61 @@ after its listener identity is revalidated. A surviving or transferred SDK
 listener, exhausted deadline, or incomplete writer stop remains fail closed
 and leaves the service boundary incomplete for the existing guard to latch.
 
+Version 0.4.22 adds one universal Lighting Recovery interface without adding a
+generic service restart, SDK restart, preset selection, or direct RGB write. A
+persistent failure replaces the RAM Tetris toggle with a compact red Recover control. A
+Tetris-only writer failure is distinguished from a full lifecycle/SDK outage;
+controller, kernel, and unknown failures remain separate blocked classes. The
+first click runs a read-only classification and health review. The two
+historically reviewed v0.4.11/v0.4.12 false positives can advance to a timed
+explicit confirmation while the independent service, lifecycle, SDK,
+controller inventory, four SPD5118 endpoints, Effects contract, locks, and
+kernel history all pass.
+
+The extension also accepts one exact incomplete service boundary: a correlated
+current-boot `stopping/deliberate` owner record with a reviewed lifecycle
+failure reason, the exact failed unit and OpenRGB package, an active graphical
+session, the Hugin detector policy, zero owners or SDK listener, free locks,
+and clean kernel history. Confirmation preserves both original records and the
+reviewed OpenRGB configuration bytes, writes the preference OFF, invokes the
+existing boundary acknowledgment, and starts the service at most once. The
+service itself must report ready and the complete
+seven-controller, four-SPD5118, Effects, ownership, and journal gate must pass
+before the unchanged latch is cleared. Failure leaves the evidence and latch
+in place with no retry. Neither recovery path starts RAM Tetris.
+
+The failure row shows a stable error code and short description. Its expandable
+diagnostic view retains the original backend reason, incident reference,
+first-detected UTC timestamp, affected subsystem, and recovery disposition.
+Copy Diagnostics places only those concise non-sensitive fields on the
+clipboard. The original failure bytes remain the authority; display codes are
+never recovery authorization.
+
+Stable diagnostic mappings are:
+
+| Code | Condition | Subsystem | Automatic recovery |
+| --- | --- | --- | --- |
+| `LGT-LIF-001` | stale or manager-completed lifecycle boundary | lifecycle | exact boundary-gated one start |
+| `LGT-LIF-002` | unauthenticated writer termination at a lifecycle boundary | lifecycle | exact boundary-gated one start |
+| `LGT-LIF-003` | lifecycle identity, handoff, boot, or suspend continuity changed | lifecycle | blocked |
+| `LGT-SDK-001` | SDK process, listener, connection, or protocol became invalid | SDK | blocked |
+| `LGT-EFX-001` | Effects contract or profile became invalid | Effects | blocked |
+| `LGT-EFX-002` | preset application failed after Tetris quiesced | Effects | blocked |
+| `LGT-EFX-003` | saved preset restoration failed | Effects | blocked |
+| `LGT-TET-001` | unreviewed Tetris writer/control failure | Tetris | blocked |
+| `LGT-TET-002` | writer exited unexpectedly | Tetris | blocked |
+| `LGT-TET-003` | writer failed to quiesce | Tetris | blocked |
+| `LGT-TET-101` | reviewed legacy lifecycle-count false positive | Tetris | health-gated confirmation |
+| `LGT-TET-102` | reviewed legacy Spectrum Effects-name false positive | Tetris | health-gated confirmation |
+| `LGT-CTL-001` | controller inventory, mode, LED count, or write failure | controller | blocked |
+| `LGT-CTL-002` | required SPD5118 endpoint missing or unreadable | controller | blocked |
+| `LGT-KRN-001` | kernel journal or relevant I2C/SMBus/SPD error | kernel | blocked |
+| `LGT-UNK-000` | unknown or malformed failure | unknown | manual review |
+
+Exact backend messages and conservative prefixes assign these display codes.
+Only the exact two reviewed legacy messages or the exact correlated deliberate
+lifecycle boundary—not their display codes—can enter recovery.
+
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
 The experimental orange, blue, and red Sunrise gradients are therefore stored
@@ -311,21 +366,23 @@ OFF with zero writer-lock owners, then acknowledge only the service boundary:
   acknowledge-reviewed-recovery --acknowledge-reviewed-recovery
 ```
 
-That command preserves the failure latch. Clear the latch separately with the
-existing reviewed `ram-tetris clear-failure` procedure; neither action starts
-the service or performs a hardware write.
+That command preserves the failure latch. `lighting-recovery` may invoke it
+only for the exact correlated current-boot `stopping/deliberate` boundary after
+preserving both records, setting RAM Tetris OFF, and confirming that the exact
+failed unit has no owner, listener, or lock. It performs one service start and
+requires full readiness before clearing the unchanged reviewed latch. Every
+other lifecycle/SDK failure, and every hardware, controller, kernel, or unknown
+failure, remains manual-review only. The legacy `ram-tetris clear-failure`
+command always refuses; exact reasons and boundary bytes—not display codes—are
+the authority for recovery.
 
-Clearing a hardware-failure latch is deliberately absent from the panel. After
-a separately reviewed recovery establishes healthy hardware, the owner must
-first leave RAM Tetris OFF and then run:
+The original technical record remains readable without changing state:
 
 ```bash
-~/.config/omarchy/plugins/io.github.ol4vr.openrgb-presets/ram-tetris \
-  clear-failure --acknowledge-reviewed-recovery
+~/.config/omarchy/plugins/io.github.ol4vr.openrgb-presets/lighting-recovery status
+~/.config/omarchy/plugins/io.github.ol4vr.openrgb-presets/lighting-recovery \
+  copy-diagnostics --print
 ```
-
-The command refuses to run while the preference is ON or while a writer owns
-the singleton lock. A later ON request still passes every normal health gate.
 
 Legacy 0.3.x/0.4.0 inhibitors and logind monitors can be classified for
 one-time cleanup with the read-only `--classify-legacy-inhibitor` and
@@ -405,6 +462,7 @@ qmllint -I "$OMARCHY_PATH/shell" \
 /usr/bin/python3 -m py_compile \
   "$PLUGIN_DIR/ram-tetris" \
   "$PLUGIN_DIR/ram_tetris_core.py" \
+  "$PLUGIN_DIR/lighting-recovery" \
   "$PLUGIN_DIR/openrgb-service-guard"
 /usr/bin/systemd-analyze --user verify \
   "$PLUGIN_DIR/systemd/omarchy-plus-openrgb-presets.service"
@@ -414,6 +472,7 @@ qmllint -I "$OMARCHY_PATH/shell" \
 "$PLUGIN_DIR/tests/test-independent-lifecycle"
 /usr/bin/python3 "$PLUGIN_DIR/tests/test-presets.py"
 /usr/bin/python3 "$PLUGIN_DIR/tests/test-ram-tetris.py"
+/usr/bin/python3 "$PLUGIN_DIR/tests/test-lighting-recovery.py"
 /usr/bin/python3 "$PLUGIN_DIR/tests/test-service-guard.py"
 "$PLUGIN_DIR/openrgb-lifecycle" --check
 "$PLUGIN_DIR/apply-preset" --list
@@ -617,6 +676,17 @@ baseline between discovery retries, so do not treat its startup or resume gate
 as proof that earlier retry-window communication errors were absent. Preserve
 the active preset, Tetris preference, historical failure latch, and Effects
 profiles throughout rollback.
+
+## Roll back the 0.4.22 Lighting Recovery interface
+
+Redeploy exact published v0.4.21 commit
+`c9481f0780055e2045a67772467a7f0caae3ee16`. This removes only the classified
+recovery helper, expandable diagnostics, and Recover-button UI. It restores
+the historical reviewed-clear CLI behavior, so do not use that command as a
+substitute for the v0.4.22 safety protocol. Preserve the active preset,
+preference, failure latch, lifecycle service state, and any retained recovery
+evidence. Rollback does not start or stop the service, SDK, Quickshell, RAM
+Tetris, Effects, or a preset.
 
 ## Remove
 

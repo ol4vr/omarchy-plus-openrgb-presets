@@ -910,7 +910,7 @@ class RuntimeSafetyTests(unittest.TestCase):
                 subprocess.run(
                     [entrypoint, *command],
                     env=env,
-                    check=True,
+                    check=command[0] != "clear-failure",
                     capture_output=True,
                     text=True,
                 )
@@ -1065,17 +1065,20 @@ class RuntimeSafetyTests(unittest.TestCase):
                 capture_output=True,
             )
             self.assertNotEqual(missing_acknowledgement.returncode, 0)
-            subprocess.run(
+            deprecated_clear = subprocess.run(
                 [
                     ROOT / "ram-tetris",
                     "clear-failure",
                     "--acknowledge-reviewed-recovery",
                 ],
                 env=relaunched_env,
-                check=True,
+                check=False,
                 capture_output=True,
+                text=True,
             )
-            self.assertFalse(failure_path.exists())
+            self.assertNotEqual(deprecated_clear.returncode, 0)
+            self.assertIn("lighting-recovery", deprecated_clear.stderr)
+            self.assertTrue(failure_path.exists())
 
     def test_new_failure_cannot_replace_retained_latch_evidence(self):
         with tempfile.TemporaryDirectory() as directory:

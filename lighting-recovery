@@ -1,0 +1,1340 @@
+#!/usr/bin/python3
+"""Classify OpenRGB failures and perform narrowly reviewed latch recovery.
+
+The status and prepare paths are read-only. Recovery is limited to explicitly
+reviewed Tetris-only incidents or an exact stale lifecycle boundary, repeats
+every applicable health gate, preserves the original evidence bytes, and
+leaves the preference OFF. Lifecycle recovery may acknowledge the reviewed
+boundary and start the user service exactly once; no path restarts a service,
+starts a writer or effect, or selects a preset.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Final
+
+sys.dont_write_bytecode = True
+
+ROOT: Final = Path(__file__).resolve().parent
+RAM_TETRIS: Final = Path(os.environ.get("RAM_TETRIS_BIN", ROOT / "ram-tetris"))
+SERVICE_GUARD: Final = Path(
+    os.environ.get("OPENRGB_SERVICE_GUARD", ROOT / "openrgb-service-guard")
+)
+SYSTEMCTL: Final = os.environ.get("SYSTEMCTL_BIN", "/usr/bin/systemctl")
+JOURNALCTL: Final = os.environ.get("JOURNALCTL_BIN", "/usr/bin/journalctl")
+PACMAN: Final = os.environ.get("PACMAN_BIN", "/usr/bin/pacman")
+SS: Final = os.environ.get("SS_BIN", "/usr/bin/ss")
+WL_COPY: Final = os.environ.get("WL_COPY_BIN", "/usr/bin/wl-copy")
+PROC_ROOT: Final = Path(os.environ.get("PROC_ROOT", "/proc"))
+BOOT_ID_PATH: Final = Path(
+    os.environ.get("BOOT_ID_PATH", "/proc/sys/kernel/random/boot_id")
+)
+MAX_COPY_REASON: Final = 360
+SENSITIVE_VALUE: Final = re.compile(
+    r"(?i)\b(password|passwd|token|secret|api[_-]?key|authorization)"
+    r"\s*[:=]\s*[^\s,;]+"
+)
+PRIVATE_HOME_PATH: Final = re.compile(r"(?:file://)?/home/[^/\s]+(?:/[^\s,;|]+)*")
+SERVICE_NAME: Final = "omarchy-plus-openrgb-presets.service"
+GRAPHICAL_TARGET: Final = "graphical-session.target"
+EXPECTED_OPENRGB_PACKAGE: Final = "openrgb 1.0rc3-3"
+SOURCE_UNIT: Final = ROOT / "systemd" / SERVICE_NAME
+INSTALLED_UNIT: Final = (
+    Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+    / "systemd/user"
+    / SERVICE_NAME
+)
+OPENRGB_CONFIG: Final = (
+    Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+    / "OpenRGB/OpenRGB.json"
+)
+DISABLED_DETECTOR: Final = "ASUS Aura SMBus Motherboard"
+REQUIRED_DETECTOR: Final = "ASUS Aura Motherboard"
+
+LIFECYCLE_ARGV: Final = (
+    "/usr/bin/bash",
+    str(ROOT / "openrgb-lifecycle"),
+    "--service",
+)
+SERVER_ARGV: Final = (
+    "/usr/bin/openrgb",
+    "--noautoconnect",
+    "--startminimized",
+    "--server",
+    "--server-host",
+    "127.0.0.1",
+    "--server-port",
+    "6742",
+)
+INHIBITOR_ARGV: Final = (
+    "/usr/bin/systemd-inhibit",
+    "--what=sleep",
+    "--who=OpenRGB Presets",
+    "--why=Stop OpenRGB before system sleep",
+    "--mode=delay",
+    "/usr/bin/setpriv",
+    "--pdeathsig",
+    "TERM",
+    "/usr/bin/sleep",
+    "infinity",
+)
+MONITOR_ARGV: Final = (
+    "/usr/bin/gdbus",
+    "monitor",
+    "--system",
+    "--dest",
+    "org.freedesktop.login1",
+    "--object-path",
+    "/org/freedesktop/login1",
+)
+
+# These two historical failures were individually diagnosed and corrected in
+# v0.4.11 and v0.4.12.  No other display classification grants eligibility.
+ELIGIBLE_REASONS: Final = frozenset(
+    {
+        "expected one OpenRGB lifecycle, found 3",
+        "live Effects instances changed or include DDR5",
+    }
+)
+LIFECYCLE_RECOVERY_REASONS: Final = frozenset(
+    {
+        "OpenRGB lifecycle service did not complete its previous bounded shutdown",
+        "OpenRGB lifecycle service required manager escalation before clean shutdown",
+        "writer termination was not preceded by an authenticated lifecycle stop request",
+    }
+)
+
+RELEVANT_KERNEL_ERROR: Final = re.compile(
+    r"(?:spd5118|i801|smbus|i2c).*"
+    r"(?:error|fail|timed out|timeout|error -[0-9]+)",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class FailureClass:
+    code: str
+    subsystem: str
+    scope: str
+    description: str
+    reviewed_recovery: bool = False
+
+
+EXACT_FAILURES: Final = {
+    "OpenRGB lifecycle service did not complete its previous bounded shutdown": FailureClass(
+        "LGT-LIF-001",
+        "lifecycle",
+        "lighting",
+        "The lighting lifecycle did not finish its previous shutdown.",
+    ),
+    "OpenRGB lifecycle service required manager escalation before clean shutdown": FailureClass(
+        "LGT-LIF-001",
+        "lifecycle",
+        "lighting",
+        "The lighting lifecycle did not finish its previous shutdown.",
+    ),
+    "writer termination was not preceded by an authenticated lifecycle stop request": FailureClass(
+        "LGT-LIF-002",
+        "lifecycle",
+        "lighting",
+        "The lighting session ended without an authenticated writer handoff.",
+    ),
+    "expected one OpenRGB lifecycle, found 3": FailureClass(
+        "LGT-TET-101",
+        "tetris",
+        "tetris",
+        "A corrected legacy lifecycle-count check stopped RAM Tetris.",
+        True,
+    ),
+    "live Effects instances changed or include DDR5": FailureClass(
+        "LGT-TET-102",
+        "tetris",
+        "tetris",
+        "A corrected legacy Effects-name check stopped RAM Tetris.",
+        True,
+    ),
+    "RAM Tetris writer exited unexpectedly; static restoration was not attempted": FailureClass(
+        "LGT-TET-002",
+        "tetris",
+        "tetris",
+        "The RAM Tetris writer stopped unexpectedly.",
+    ),
+    "RAM Tetris did not quiesce before preset application": FailureClass(
+        "LGT-TET-003",
+        "tetris",
+        "tetris",
+        "RAM Tetris did not stop safely for a preset transition.",
+    ),
+    "Preset application failed while RAM Tetris was quiesced": FailureClass(
+        "LGT-EFX-002",
+        "effects",
+        "lighting",
+        "A lighting preset transition failed after RAM Tetris stopped.",
+    ),
+    "Saved preset restoration failed; RAM Tetris was not started": FailureClass(
+        "LGT-EFX-003",
+        "effects",
+        "lighting",
+        "The saved lighting preset could not be restored.",
+    ),
+}
+
+PREFIX_FAILURES: Final = (
+    (
+        (
+            "OpenRGB SDK",
+            "OpenRGB listener",
+            "OpenRGB closed",
+            "OpenRGB returned",
+            "process ",
+        ),
+        FailureClass(
+            "LGT-SDK-001",
+            "sdk",
+            "lighting",
+            "The OpenRGB SDK or its verified owner became unavailable.",
+        ),
+    ),
+    (
+        ("Effects ", "OpenRGB Effects Plugin", "live Effects"),
+        FailureClass(
+            "LGT-EFX-001",
+            "effects",
+            "lighting",
+            "The live Effects configuration no longer matched the reviewed preset.",
+        ),
+    ),
+    (
+        (
+            "expected seven controllers",
+            "expected one DIMM",
+            "DIMM is not",
+            "DIMM state changed",
+            "invalid OpenRGB controller count",
+            "OpenRGB UPDATELEDS failed",
+        ),
+        FailureClass(
+            "LGT-CTL-001",
+            "controller",
+            "lighting",
+            "An accepted lighting controller was missing, changed, or unreadable.",
+        ),
+    ),
+    (
+        ("10-0050", "10-0051", "10-0052", "10-0053"),
+        FailureClass(
+            "LGT-CTL-002",
+            "controller",
+            "lighting",
+            "A required SPD5118 endpoint was missing or unreadable.",
+        ),
+    ),
+    (
+        (
+            "new relevant kernel error",
+            "current-boot kernel journal",
+            "kernel journal",
+            "journalctl",
+        ),
+        FailureClass(
+            "LGT-KRN-001",
+            "kernel",
+            "lighting",
+            "Kernel communication evidence requires hardware review.",
+        ),
+    ),
+    (
+        (
+            "OpenRGB lifecycle",
+            "lifecycle ",
+            "lifecycle stop request",
+            "boot or suspend continuity",
+        ),
+        FailureClass(
+            "LGT-LIF-003",
+            "lifecycle",
+            "lighting",
+            "The verified lighting lifecycle boundary changed unexpectedly.",
+        ),
+    ),
+    (
+        (
+            "RAM Tetris",
+            "selected preset changed",
+            "unknown selected preset",
+            "invalid RGB color",
+            "unsafe runtime directory",
+            "scheduler produced",
+            "unexpected writer failure",
+        ),
+        FailureClass(
+            "LGT-TET-001",
+            "tetris",
+            "tetris",
+            "RAM Tetris stopped at a fail-closed software boundary.",
+        ),
+    ),
+)
+
+UNKNOWN_FAILURE: Final = FailureClass(
+    "LGT-UNK-000",
+    "unknown",
+    "lighting",
+    "The failure is not recognized and requires manual review.",
+)
+
+
+class RecoveryBlocked(RuntimeError):
+    """A recovery safety gate refused to continue."""
+
+
+def _private_directory(path: Path) -> None:
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    metadata = path.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_mode & 0o077
+    ):
+        raise RecoveryBlocked(f"Recovery state directory is unsafe: {path.name}")
+
+
+def state_root() -> Path:
+    return (
+        Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
+        / "omarchy-plus"
+        / "openrgb-presets"
+    )
+
+
+def runtime_root() -> Path:
+    return Path(
+        os.environ.get(
+            "OPENRGB_RUNTIME_DIR",
+            str(
+                Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+                / "omarchy-plus"
+                / "openrgb-presets"
+            ),
+        )
+    )
+
+
+def classify_reason(message: str) -> FailureClass:
+    exact = EXACT_FAILURES.get(message)
+    if exact is not None:
+        return exact
+    for prefixes, failure_class in PREFIX_FAILURES:
+        if message.startswith(prefixes):
+            return failure_class
+    return UNKNOWN_FAILURE
+
+
+def _failure_record() -> tuple[bytes, dict[str, object]]:
+    path = state_root() / "ram-tetris-failure.json"
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError as error:
+        raise RecoveryBlocked("No preserved lighting failure is present.") from error
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RecoveryBlocked(
+            "The preserved lighting failure record is unreadable."
+        ) from error
+    if not isinstance(value, dict):
+        raise RecoveryBlocked("The preserved lighting failure record is invalid.")
+    return raw, value
+
+
+def _failure_message(value: dict[str, object]) -> str:
+    message = value.get("message")
+    return (
+        message if isinstance(message, str) and message else "unreadable failure reason"
+    )
+
+
+def _incident_reference(raw: bytes) -> str:
+    return "LR-" + hashlib.sha256(raw).hexdigest()[:16].upper()
+
+
+def _timestamp(value: dict[str, object]) -> tuple[float | None, str]:
+    timestamp = value.get("time")
+    if not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool):
+        return None, "Unknown"
+    try:
+        rendered = datetime.fromtimestamp(float(timestamp), UTC).isoformat(
+            timespec="seconds"
+        )
+    except (OverflowError, OSError, ValueError):
+        return None, "Unknown"
+    return float(timestamp), rendered.replace("+00:00", "Z")
+
+
+def _preference() -> bool:
+    try:
+        return (
+            state_root()
+            .joinpath("ram-tetris-enabled")
+            .read_text(encoding="utf-8")
+            .splitlines()[0]
+            == "on"
+        )
+    except (FileNotFoundError, IndexError, OSError):
+        return False
+
+
+def _process_start(pid: int) -> str | None:
+    try:
+        fields = PROC_ROOT.joinpath(str(pid), "stat").read_text().split()
+    except OSError:
+        return None
+    return fields[21] if len(fields) > 21 else None
+
+
+def _process_argv(pid: int) -> tuple[str, ...]:
+    try:
+        raw = PROC_ROOT.joinpath(str(pid), "cmdline").read_bytes()
+    except OSError:
+        return ()
+    return tuple(
+        part.decode(errors="surrogateescape") for part in raw.split(b"\0") if part
+    )
+
+
+def _process_parent(pid: int) -> int | None:
+    try:
+        lines = PROC_ROOT.joinpath(str(pid), "status").read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        if line.startswith("PPid:"):
+            try:
+                return int(line.split()[1])
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
+def _is_descendant(pid: int, owner: int) -> bool:
+    seen: set[int] = set()
+    current = pid
+    while current > 1 and current not in seen:
+        seen.add(current)
+        parent = _process_parent(current)
+        if parent is None:
+            return False
+        if parent == owner:
+            return True
+        current = parent
+    return False
+
+
+def _matching_processes(argv: tuple[str, ...]) -> tuple[int, ...]:
+    matches: list[int] = []
+    try:
+        entries = tuple(PROC_ROOT.iterdir())
+    except OSError as error:
+        raise RecoveryBlocked("Process ownership is unreadable.") from error
+    for entry in entries:
+        if entry.name.isdigit() and _process_argv(int(entry.name)) == argv:
+            matches.append(int(entry.name))
+    return tuple(sorted(matches))
+
+
+def _service_properties(unit: str, properties: tuple[str, ...]) -> dict[str, str]:
+    command = [SYSTEMCTL, "--user", "show", unit, "--no-pager"]
+    command.extend(f"--property={name}" for name in properties)
+    result = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if result.returncode != 0:
+        raise RecoveryBlocked(f"Recovery blocked: {unit} state is unavailable.")
+    values: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        name, separator, value = line.partition("=")
+        if separator:
+            values[name] = value
+    if any(name not in values for name in properties):
+        raise RecoveryBlocked(f"Recovery blocked: {unit} state is incomplete.")
+    return values
+
+
+def _unit_is_reviewed() -> None:
+    try:
+        source = SOURCE_UNIT.read_bytes()
+        installed = INSTALLED_UNIT.read_bytes()
+        metadata = INSTALLED_UNIT.lstat()
+    except OSError as error:
+        raise RecoveryBlocked(
+            "Recovery blocked: the reviewed lighting unit is unavailable."
+        ) from error
+    if not stat.S_ISREG(metadata.st_mode) or source != installed:
+        raise RecoveryBlocked(
+            "Recovery blocked: the installed lighting unit is not the reviewed unit."
+        )
+
+
+def _detector_policy_is_reviewed() -> bytes:
+    try:
+        raw = OPENRGB_CONFIG.read_bytes()
+        value = json.loads(raw)
+        detectors = value["Detectors"]["detectors"]
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+    ) as error:
+        raise RecoveryBlocked(
+            "Recovery blocked: the OpenRGB detector policy is unreadable."
+        ) from error
+    if not isinstance(detectors, dict):
+        raise RecoveryBlocked(
+            "Recovery blocked: the OpenRGB detector policy is invalid."
+        )
+    if detectors.get(DISABLED_DETECTOR) is not False:
+        raise RecoveryBlocked(
+            "Recovery blocked: the unsafe SMBus detector is not disabled."
+        )
+    if detectors.get(REQUIRED_DETECTOR) is False:
+        raise RecoveryBlocked(
+            "Recovery blocked: the required USB motherboard detector is disabled."
+        )
+    return raw
+
+
+def _kernel_errors_since(timestamp: float) -> None:
+    journal = subprocess.run(
+        [JOURNALCTL, "-k", f"--since=@{timestamp}", "--no-pager"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if journal.returncode != 0:
+        raise RecoveryBlocked(
+            "Recovery blocked: kernel communication history is unreadable."
+        )
+    if any(RELEVANT_KERNEL_ERROR.search(line) for line in journal.stdout.splitlines()):
+        raise RecoveryBlocked(
+            "Recovery blocked: relevant kernel communication errors exist."
+        )
+
+
+def _validate_lifecycle_boundary(
+    failure: dict[str, object], message: str, state: dict[str, object]
+) -> float:
+    if message not in LIFECYCLE_RECOVERY_REASONS:
+        raise RecoveryBlocked(
+            "Recovery blocked: this failure is not a reviewed lifecycle boundary."
+        )
+    failure_time, _ = _timestamp(failure)
+    state_time = state.get("time")
+    if (
+        failure_time is None
+        or not isinstance(state_time, (int, float))
+        or isinstance(state_time, bool)
+        or failure_time < float(state_time)
+        or failure_time - float(state_time) > 120
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: lifecycle and failure evidence do not correlate."
+        )
+    if (
+        state.get("state") != "stopping"
+        or state.get("reason") != "deliberate"
+        or state.get("boot_id") != _current_boot_id()
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: the lifecycle boundary is not an exact deliberate stop."
+        )
+    lifecycle_pid, lifecycle_start = _identity(state, "lifecycle")
+    server_pid, server_start = _identity(state, "server")
+    if _process_start(lifecycle_pid) == lifecycle_start:
+        raise RecoveryBlocked(
+            "Recovery blocked: the recorded lifecycle is still active."
+        )
+    if _process_start(server_pid) == server_start:
+        raise RecoveryBlocked("Recovery blocked: the recorded SDK is still active.")
+    return failure_time
+
+
+def _verify_no_lighting_owners() -> None:
+    for argv, label in (
+        (LIFECYCLE_ARGV, "lifecycle"),
+        (SERVER_ARGV, "SDK"),
+        (INHIBITOR_ARGV, "sleep inhibitor"),
+        (MONITOR_ARGV, "sleep monitor"),
+    ):
+        if _matching_processes(argv):
+            raise RecoveryBlocked(f"Recovery blocked: a lighting {label} is active.")
+
+    for entry in PROC_ROOT.iterdir():
+        if not entry.name.isdigit():
+            continue
+        argv = _process_argv(int(entry.name))
+        if len(argv) >= 3 and Path(argv[1]) == RAM_TETRIS and argv[2] == "run":
+            raise RecoveryBlocked("Recovery blocked: a RAM Tetris writer is active.")
+
+    listener = subprocess.run(
+        [SS, "-H", "-ltnp", "sport = :6742"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if listener.returncode != 0:
+        raise RecoveryBlocked("Recovery blocked: SDK listener ownership is unreadable.")
+    if listener.stdout.strip():
+        raise RecoveryBlocked("Recovery blocked: an SDK listener is already active.")
+
+    root = runtime_root()
+    for name, label in (
+        ("lifecycle.lock", "lifecycle"),
+        ("ram-tetris.lock", "RAM Tetris writer"),
+        ("ram-tetris-write.lock", "lighting write"),
+    ):
+        if _lock_is_owned(root / name):
+            raise RecoveryBlocked(f"Recovery blocked: the {label} lock is owned.")
+
+
+def _verify_lifecycle_environment(failure_time: float) -> bytes:
+    _unit_is_reviewed()
+    package = subprocess.run(
+        [PACMAN, "-Q", "openrgb"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if package.returncode != 0 or package.stdout.strip() != EXPECTED_OPENRGB_PACKAGE:
+        raise RecoveryBlocked(
+            "Recovery blocked: the installed OpenRGB revision is not reviewed."
+        )
+
+    service = _service_properties(
+        SERVICE_NAME,
+        (
+            "LoadState",
+            "ActiveState",
+            "SubState",
+            "Result",
+            "MainPID",
+            "ControlPID",
+            "FragmentPath",
+            "UnitFileState",
+            "WantedBy",
+            "PartOf",
+            "DropInPaths",
+            "NeedDaemonReload",
+            "Type",
+            "Restart",
+            "KillMode",
+            "TimeoutStartUSec",
+            "TimeoutStopUSec",
+        ),
+    )
+    if (
+        service["LoadState"] != "loaded"
+        or service["ActiveState"] != "failed"
+        or service["SubState"] != "failed"
+        or service["Result"] != "exit-code"
+        or service["MainPID"] != "0"
+        or service["ControlPID"] != "0"
+        or service["UnitFileState"] != "enabled"
+        or GRAPHICAL_TARGET not in service["WantedBy"].split()
+        or GRAPHICAL_TARGET not in service["PartOf"].split()
+        or service["DropInPaths"]
+        or service["NeedDaemonReload"] != "no"
+        or service["Type"] != "notify"
+        or service["Restart"] != "no"
+        or service["KillMode"] != "mixed"
+        or service["TimeoutStartUSec"] != "2min"
+        or service["TimeoutStopUSec"] != "20s"
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: the lighting service boundary is not inactive and reviewed."
+        )
+    try:
+        fragment = Path(service["FragmentPath"]).resolve(strict=True)
+        installed = INSTALLED_UNIT.resolve(strict=True)
+    except OSError as error:
+        raise RecoveryBlocked(
+            "Recovery blocked: the lighting unit path is unreadable."
+        ) from error
+    if fragment != installed:
+        raise RecoveryBlocked(
+            "Recovery blocked: systemd loaded an unexpected lighting unit."
+        )
+
+    target = _service_properties(
+        GRAPHICAL_TARGET, ("LoadState", "ActiveState", "SubState")
+    )
+    if target != {
+        "LoadState": "loaded",
+        "ActiveState": "active",
+        "SubState": "active",
+    }:
+        raise RecoveryBlocked(
+            "Recovery blocked: the graphical session is not an active service owner."
+        )
+
+    _verify_no_lighting_owners()
+    config_raw = _detector_policy_is_reviewed()
+    _kernel_errors_since(failure_time)
+    return config_raw
+
+
+def _verify_lifecycle_recovery_preflight(
+    failure: dict[str, object], message: str
+) -> tuple[bytes, bytes]:
+    raw, state = _service_state_record()
+    failure_time = _validate_lifecycle_boundary(failure, message, state)
+    config_raw = _verify_lifecycle_environment(failure_time)
+    if (state_root() / "lifecycle-service-state.json").read_bytes() != raw:
+        raise RecoveryBlocked(
+            "Recovery blocked: lifecycle evidence changed during review."
+        )
+    if OPENRGB_CONFIG.read_bytes() != config_raw:
+        raise RecoveryBlocked(
+            "Recovery blocked: OpenRGB configuration changed during review."
+        )
+    return raw, config_raw
+
+
+def _service_state_record() -> tuple[bytes, dict[str, object]]:
+    path = state_root() / "lifecycle-service-state.json"
+    try:
+        raw = path.read_bytes()
+        value = json.loads(raw)
+    except (
+        FileNotFoundError,
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as error:
+        raise RecoveryBlocked(
+            "The independent lighting lifecycle state is unavailable."
+        ) from error
+    if not isinstance(value, dict):
+        raise RecoveryBlocked("The independent lighting lifecycle state is invalid.")
+    return raw, value
+
+
+def _read_service_state() -> dict[str, object]:
+    return _service_state_record()[1]
+
+
+def _identity(value: dict[str, object], prefix: str) -> tuple[int, str]:
+    pid = value.get(f"{prefix}_pid")
+    start = value.get(f"{prefix}_start")
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid <= 0
+        or not isinstance(start, str)
+        or not start
+    ):
+        raise RecoveryBlocked(f"The recorded {prefix} identity is incomplete.")
+    return pid, start
+
+
+def _current_boot_id() -> str:
+    try:
+        value = BOOT_ID_PATH.read_text(encoding="utf-8").strip()
+    except OSError as error:
+        raise RecoveryBlocked("The current boot identity is unreadable.") from error
+    if not value:
+        raise RecoveryBlocked("The current boot identity is empty.")
+    return value
+
+
+def _lock_is_owned(path: Path) -> bool:
+    try:
+        parent = path.parent.lstat()
+    except FileNotFoundError:
+        return False
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.getuid()
+        or parent.st_mode & 0o077
+    ):
+        raise RecoveryBlocked(
+            f"Recovery blocked: runtime directory is unsafe: {path.parent.name}"
+        )
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return False
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(descriptor)
+
+
+def _service_quick_health() -> bool:
+    try:
+        value = _read_service_state()
+        lifecycle_pid, lifecycle_start = _identity(value, "lifecycle")
+        server_pid, server_start = _identity(value, "server")
+        return (
+            value.get("state") == "ready"
+            and value.get("boot_id") == _current_boot_id()
+            and _process_start(lifecycle_pid) == lifecycle_start
+            and _process_argv(lifecycle_pid) == LIFECYCLE_ARGV
+            and _process_start(server_pid) == server_start
+            and _process_argv(server_pid) == SERVER_ARGV
+        )
+    except RecoveryBlocked:
+        return False
+
+
+def _lifecycle_recovery_candidate(failure: dict[str, object], message: str) -> bool:
+    try:
+        _, state = _service_state_record()
+        _validate_lifecycle_boundary(failure, message, state)
+    except RecoveryBlocked:
+        return False
+    return True
+
+
+def _run_ram_tetris_status() -> dict[str, object]:
+    try:
+        result = subprocess.run(
+            [RAM_TETRIS, "status"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {
+            "preference": _preference(),
+            "state": "failed",
+            "message": "Lighting status is unavailable",
+        }
+    if result.returncode != 0:
+        return {
+            "preference": _preference(),
+            "state": "failed",
+            "message": "Lighting status is unavailable",
+        }
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        value = {}
+    if not isinstance(value, dict):
+        value = {}
+    value.setdefault("preference", _preference())
+    value.setdefault("state", "waiting")
+    value.setdefault("message", "Lighting status is unavailable")
+    return value
+
+
+def status_document() -> dict[str, object]:
+    normal = _run_ram_tetris_status()
+    try:
+        raw, record = _failure_record()
+    except RecoveryBlocked:
+        return normal | {"failure": False}
+
+    message = _failure_message(record)
+    failure_class = classify_reason(message)
+    _, timestamp = _timestamp(record)
+    service_healthy = _service_quick_health()
+    lifecycle_candidate = _lifecycle_recovery_candidate(record, message)
+    scope = failure_class.scope
+    if scope == "tetris" and not service_healthy:
+        scope = "lighting"
+    available = (
+        failure_class.reviewed_recovery
+        and message in ELIGIBLE_REASONS
+        and service_healthy
+    ) or lifecycle_candidate
+    recovery_status = (
+        "available"
+        if available
+        else ("manual-review" if failure_class is UNKNOWN_FAILURE else "blocked")
+    )
+    recovery_summary = (
+        "Reviewed lifecycle recovery can be checked."
+        if lifecycle_candidate
+        else "Safe Tetris-only recovery can be checked."
+        if available
+        else "Manual lifecycle recovery is required."
+        if scope == "lighting"
+        else "This failure requires manual review."
+    )
+    return {
+        "failure": True,
+        "preference": normal.get("preference", _preference()),
+        "state": "failed",
+        "message": message,
+        "code": failure_class.code,
+        "description": failure_class.description,
+        "incident_reference": _incident_reference(raw),
+        "first_detected": timestamp,
+        "subsystem": failure_class.subsystem,
+        "scope": scope,
+        "recovery_status": recovery_status,
+        "recovery_summary": recovery_summary,
+        "recovery_available": available,
+    }
+
+
+def _verify_service_and_hardware(failure_time: float) -> dict[str, object]:
+    value = _read_service_state()
+    if value.get("state") != "ready":
+        raise RecoveryBlocked(
+            "Recovery blocked: the independent lifecycle is not ready."
+        )
+    if value.get("boot_id") != _current_boot_id():
+        raise RecoveryBlocked(
+            "Recovery blocked: the lifecycle belongs to a stale boot."
+        )
+
+    lifecycle_pid, lifecycle_start = _identity(value, "lifecycle")
+    server_pid, server_start = _identity(value, "server")
+    if (
+        _process_start(lifecycle_pid) != lifecycle_start
+        or _process_argv(lifecycle_pid) != LIFECYCLE_ARGV
+    ):
+        raise RecoveryBlocked("Recovery blocked: lifecycle identity is not healthy.")
+    if (
+        _process_start(server_pid) != server_start
+        or _process_argv(server_pid) != SERVER_ARGV
+    ):
+        raise RecoveryBlocked("Recovery blocked: SDK identity is not healthy.")
+
+    lifecycle_matches = tuple(
+        pid
+        for pid in _matching_processes(LIFECYCLE_ARGV)
+        if pid == lifecycle_pid or not _is_descendant(pid, lifecycle_pid)
+    )
+    if lifecycle_matches != (lifecycle_pid,):
+        raise RecoveryBlocked("Recovery blocked: lifecycle ownership is ambiguous.")
+    if _matching_processes(SERVER_ARGV) != (server_pid,):
+        raise RecoveryBlocked("Recovery blocked: SDK ownership is ambiguous.")
+
+    service = subprocess.run(
+        [
+            SYSTEMCTL,
+            "--user",
+            "is-active",
+            "--quiet",
+            "omarchy-plus-openrgb-presets.service",
+        ],
+        check=False,
+        capture_output=True,
+        timeout=5,
+    )
+    if service.returncode != 0:
+        raise RecoveryBlocked("Recovery blocked: the lighting service is unavailable.")
+
+    root = runtime_root()
+    if not _lock_is_owned(root / "lifecycle.lock"):
+        raise RecoveryBlocked(
+            "Recovery blocked: lifecycle singleton ownership is missing."
+        )
+    if _lock_is_owned(root / "ram-tetris.lock"):
+        raise RecoveryBlocked("Recovery blocked: a RAM Tetris writer owns its lock.")
+    if _lock_is_owned(root / "ram-tetris-write.lock"):
+        raise RecoveryBlocked("Recovery blocked: a lighting write is active.")
+
+    for entry in PROC_ROOT.iterdir():
+        if not entry.name.isdigit():
+            continue
+        argv = _process_argv(int(entry.name))
+        if len(argv) >= 3 and Path(argv[1]) == RAM_TETRIS and argv[2] == "run":
+            raise RecoveryBlocked("Recovery blocked: a RAM Tetris writer is active.")
+
+    health = subprocess.run(
+        [
+            RAM_TETRIS,
+            "validate-health",
+            "--server-pid",
+            str(server_pid),
+            "--server-start",
+            server_start,
+            "--lifecycle-pid",
+            str(lifecycle_pid),
+            "--lifecycle-start",
+            lifecycle_start,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if health.returncode != 0:
+        reason = health.stderr.strip() or "existing health validation failed"
+        raise RecoveryBlocked(f"Recovery blocked: {reason}")
+    try:
+        health_value = json.loads(health.stdout)
+    except json.JSONDecodeError as error:
+        raise RecoveryBlocked(
+            "Recovery blocked: health validation was unreadable."
+        ) from error
+    if health_value.get("controller_count") != 7 or health_value.get("dimm_count") != 4:
+        raise RecoveryBlocked(
+            "Recovery blocked: accepted controller inventory is incomplete."
+        )
+    temperatures = health_value.get("temperatures_mc")
+    if not isinstance(temperatures, dict) or set(temperatures) != {
+        "10-0050",
+        "10-0051",
+        "10-0052",
+        "10-0053",
+    }:
+        raise RecoveryBlocked(
+            "Recovery blocked: four SPD5118 endpoints were not verified."
+        )
+
+    _kernel_errors_since(failure_time)
+    return health_value
+
+
+def prepare_document() -> dict[str, object]:
+    raw, record = _failure_record()
+    message = _failure_message(record)
+    failure_class = classify_reason(message)
+    failure_time, _ = _timestamp(record)
+    if message in LIFECYCLE_RECOVERY_REASONS:
+        lifecycle_raw, config_raw = _verify_lifecycle_recovery_preflight(
+            record, message
+        )
+        return {
+            "state": "confirmation-required",
+            "confirmation_token": _lifecycle_confirmation_token(
+                raw, lifecycle_raw, config_raw
+            ),
+            "incident_reference": _incident_reference(raw),
+            "message": (
+                "Confirm one reviewed lifecycle start. RAM Tetris will remain OFF."
+            ),
+        }
+    if not failure_class.reviewed_recovery or message not in ELIGIBLE_REASONS:
+        raise RecoveryBlocked(
+            "Recovery blocked: this incident has no reviewed automatic recovery procedure."
+        )
+    if failure_time is None:
+        raise RecoveryBlocked("Recovery blocked: the incident timestamp is invalid.")
+    _verify_service_and_hardware(failure_time)
+    return {
+        "state": "confirmation-required",
+        "confirmation_token": hashlib.sha256(raw).hexdigest(),
+        "incident_reference": _incident_reference(raw),
+        "message": "Confirm recovery. RAM Tetris will remain OFF.",
+    }
+
+
+def _lifecycle_confirmation_token(
+    failure_raw: bytes, lifecycle_raw: bytes, config_raw: bytes
+) -> str:
+    return hashlib.sha256(
+        b"reviewed-lifecycle-boundary\0"
+        + failure_raw
+        + b"\0"
+        + lifecycle_raw
+        + b"\0"
+        + config_raw
+    ).hexdigest()
+
+
+def _atomic_text(path: Path, text: str) -> None:
+    _private_directory(path.parent)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _preserve_evidence(raw: bytes, reference: str, kind: str = "failure") -> Path:
+    evidence_root = state_root() / "recovery-evidence"
+    _private_directory(state_root())
+    _private_directory(evidence_root)
+    destination = evidence_root / f"{reference}.{kind}.json"
+    try:
+        descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        if destination.read_bytes() != raw:
+            raise RecoveryBlocked(
+                "Recovery blocked: retained evidence does not match the current record."
+            )
+        return destination
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        try:
+            destination.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    if destination.read_bytes() != raw:
+        raise RecoveryBlocked(
+            "Recovery blocked: retained evidence readback did not match."
+        )
+    _fsync_directory(evidence_root)
+    return destination
+
+
+def _recover_lifecycle(
+    raw: bytes,
+    record: dict[str, object],
+    confirmation_token: str,
+) -> dict[str, object]:
+    message = _failure_message(record)
+    lifecycle_raw, config_raw = _verify_lifecycle_recovery_preflight(record, message)
+    expected_token = _lifecycle_confirmation_token(raw, lifecycle_raw, config_raw)
+    if not confirmation_token or confirmation_token != expected_token:
+        raise RecoveryBlocked(
+            "Recovery blocked: confirmation does not match this lifecycle incident."
+        )
+
+    reference = _incident_reference(raw)
+    _preserve_evidence(raw, reference)
+    _preserve_evidence(lifecycle_raw, reference, "lifecycle-state")
+    _preserve_evidence(config_raw, reference, "openrgb-config")
+    _atomic_text(state_root() / "ram-tetris-enabled", "off\n")
+
+    failure_path = state_root() / "ram-tetris-failure.json"
+    lifecycle_path = state_root() / "lifecycle-service-state.json"
+    preference_path = state_root() / "ram-tetris-enabled"
+    if (
+        preference_path.read_bytes() != b"off\n"
+        or failure_path.read_bytes() != raw
+        or lifecycle_path.read_bytes() != lifecycle_raw
+        or OPENRGB_CONFIG.read_bytes() != config_raw
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: preserved boundary evidence changed before acknowledgment."
+        )
+
+    acknowledgement = subprocess.run(
+        [
+            SERVICE_GUARD,
+            "acknowledge-reviewed-recovery",
+            "--acknowledge-reviewed-recovery",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if acknowledgement.returncode != 0:
+        raise RecoveryBlocked(
+            "Recovery blocked: the reviewed service-boundary acknowledgment failed."
+        )
+
+    start = subprocess.run(
+        [SYSTEMCTL, "--user", "start", SERVICE_NAME],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=125,
+    )
+    if start.returncode != 0:
+        raise RecoveryBlocked(
+            "Recovery blocked: the single service start failed; manual review is required."
+        )
+
+    failure_time, _ = _timestamp(record)
+    if failure_time is None:  # preflight already rejects this; retain fail-closed form.
+        raise RecoveryBlocked("Recovery blocked: the incident timestamp is invalid.")
+    _verify_service_and_hardware(failure_time)
+    if failure_path.read_bytes() != raw:
+        raise RecoveryBlocked(
+            "Recovery blocked: the failure latch changed during service acceptance."
+        )
+    failure_path.unlink()
+    _fsync_directory(failure_path.parent)
+    return {
+        "state": "recovered",
+        "incident_reference": reference,
+        "message": "Lighting recovery complete. RAM Tetris remains OFF.",
+    }
+
+
+def recover(confirmation_token: str) -> dict[str, object]:
+    root = runtime_root()
+    _private_directory(root)
+    lock_fd = os.open(root / "lighting-recovery.lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RecoveryBlocked(
+                "Recovery blocked: another recovery is active."
+            ) from error
+
+        raw, record = _failure_record()
+        message = _failure_message(record)
+        if message in LIFECYCLE_RECOVERY_REASONS:
+            return _recover_lifecycle(raw, record, confirmation_token)
+        expected_token = hashlib.sha256(raw).hexdigest()
+        if not confirmation_token or confirmation_token != expected_token:
+            raise RecoveryBlocked(
+                "Recovery blocked: confirmation does not match this incident."
+            )
+        failure_class = classify_reason(message)
+        failure_time, _ = _timestamp(record)
+        if not failure_class.reviewed_recovery or message not in ELIGIBLE_REASONS:
+            raise RecoveryBlocked("Recovery blocked: this incident is not eligible.")
+        if failure_time is None:
+            raise RecoveryBlocked(
+                "Recovery blocked: the incident timestamp is invalid."
+            )
+
+        _verify_service_and_hardware(failure_time)
+        reference = _incident_reference(raw)
+        _preserve_evidence(raw, reference)
+        _atomic_text(state_root() / "ram-tetris-enabled", "off\n")
+
+        failure_path = state_root() / "ram-tetris-failure.json"
+        if failure_path.read_bytes() != raw:
+            raise RecoveryBlocked(
+                "Recovery blocked: the failure latch changed during review."
+            )
+        failure_path.unlink()
+        _fsync_directory(failure_path.parent)
+        return {
+            "state": "recovered",
+            "incident_reference": reference,
+            "message": "Recovery complete. RAM Tetris remains OFF.",
+        }
+    finally:
+        os.close(lock_fd)
+
+
+def _truncate(value: str, limit: int) -> str:
+    normalized = " ".join(value.split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 1].rstrip() + "…"
+
+
+def _sanitized_reason(value: str) -> str:
+    value = PRIVATE_HOME_PATH.sub("[private-path]", value)
+    return SENSITIVE_VALUE.sub(lambda match: f"{match.group(1)}=[redacted]", value)
+
+
+def diagnostics_text() -> str:
+    value = status_document()
+    if not value.get("failure"):
+        return "OpenRGB Lighting Recovery\nStatus: no preserved failure\n"
+    return "\n".join(
+        (
+            "OpenRGB Lighting Recovery",
+            f"Error code: {value['code']}",
+            f"Incident: {value['incident_reference']}",
+            f"First detected: {value['first_detected']}",
+            f"Affected subsystem: {value['subsystem']}",
+            f"Recovery: {value['recovery_status']}",
+            f"Description: {value['description']}",
+            "Backend reason: "
+            + _truncate(_sanitized_reason(str(value["message"])), MAX_COPY_REASON),
+            "",
+        )
+    )
+
+
+def copy_diagnostics(print_only: bool) -> int:
+    text = diagnostics_text()
+    if print_only:
+        print(text, end="")
+        return 0
+    result = subprocess.run(
+        [WL_COPY, "--type", "text/plain;charset=utf-8"],
+        input=text,
+        text=True,
+        check=False,
+        timeout=5,
+    )
+    if result.returncode != 0:
+        raise RecoveryBlocked("Diagnostics could not be copied.")
+    print(json.dumps({"state": "copied", "message": "Diagnostics copied."}))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    actions = parser.add_subparsers(dest="action", required=True)
+    actions.add_parser("status")
+    actions.add_parser("prepare")
+    recover_parser = actions.add_parser("recover")
+    recover_parser.add_argument("--confirm", required=True)
+    copy_parser = actions.add_parser("copy-diagnostics")
+    copy_parser.add_argument("--print", action="store_true")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        if args.action == "status":
+            print(json.dumps(status_document(), sort_keys=True))
+            return 0
+        if args.action == "prepare":
+            print(json.dumps(prepare_document(), sort_keys=True))
+            return 0
+        if args.action == "recover":
+            print(json.dumps(recover(args.confirm), sort_keys=True))
+            return 0
+        return copy_diagnostics(args.print)
+    except (RecoveryBlocked, OSError, subprocess.TimeoutExpired) as error:
+        print(str(error), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

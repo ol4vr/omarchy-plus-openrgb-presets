@@ -1339,28 +1339,10 @@ def main() -> int:
             pass
         return 0
     if args.action == "clear-failure":
-        if _preference():
-            raise SystemExit(
-                "failure recovery refused: turn RAM Tetris OFF before the "
-                "separately reviewed recovery action"
-            )
-        lock_path = control.root / "ram-tetris.lock"
-        lock_fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
-        try:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as error:
-                raise SystemExit(
-                    "failure recovery refused: RAM Tetris writer still owns the lock"
-                ) from error
-            try:
-                control.failure_path.unlink()
-            except FileNotFoundError:
-                pass
-        finally:
-            os.close(lock_fd)
-        print("Persistent RAM Tetris failure latch cleared after reviewed recovery")
-        return 0
+        raise SystemExit(
+            "direct failure clearance is disabled; use the classified "
+            "lighting-recovery procedure"
+        )
     if args.action == "fail":
         control.fail(args.message)
         return 0
