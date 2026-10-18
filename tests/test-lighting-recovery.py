@@ -15,7 +15,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -98,6 +98,67 @@ class LightingRecoveryTests(unittest.TestCase):
         raw = (json.dumps(value, sort_keys=True) + "\n").encode()
         self.lifecycle_state.write_bytes(raw)
         return raw
+
+    def write_historical_clearance_records(
+        self,
+    ) -> tuple[bytes, bytes, bytes, bytes]:
+        failure_raw = (
+            b'{"message": "writer termination was not preceded by an authenticated '
+            b'lifecycle stop request", "pid": 5919, "state": "failed", '
+            b'"time": 1792308226.2688146}\n'
+        )
+        boundary_raw = (
+            json.dumps(
+                {
+                    "boot_id": "boot-a",
+                    "lifecycle_pid": 41,
+                    "lifecycle_start": "4100",
+                    "reason": "deliberate",
+                    "server_pid": 42,
+                    "server_start": "4200",
+                    "state": "stopping",
+                    "time": 1_792_308_226.2024546,
+                },
+                sort_keys=True,
+            ).encode()
+            + b"\n"
+        )
+        current_raw = (
+            json.dumps(
+                {
+                    "boot_id": "boot-a",
+                    "lifecycle_pid": 51,
+                    "lifecycle_start": "5100",
+                    "reason": recovery.HISTORICAL_READY_REASON,
+                    "server_pid": 52,
+                    "server_start": "5200",
+                    "state": "ready",
+                    "time": 1_792_343_227.7618039,
+                },
+                sort_keys=True,
+            ).encode()
+            + b"\n"
+        )
+        root = self.failure.parent
+        evidence = root / "recovery-evidence"
+        evidence.mkdir(parents=True, exist_ok=True)
+        root.chmod(0o700)
+        evidence.chmod(0o700)
+        files = {
+            self.failure: failure_raw,
+            evidence
+            / f"{recovery.HISTORICAL_CLEARANCE_REFERENCE}.failure.json": failure_raw,
+            evidence
+            / f"{recovery.HISTORICAL_CLEARANCE_REFERENCE}.lifecycle-state.json": boundary_raw,
+            evidence
+            / f"{recovery.HISTORICAL_CLEARANCE_REFERENCE}.openrgb-config.json": self.config_raw,
+            self.lifecycle_state: current_raw,
+            root / "ram-tetris-enabled": b"off\n",
+        }
+        for path, raw in files.items():
+            path.write_bytes(raw)
+            path.chmod(0o600)
+        return failure_raw, boundary_raw, self.config_raw, current_raw
 
     def test_stable_code_mapping_and_subsystems(self):
         cases = {
@@ -663,6 +724,440 @@ class LightingRecoveryTests(unittest.TestCase):
             ),
         ):
             recovery._verify_service_and_hardware(1_792_000_000.0)
+
+    def test_historical_clearance_accepts_only_exact_incident_arguments(self):
+        recovery._verify_historical_authorization(
+            recovery.HISTORICAL_CLEARANCE_REFERENCE,
+            recovery.HISTORICAL_CLEARANCE_LATCH_SHA256,
+            recovery.HISTORICAL_CLEARANCE_REASON,
+        )
+        cases = (
+            (
+                "LR-WRONG",
+                recovery.HISTORICAL_CLEARANCE_LATCH_SHA256,
+                recovery.HISTORICAL_CLEARANCE_REASON,
+            ),
+            (
+                recovery.HISTORICAL_CLEARANCE_REFERENCE,
+                "0" * 64,
+                recovery.HISTORICAL_CLEARANCE_REASON,
+            ),
+            (
+                recovery.HISTORICAL_CLEARANCE_REFERENCE,
+                recovery.HISTORICAL_CLEARANCE_LATCH_SHA256,
+                "different reason",
+            ),
+        )
+        for reference, checksum, reason in cases:
+            with (
+                self.subTest(reference=reference, checksum=checksum, reason=reason),
+                self.assertRaisesRegex(
+                    recovery.RecoveryBlocked, "authorization does not match"
+                ),
+            ):
+                recovery._verify_historical_authorization(reference, checksum, reason)
+
+    def test_historical_clearance_cli_requires_explicit_acknowledgement(self):
+        arguments = [
+            "clear-resolved-lifecycle",
+            "--incident-reference",
+            recovery.HISTORICAL_CLEARANCE_REFERENCE,
+            "--latch-sha256",
+            recovery.HISTORICAL_CLEARANCE_LATCH_SHA256,
+            "--original-reason",
+            recovery.HISTORICAL_CLEARANCE_REASON,
+        ]
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            recovery.build_parser().parse_args(arguments)
+        parsed = recovery.build_parser().parse_args(
+            arguments + ["--acknowledge-historical-clearance"]
+        )
+        self.assertEqual(parsed.action, "clear-resolved-lifecycle")
+        self.assertTrue(parsed.acknowledge_historical_clearance)
+
+    def test_historical_clearance_preflight_binds_preserved_records(self):
+        failure_raw, boundary_raw, config_raw, current_raw = (
+            self.write_historical_clearance_records()
+        )
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery,
+                "HISTORICAL_CLEARANCE_BOUNDARY_SHA256",
+                hashlib.sha256(boundary_raw).hexdigest(),
+            ),
+            mock.patch.object(
+                recovery,
+                "HISTORICAL_CLEARANCE_CONFIG_SHA256",
+                hashlib.sha256(config_raw).hexdigest(),
+            ),
+            mock.patch.object(recovery, "_current_boot_id", return_value="boot-a"),
+            mock.patch.object(recovery, "_process_start", return_value=None),
+            mock.patch.object(
+                recovery, "_verify_historical_running_environment"
+            ) as runtime_verify,
+            mock.patch.object(recovery, "_verify_service_and_hardware") as health,
+        ):
+            binding = recovery._historical_clearance_preflight(
+                recovery.HISTORICAL_CLEARANCE_REFERENCE,
+                recovery.HISTORICAL_CLEARANCE_LATCH_SHA256,
+                recovery.HISTORICAL_CLEARANCE_REASON,
+            )
+        self.assertEqual(
+            binding,
+            recovery.HistoricalClearanceBinding(
+                failure_raw, boundary_raw, config_raw, current_raw
+            ),
+        )
+        runtime_verify.assert_called_once()
+        health.assert_called_once_with(1_792_308_226.2688146)
+
+    def test_historical_running_environment_is_read_only_and_fully_owned(self):
+        _, _, config_raw, current_raw = self.write_historical_clearance_records()
+        current = json.loads(current_raw)
+        unit = self.root / "reviewed.service"
+        unit.write_text("reviewed\n", encoding="utf-8")
+        service = {
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "Result": "success",
+            "MainPID": "51",
+            "ControlPID": "0",
+            "ControlGroup": "/user.slice/openrgb.service",
+            "FragmentPath": str(unit),
+            "UnitFileState": "enabled",
+            "WantedBy": recovery.GRAPHICAL_TARGET,
+            "PartOf": recovery.GRAPHICAL_TARGET,
+            "DropInPaths": "",
+            "NeedDaemonReload": "no",
+            "Type": "notify",
+            "Restart": "no",
+            "KillMode": "mixed",
+            "TimeoutStartUSec": "2min",
+            "TimeoutStopUSec": "20s",
+        }
+        target = {
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "active",
+        }
+
+        def argv(pid):
+            return {
+                51: recovery.LIFECYCLE_ARGV,
+                52: recovery.SERVER_ARGV,
+                53: recovery.INHIBITOR_ARGV,
+                54: recovery.MONITOR_ARGV,
+            }[pid]
+
+        def matches(expected):
+            return {
+                recovery.LIFECYCLE_ARGV: (51,),
+                recovery.SERVER_ARGV: (52,),
+                recovery.INHIBITOR_ARGV: (53,),
+                recovery.MONITOR_ARGV: (54,),
+            }[expected]
+
+        commands = (
+            subprocess.CompletedProcess(
+                [], 0, recovery.EXPECTED_OPENRGB_PACKAGE + "\n", ""
+            ),
+            subprocess.CompletedProcess(
+                [],
+                0,
+                'LISTEN 0 4096 127.0.0.1:6742 users:(("openrgb",pid=52,fd=4))\n',
+                "",
+            ),
+        )
+        with (
+            self.patched_environment(),
+            mock.patch.object(recovery, "INSTALLED_UNIT", unit),
+            mock.patch.object(recovery, "_unit_is_reviewed"),
+            mock.patch.object(
+                recovery,
+                "_service_properties",
+                side_effect=lambda name, _properties: (
+                    service if name == recovery.SERVICE_NAME else target
+                ),
+            ),
+            mock.patch.object(
+                recovery, "_process_start", side_effect=lambda pid: f"{pid}00"
+            ),
+            mock.patch.object(recovery, "_process_argv", side_effect=argv),
+            mock.patch.object(recovery, "_matching_processes", side_effect=matches),
+            mock.patch.object(recovery, "_is_descendant", return_value=True),
+            mock.patch.object(
+                recovery,
+                "_process_cgroup",
+                return_value="/user.slice/openrgb.service",
+            ),
+            mock.patch.object(
+                recovery,
+                "_lock_is_owned",
+                side_effect=lambda path: path.name == "lifecycle.lock",
+            ),
+            mock.patch.object(
+                recovery, "_detector_policy_is_reviewed", return_value=config_raw
+            ),
+            mock.patch.object(recovery, "PROC_ROOT", self.proc),
+            mock.patch.object(recovery.subprocess, "run", side_effect=commands) as run,
+        ):
+            recovery._verify_historical_running_environment(current, config_raw)
+        invoked = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(invoked[0], [recovery.PACMAN, "-Q", "openrgb"])
+        self.assertEqual(invoked[1][0], recovery.SS)
+        self.assertFalse(
+            any(
+                isinstance(command, list)
+                and any(action in command for action in ("start", "stop", "restart"))
+                for command in invoked
+            )
+        )
+
+    def test_historical_clearance_rejects_changed_latch_or_evidence(self):
+        for changed in ("latch", "failure-evidence", "boundary", "config"):
+            with self.subTest(changed=changed):
+                failure_raw, boundary_raw, config_raw, _ = (
+                    self.write_historical_clearance_records()
+                )
+                evidence = self.failure.parent / "recovery-evidence"
+                target = {
+                    "latch": self.failure,
+                    "failure-evidence": evidence
+                    / f"{recovery.HISTORICAL_CLEARANCE_REFERENCE}.failure.json",
+                    "boundary": evidence
+                    / f"{recovery.HISTORICAL_CLEARANCE_REFERENCE}.lifecycle-state.json",
+                    "config": evidence
+                    / f"{recovery.HISTORICAL_CLEARANCE_REFERENCE}.openrgb-config.json",
+                }[changed]
+                target.write_bytes(target.read_bytes() + b"changed")
+                target.chmod(0o600)
+                with (
+                    self.patched_environment(),
+                    mock.patch.object(
+                        recovery,
+                        "HISTORICAL_CLEARANCE_BOUNDARY_SHA256",
+                        hashlib.sha256(boundary_raw).hexdigest(),
+                    ),
+                    mock.patch.object(
+                        recovery,
+                        "HISTORICAL_CLEARANCE_CONFIG_SHA256",
+                        hashlib.sha256(config_raw).hexdigest(),
+                    ),
+                    self.assertRaises(recovery.RecoveryBlocked),
+                ):
+                    recovery._historical_clearance_preflight(
+                        recovery.HISTORICAL_CLEARANCE_REFERENCE,
+                        recovery.HISTORICAL_CLEARANCE_LATCH_SHA256,
+                        recovery.HISTORICAL_CLEARANCE_REASON,
+                    )
+                if changed != "latch":
+                    self.assertEqual(self.failure.read_bytes(), failure_raw)
+
+    def test_historical_clearance_blocks_unhealthy_lifecycle_or_sdk(self):
+        failure_raw, boundary_raw, config_raw, _ = (
+            self.write_historical_clearance_records()
+        )
+        for verifier, message in (
+            ("_verify_historical_acknowledgement", "lifecycle is not ready"),
+            ("_verify_historical_running_environment", "SDK identity is not healthy"),
+        ):
+            with self.subTest(verifier=verifier):
+                with (
+                    self.patched_environment(),
+                    mock.patch.object(
+                        recovery,
+                        "HISTORICAL_CLEARANCE_BOUNDARY_SHA256",
+                        hashlib.sha256(boundary_raw).hexdigest(),
+                    ),
+                    mock.patch.object(
+                        recovery,
+                        "HISTORICAL_CLEARANCE_CONFIG_SHA256",
+                        hashlib.sha256(config_raw).hexdigest(),
+                    ),
+                    mock.patch.object(
+                        recovery,
+                        verifier,
+                        side_effect=recovery.RecoveryBlocked(message),
+                    ),
+                    self.assertRaises(recovery.RecoveryBlocked),
+                ):
+                    recovery._historical_clearance_preflight(
+                        recovery.HISTORICAL_CLEARANCE_REFERENCE,
+                        recovery.HISTORICAL_CLEARANCE_LATCH_SHA256,
+                        recovery.HISTORICAL_CLEARANCE_REASON,
+                    )
+                self.assertEqual(self.failure.read_bytes(), failure_raw)
+
+    def test_historical_clearance_blocks_health_inventory_and_kernel_failures(self):
+        failure_raw, boundary_raw, config_raw, _ = (
+            self.write_historical_clearance_records()
+        )
+        for message in (
+            "accepted controller inventory is incomplete",
+            "four SPD5118 endpoints were not verified",
+            "relevant kernel communication errors exist",
+        ):
+            with self.subTest(message=message):
+                with (
+                    self.patched_environment(),
+                    mock.patch.object(
+                        recovery,
+                        "HISTORICAL_CLEARANCE_BOUNDARY_SHA256",
+                        hashlib.sha256(boundary_raw).hexdigest(),
+                    ),
+                    mock.patch.object(
+                        recovery,
+                        "HISTORICAL_CLEARANCE_CONFIG_SHA256",
+                        hashlib.sha256(config_raw).hexdigest(),
+                    ),
+                    mock.patch.object(
+                        recovery,
+                        "_verify_historical_acknowledgement",
+                        return_value=1_792_308_226.2688146,
+                    ),
+                    mock.patch.object(
+                        recovery, "_verify_historical_running_environment"
+                    ),
+                    mock.patch.object(
+                        recovery,
+                        "_verify_service_and_hardware",
+                        side_effect=recovery.RecoveryBlocked(message),
+                    ),
+                    self.assertRaises(recovery.RecoveryBlocked),
+                ):
+                    recovery._historical_clearance_preflight(
+                        recovery.HISTORICAL_CLEARANCE_REFERENCE,
+                        recovery.HISTORICAL_CLEARANCE_LATCH_SHA256,
+                        recovery.HISTORICAL_CLEARANCE_REASON,
+                    )
+                self.assertEqual(self.failure.read_bytes(), failure_raw)
+
+    def test_historical_clearance_blocks_writer_or_ownership_conflict(self):
+        failure_raw, boundary_raw, config_raw, _ = (
+            self.write_historical_clearance_records()
+        )
+        for message in (
+            "a RAM Tetris writer is active",
+            "lifecycle or SDK ownership is ambiguous",
+        ):
+            with self.subTest(message=message):
+                with (
+                    self.patched_environment(),
+                    mock.patch.object(
+                        recovery,
+                        "HISTORICAL_CLEARANCE_BOUNDARY_SHA256",
+                        hashlib.sha256(boundary_raw).hexdigest(),
+                    ),
+                    mock.patch.object(
+                        recovery,
+                        "HISTORICAL_CLEARANCE_CONFIG_SHA256",
+                        hashlib.sha256(config_raw).hexdigest(),
+                    ),
+                    mock.patch.object(
+                        recovery,
+                        "_verify_historical_acknowledgement",
+                        return_value=1_792_308_226.2688146,
+                    ),
+                    mock.patch.object(
+                        recovery,
+                        "_verify_historical_running_environment",
+                        side_effect=recovery.RecoveryBlocked(message),
+                    ),
+                    self.assertRaises(recovery.RecoveryBlocked),
+                ):
+                    recovery._historical_clearance_preflight(
+                        recovery.HISTORICAL_CLEARANCE_REFERENCE,
+                        recovery.HISTORICAL_CLEARANCE_LATCH_SHA256,
+                        recovery.HISTORICAL_CLEARANCE_REASON,
+                    )
+                self.assertEqual(self.failure.read_bytes(), failure_raw)
+
+    def test_historical_clearance_revalidates_and_retains_protected_evidence(self):
+        failure_raw, boundary_raw, config_raw, current_raw = (
+            self.write_historical_clearance_records()
+        )
+        binding = recovery.HistoricalClearanceBinding(
+            failure_raw, boundary_raw, config_raw, current_raw
+        )
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery, "_historical_clearance_preflight", return_value=binding
+            ) as preflight,
+            mock.patch.object(
+                recovery.subprocess,
+                "run",
+                side_effect=AssertionError("no service or RGB operation is permitted"),
+            ),
+        ):
+            result = recovery.clear_resolved_lifecycle(
+                recovery.HISTORICAL_CLEARANCE_REFERENCE,
+                recovery.HISTORICAL_CLEARANCE_LATCH_SHA256,
+                recovery.HISTORICAL_CLEARANCE_REASON,
+            )
+        self.assertEqual(result["state"], "cleared")
+        self.assertEqual(preflight.call_count, 2)
+        self.assertFalse(self.failure.exists())
+        self.assertEqual(
+            (self.failure.parent / "ram-tetris-enabled").read_bytes(), b"off\n"
+        )
+        evidence = (
+            self.failure.parent
+            / "recovery-evidence"
+            / f"{recovery.HISTORICAL_CLEARANCE_REFERENCE}.historical-clearance.json"
+        )
+        self.assertEqual(evidence.read_bytes(), failure_raw)
+        self.assertEqual(evidence.stat().st_mode & 0o777, 0o600)
+
+    def test_historical_clearance_binding_change_preserves_latch(self):
+        failure_raw, boundary_raw, config_raw, current_raw = (
+            self.write_historical_clearance_records()
+        )
+        first = recovery.HistoricalClearanceBinding(
+            failure_raw, boundary_raw, config_raw, current_raw
+        )
+        second = recovery.HistoricalClearanceBinding(
+            failure_raw, boundary_raw, config_raw, current_raw + b"changed"
+        )
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery,
+                "_historical_clearance_preflight",
+                side_effect=(first, second),
+            ),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "bindings changed"),
+        ):
+            recovery.clear_resolved_lifecycle(
+                recovery.HISTORICAL_CLEARANCE_REFERENCE,
+                recovery.HISTORICAL_CLEARANCE_LATCH_SHA256,
+                recovery.HISTORICAL_CLEARANCE_REASON,
+            )
+        self.assertEqual(self.failure.read_bytes(), failure_raw)
+
+    def test_concurrent_historical_clearance_is_blocked(self):
+        failure_raw, _, _, _ = self.write_historical_clearance_records()
+        self.runtime.mkdir(parents=True)
+        self.runtime.chmod(0o700)
+        descriptor = os.open(
+            self.runtime / "lighting-recovery.lock", os.O_WRONLY | os.O_CREAT, 0o600
+        )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with (
+                self.patched_environment(),
+                self.assertRaisesRegex(recovery.RecoveryBlocked, "another recovery"),
+            ):
+                recovery.clear_resolved_lifecycle(
+                    recovery.HISTORICAL_CLEARANCE_REFERENCE,
+                    recovery.HISTORICAL_CLEARANCE_LATCH_SHA256,
+                    recovery.HISTORICAL_CLEARANCE_REASON,
+                )
+        finally:
+            os.close(descriptor)
+        self.assertEqual(self.failure.read_bytes(), failure_raw)
 
     def test_copy_diagnostics_is_sanitized_and_truncates_long_reason(self):
         long_reason = "/home/private/secret/config token=actual-secret " + "x" * 700

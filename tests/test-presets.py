@@ -1,4 +1,4 @@
-"""Focused source-only validation for OpenRGB Presets 0.4.23."""
+"""Focused source-only validation for OpenRGB Presets 0.4.24."""
 
 from __future__ import annotations
 
@@ -326,7 +326,7 @@ class PresetTests(unittest.TestCase):
 
     def test_manifest_and_panel_order(self) -> None:
         manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.4.23")
+        self.assertEqual(manifest["version"], "0.4.24")
         self.assertEqual(manifest["kinds"], ["bar-widget"])
         self.assertNotIn("service", manifest["entryPoints"])
         self.assertFalse((ROOT / "Service.qml").exists())

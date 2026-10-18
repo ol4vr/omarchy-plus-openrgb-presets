@@ -217,8 +217,8 @@ Exact backend messages and conservative prefixes assign these display codes.
 Only the exact two reviewed legacy messages or the exact correlated deliberate
 lifecycle boundary—not their display codes—can enter recovery.
 
-Version 0.4.23 is a source-only candidate correcting the first v0.4.22
-lifecycle-recovery attempt. A single Recover click now performs the read-only
+Version 0.4.23 corrected the first v0.4.22 lifecycle-recovery attempt. A single
+Recover click now performs the read-only
 preparation and immediately submits its incident-and-configuration-bound token;
 there is no second confirmation control or countdown. The action remains
 disabled for the complete transaction, while the backend recovery singleton
@@ -234,6 +234,18 @@ Effects, and journal gates. It never starts the service a second time or retries
 failed acceptance. The compact failure row also reserves space for the stable
 error code and a short `Recovery needed`, `Recovery blocked`, or manual-review
 status; action feedback and the original reason remain in diagnostics.
+
+Version 0.4.24 adds one administrative clearance path for the already-resolved
+historical incident `LR-BDAAA01A60E133FB`. The command is hard-bound to that
+incident's exact reference, latch checksum, original reason, preserved
+lifecycle-boundary bytes, and preserved OpenRGB configuration. It requires an
+explicit acknowledgment, takes the existing recovery singleton, validates the
+healthy service and complete hardware/ownership contract twice, retains another
+private byte-identical evidence copy, and unlinks only the unchanged latch with
+a parent-directory fsync. It performs no service operation, preset selection,
+RGB write, or Tetris activation. General recovery eligibility, the Lighting
+Control UI, palettes, static arrays, cadence, Effects profiles, lifecycle, and
+systemd unit behavior are unchanged.
 
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
@@ -393,6 +405,22 @@ other lifecycle/SDK failure, and every hardware, controller, kernel, or unknown
 failure, remains manual-review only. The legacy `ram-tetris clear-failure`
 command always refuses; exact reasons and boundary bytes—not display codes—are
 the authority for recovery.
+
+The separately reviewed historical incident `LR-BDAAA01A60E133FB` has one
+administrative cleanup path after its lifecycle recovery has already completed.
+`lighting-recovery clear-resolved-lifecycle` requires that exact reference,
+the exact original latch SHA-256, the exact original reason, and the explicit
+`--acknowledge-historical-clearance` flag. It verifies the protected original
+failure, lifecycle-boundary, and OpenRGB-configuration evidence; the reviewed
+unit/package/detector policy; the acknowledged healthy lifecycle, SDK listener,
+inhibitor, monitor, cgroup, and singleton ownership; Tetris OFF with no writer;
+seven controllers, four SPD5118 endpoints, the accepted Effects assignment;
+and clean relevant kernel history. It then retains another mode-0600 byte-exact
+copy, repeats every binding and health check, and unlinks only the still-exact
+latch with a parent-directory fsync. It never starts or restarts a service,
+selects a preset, writes RGB data, or enables Tetris. Every other incident is
+refused, and neither the normal `recover` command nor the legacy generic clear
+behavior is changed.
 
 The original technical record remains readable without changing state:
 

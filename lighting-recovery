@@ -7,6 +7,10 @@ every applicable health gate, preserves the original evidence bytes, and
 leaves the preference OFF. Lifecycle recovery may acknowledge the reviewed
 boundary and start the user service exactly once; no path restarts a service,
 starts a writer or effect, or selects a preset.
+
+The clear-resolved-lifecycle administrative path is separately hard-bound to
+one already-recovered historical incident. It performs no service operation;
+it only removes the unchanged latch after two complete healthy-state reviews.
 """
 
 from __future__ import annotations
@@ -120,6 +124,25 @@ LIFECYCLE_RECOVERY_REASONS: Final = frozenset(
     }
 )
 
+# One historical v0.4.22 lifecycle incident was recovered successfully before
+# the latch-clearance stage failed.  This administrative contract is bound to
+# that incident's original bytes and retained boundary/configuration evidence;
+# it must not become a general failure-clearance interface.
+HISTORICAL_CLEARANCE_REFERENCE: Final = "LR-BDAAA01A60E133FB"
+HISTORICAL_CLEARANCE_LATCH_SHA256: Final = (
+    "bdaaa01a60e133fb2550d451404f8d6870e63123561a77aa88456e7c4d6ad304"
+)
+HISTORICAL_CLEARANCE_BOUNDARY_SHA256: Final = (
+    "3d0296b94b8607ce3fe2208222bdbc98f582f7b6b63fb0fb55d487e89353be59"
+)
+HISTORICAL_CLEARANCE_CONFIG_SHA256: Final = (
+    "507309e7aaeeb2ef80ccef0ab70d48830aebf989fc212f2977e139ff5b714d09"
+)
+HISTORICAL_CLEARANCE_REASON: Final = (
+    "writer termination was not preceded by an authenticated lifecycle stop request"
+)
+HISTORICAL_READY_REASON: Final = "independent lifecycle health validation complete"
+
 RELEVANT_KERNEL_ERROR: Final = re.compile(
     r"(?:spd5118|i801|smbus|i2c).*"
     r"(?:error|fail|timed out|timeout|error -[0-9]+)",
@@ -134,6 +157,14 @@ class FailureClass:
     scope: str
     description: str
     reviewed_recovery: bool = False
+
+
+@dataclass(frozen=True)
+class HistoricalClearanceBinding:
+    failure_raw: bytes
+    boundary_raw: bytes
+    config_raw: bytes
+    current_state_raw: bytes
 
 
 EXACT_FAILURES: Final = {
@@ -336,6 +367,52 @@ def runtime_root() -> Path:
     )
 
 
+def _require_private_directory(path: Path, label: str) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise RecoveryBlocked(f"Recovery blocked: {label} is unavailable.") from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_mode & 0o077
+    ):
+        raise RecoveryBlocked(f"Recovery blocked: {label} is not protected.")
+
+
+def _read_protected_bytes(path: Path, label: str) -> bytes:
+    _require_private_directory(path.parent, f"{label} directory")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise RecoveryBlocked(f"Recovery blocked: {label} is unavailable.") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_mode & 0o077
+        ):
+            raise RecoveryBlocked(f"Recovery blocked: {label} is not protected.")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 65_536):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _json_record(raw: bytes, label: str) -> dict[str, object]:
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RecoveryBlocked(f"Recovery blocked: {label} is unreadable.") from error
+    if not isinstance(value, dict):
+        raise RecoveryBlocked(f"Recovery blocked: {label} is invalid.")
+    return value
+
+
 def classify_reason(message: str) -> FailureClass:
     exact = EXACT_FAILURES.get(message)
     if exact is not None:
@@ -456,6 +533,15 @@ def _matching_processes(argv: tuple[str, ...]) -> tuple[int, ...]:
         if entry.name.isdigit() and _process_argv(int(entry.name)) == argv:
             matches.append(int(entry.name))
     return tuple(sorted(matches))
+
+
+def _process_cgroup(pid: int) -> str | None:
+    try:
+        lines = PROC_ROOT.joinpath(str(pid), "cgroup").read_text().splitlines()
+    except OSError:
+        return None
+    unified = [line[3:] for line in lines if line.startswith("0::")]
+    return unified[0] if len(unified) == 1 and unified[0] else None
 
 
 def _service_properties(unit: str, properties: tuple[str, ...]) -> dict[str, str]:
@@ -1021,6 +1107,285 @@ def _verify_service_and_hardware(failure_time: float) -> dict[str, object]:
     return health_value
 
 
+def _verify_historical_authorization(
+    incident_reference: str, latch_sha256: str, original_reason: str
+) -> None:
+    if (
+        incident_reference != HISTORICAL_CLEARANCE_REFERENCE
+        or latch_sha256 != HISTORICAL_CLEARANCE_LATCH_SHA256
+        or original_reason != HISTORICAL_CLEARANCE_REASON
+    ):
+        raise RecoveryBlocked(
+            "Historical clearance refused: authorization does not match the "
+            "reviewed incident."
+        )
+
+
+def _verify_historical_acknowledgement(
+    failure: dict[str, object], boundary: dict[str, object], current: dict[str, object]
+) -> float:
+    failure_time = _validate_lifecycle_boundary(
+        failure, HISTORICAL_CLEARANCE_REASON, boundary
+    )
+    current_time = current.get("time")
+    boundary_time = boundary.get("time")
+    if (
+        current.get("state") != "ready"
+        or current.get("reason") != HISTORICAL_READY_REASON
+        or current.get("boot_id") != _current_boot_id()
+        or not isinstance(current_time, (int, float))
+        or isinstance(current_time, bool)
+        or not isinstance(boundary_time, (int, float))
+        or isinstance(boundary_time, bool)
+        or float(current_time) <= max(failure_time, float(boundary_time))
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: the historical boundary has not been replaced by "
+            "an authoritative healthy lifecycle."
+        )
+    old_lifecycle, old_lifecycle_start = _identity(boundary, "lifecycle")
+    old_server, old_server_start = _identity(boundary, "server")
+    current_lifecycle, current_lifecycle_start = _identity(current, "lifecycle")
+    current_server, current_server_start = _identity(current, "server")
+    if (old_lifecycle, old_lifecycle_start) == (
+        current_lifecycle,
+        current_lifecycle_start,
+    ) or (old_server, old_server_start) == (current_server, current_server_start):
+        raise RecoveryBlocked(
+            "Recovery blocked: the lifecycle acknowledgment boundary is ambiguous."
+        )
+    return failure_time
+
+
+def _verify_historical_running_environment(
+    current: dict[str, object], config_evidence: bytes
+) -> None:
+    _unit_is_reviewed()
+    package = subprocess.run(
+        [PACMAN, "-Q", "openrgb"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if package.returncode != 0 or package.stdout.strip() != EXPECTED_OPENRGB_PACKAGE:
+        raise RecoveryBlocked(
+            "Recovery blocked: the installed OpenRGB revision is not reviewed."
+        )
+
+    lifecycle_pid, lifecycle_start = _identity(current, "lifecycle")
+    server_pid, server_start = _identity(current, "server")
+    service = _service_properties(
+        SERVICE_NAME,
+        (
+            "LoadState",
+            "ActiveState",
+            "SubState",
+            "Result",
+            "MainPID",
+            "ControlPID",
+            "ControlGroup",
+            "FragmentPath",
+            "UnitFileState",
+            "WantedBy",
+            "PartOf",
+            "DropInPaths",
+            "NeedDaemonReload",
+            "Type",
+            "Restart",
+            "KillMode",
+            "TimeoutStartUSec",
+            "TimeoutStopUSec",
+        ),
+    )
+    if (
+        service["LoadState"] != "loaded"
+        or service["ActiveState"] != "active"
+        or service["SubState"] != "running"
+        or service["Result"] != "success"
+        or service["MainPID"] != str(lifecycle_pid)
+        or service["ControlPID"] != "0"
+        or not service["ControlGroup"]
+        or service["UnitFileState"] != "enabled"
+        or GRAPHICAL_TARGET not in service["WantedBy"].split()
+        or GRAPHICAL_TARGET not in service["PartOf"].split()
+        or service["DropInPaths"]
+        or service["NeedDaemonReload"] != "no"
+        or service["Type"] != "notify"
+        or service["Restart"] != "no"
+        or service["KillMode"] != "mixed"
+        or service["TimeoutStartUSec"] != "2min"
+        or service["TimeoutStopUSec"] != "20s"
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: the running lighting service is not the reviewed boundary."
+        )
+    try:
+        fragment = Path(service["FragmentPath"]).resolve(strict=True)
+        installed = INSTALLED_UNIT.resolve(strict=True)
+    except OSError as error:
+        raise RecoveryBlocked(
+            "Recovery blocked: the lighting unit path is unreadable."
+        ) from error
+    if fragment != installed:
+        raise RecoveryBlocked(
+            "Recovery blocked: systemd loaded an unexpected lighting unit."
+        )
+
+    target = _service_properties(
+        GRAPHICAL_TARGET, ("LoadState", "ActiveState", "SubState")
+    )
+    if target != {
+        "LoadState": "loaded",
+        "ActiveState": "active",
+        "SubState": "active",
+    }:
+        raise RecoveryBlocked(
+            "Recovery blocked: the graphical session is not an active service owner."
+        )
+
+    if (
+        _process_start(lifecycle_pid) != lifecycle_start
+        or _process_argv(lifecycle_pid) != LIFECYCLE_ARGV
+        or _process_start(server_pid) != server_start
+        or _process_argv(server_pid) != SERVER_ARGV
+        or _matching_processes(LIFECYCLE_ARGV) != (lifecycle_pid,)
+        or _matching_processes(SERVER_ARGV) != (server_pid,)
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: lifecycle or SDK ownership is ambiguous."
+        )
+
+    inhibitor = _matching_processes(INHIBITOR_ARGV)
+    monitor = _matching_processes(MONITOR_ARGV)
+    if (
+        len(inhibitor) != 1
+        or len(monitor) != 1
+        or not _is_descendant(server_pid, lifecycle_pid)
+        or not _is_descendant(inhibitor[0], lifecycle_pid)
+        or not _is_descendant(monitor[0], lifecycle_pid)
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: lifecycle child ownership is incomplete or ambiguous."
+        )
+
+    expected_cgroup = service["ControlGroup"]
+    for pid in (lifecycle_pid, server_pid, inhibitor[0], monitor[0]):
+        if _process_cgroup(pid) != expected_cgroup:
+            raise RecoveryBlocked(
+                "Recovery blocked: lighting process cgroup ownership is ambiguous."
+            )
+
+    listener = subprocess.run(
+        [SS, "-H", "-ltnp", "sport = :6742"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    listener_lines = [line for line in listener.stdout.splitlines() if line.strip()]
+    if (
+        listener.returncode != 0
+        or len(listener_lines) != 1
+        or "127.0.0.1:6742" not in listener_lines[0]
+        or f"pid={server_pid}," not in listener_lines[0]
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: SDK listener ownership is incomplete or ambiguous."
+        )
+
+    root = runtime_root()
+    if not _lock_is_owned(root / "lifecycle.lock"):
+        raise RecoveryBlocked(
+            "Recovery blocked: lifecycle singleton ownership is missing."
+        )
+    if _lock_is_owned(root / "ram-tetris.lock"):
+        raise RecoveryBlocked("Recovery blocked: a RAM Tetris writer owns its lock.")
+    if _lock_is_owned(root / "ram-tetris-write.lock"):
+        raise RecoveryBlocked("Recovery blocked: a lighting write is active.")
+    if (
+        _read_protected_bytes(
+            state_root() / "ram-tetris-enabled", "RAM Tetris preference"
+        )
+        != b"off\n"
+    ):
+        raise RecoveryBlocked("Recovery blocked: RAM Tetris preference is not OFF.")
+    for entry in PROC_ROOT.iterdir():
+        if not entry.name.isdigit():
+            continue
+        argv = _process_argv(int(entry.name))
+        if len(argv) >= 3 and Path(argv[1]) == RAM_TETRIS and argv[2] == "run":
+            raise RecoveryBlocked("Recovery blocked: a RAM Tetris writer is active.")
+
+    config_raw = _detector_policy_is_reviewed()
+    if config_raw != config_evidence:
+        raise RecoveryBlocked(
+            "Recovery blocked: OpenRGB configuration changed from protected evidence."
+        )
+
+
+def _historical_clearance_preflight(
+    incident_reference: str, latch_sha256: str, original_reason: str
+) -> HistoricalClearanceBinding:
+    _verify_historical_authorization(incident_reference, latch_sha256, original_reason)
+    failure_path = state_root() / "ram-tetris-failure.json"
+    failure_raw = _read_protected_bytes(failure_path, "historical failure latch")
+    if (
+        hashlib.sha256(failure_raw).hexdigest() != HISTORICAL_CLEARANCE_LATCH_SHA256
+        or _incident_reference(failure_raw) != HISTORICAL_CLEARANCE_REFERENCE
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: the historical failure latch bytes changed."
+        )
+    failure = _json_record(failure_raw, "historical failure latch")
+    if _failure_message(failure) != HISTORICAL_CLEARANCE_REASON:
+        raise RecoveryBlocked(
+            "Recovery blocked: the historical failure reason changed."
+        )
+
+    evidence_root = state_root() / "recovery-evidence"
+    failure_evidence = _read_protected_bytes(
+        evidence_root / f"{HISTORICAL_CLEARANCE_REFERENCE}.failure.json",
+        "original failure evidence",
+    )
+    boundary_raw = _read_protected_bytes(
+        evidence_root / f"{HISTORICAL_CLEARANCE_REFERENCE}.lifecycle-state.json",
+        "original lifecycle-boundary evidence",
+    )
+    config_raw = _read_protected_bytes(
+        evidence_root / f"{HISTORICAL_CLEARANCE_REFERENCE}.openrgb-config.json",
+        "original OpenRGB configuration evidence",
+    )
+    if failure_evidence != failure_raw:
+        raise RecoveryBlocked(
+            "Recovery blocked: original failure evidence does not match the latch."
+        )
+    if hashlib.sha256(boundary_raw).hexdigest() != HISTORICAL_CLEARANCE_BOUNDARY_SHA256:
+        raise RecoveryBlocked(
+            "Recovery blocked: original lifecycle-boundary evidence changed."
+        )
+    if hashlib.sha256(config_raw).hexdigest() != HISTORICAL_CLEARANCE_CONFIG_SHA256:
+        raise RecoveryBlocked(
+            "Recovery blocked: original OpenRGB configuration evidence changed."
+        )
+
+    current_state_path = state_root() / "lifecycle-service-state.json"
+    current_state_raw = _read_protected_bytes(
+        current_state_path, "current lifecycle state"
+    )
+    boundary = _json_record(boundary_raw, "original lifecycle-boundary evidence")
+    current = _json_record(current_state_raw, "current lifecycle state")
+    failure_time = _verify_historical_acknowledgement(failure, boundary, current)
+    _verify_historical_running_environment(current, config_raw)
+    _verify_service_and_hardware(failure_time)
+    return HistoricalClearanceBinding(
+        failure_raw=failure_raw,
+        boundary_raw=boundary_raw,
+        config_raw=config_raw,
+        current_state_raw=current_state_raw,
+    )
+
+
 def _wait_for_authoritative_lifecycle_ready(deadline: float) -> None:
     """Wait for the lifecycle's own state record after systemd accepts READY."""
     while True:
@@ -1149,6 +1514,47 @@ def _preserve_evidence(raw: bytes, reference: str, kind: str = "failure") -> Pat
         )
     _fsync_directory(evidence_root)
     return destination
+
+
+def _unlink_unchanged_historical_latch(expected: bytes) -> None:
+    path = state_root() / "ram-tetris-failure.json"
+    _require_private_directory(path.parent, "historical failure-latch directory")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise RecoveryBlocked(
+            "Recovery blocked: the historical failure latch is unavailable."
+        ) from error
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_mode & 0o077
+        ):
+            raise RecoveryBlocked(
+                "Recovery blocked: the historical failure latch is not protected."
+            )
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 65_536):
+            chunks.append(chunk)
+        if b"".join(chunks) != expected:
+            raise RecoveryBlocked(
+                "Recovery blocked: the historical failure latch changed before clearance."
+            )
+        path_metadata = path.lstat()
+        if (
+            path_metadata.st_dev != metadata.st_dev
+            or path_metadata.st_ino != metadata.st_ino
+        ):
+            raise RecoveryBlocked(
+                "Recovery blocked: the historical failure latch identity changed."
+            )
+        path.unlink()
+        _fsync_directory(path.parent)
+    finally:
+        os.close(descriptor)
 
 
 def _recover_lifecycle(
@@ -1281,6 +1687,56 @@ def recover(confirmation_token: str) -> dict[str, object]:
         os.close(lock_fd)
 
 
+def clear_resolved_lifecycle(
+    incident_reference: str,
+    latch_sha256: str,
+    original_reason: str,
+) -> dict[str, object]:
+    """Clear only the reviewed, already-resolved LGT-LIF-002 historical latch."""
+    root = runtime_root()
+    _private_directory(root)
+    lock_fd = os.open(root / "lighting-recovery.lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RecoveryBlocked(
+                "Recovery blocked: another recovery is active."
+            ) from error
+
+        first = _historical_clearance_preflight(
+            incident_reference, latch_sha256, original_reason
+        )
+        evidence = _preserve_evidence(
+            first.failure_raw,
+            HISTORICAL_CLEARANCE_REFERENCE,
+            "historical-clearance",
+        )
+        if (
+            _read_protected_bytes(evidence, "historical-clearance evidence")
+            != first.failure_raw
+        ):
+            raise RecoveryBlocked(
+                "Recovery blocked: historical-clearance evidence readback changed."
+            )
+
+        second = _historical_clearance_preflight(
+            incident_reference, latch_sha256, original_reason
+        )
+        if second != first:
+            raise RecoveryBlocked(
+                "Recovery blocked: incident or health bindings changed before clearance."
+            )
+        _unlink_unchanged_historical_latch(first.failure_raw)
+        return {
+            "state": "cleared",
+            "incident_reference": HISTORICAL_CLEARANCE_REFERENCE,
+            "message": "Historical lifecycle failure cleared. RAM Tetris remains OFF.",
+        }
+    finally:
+        os.close(lock_fd)
+
+
 def _truncate(value: str, limit: int) -> str:
     normalized = " ".join(value.split())
     if len(normalized) <= limit:
@@ -1338,6 +1794,13 @@ def build_parser() -> argparse.ArgumentParser:
     actions.add_parser("prepare")
     recover_parser = actions.add_parser("recover")
     recover_parser.add_argument("--confirm", required=True)
+    historical = actions.add_parser("clear-resolved-lifecycle")
+    historical.add_argument("--incident-reference", required=True)
+    historical.add_argument("--latch-sha256", required=True)
+    historical.add_argument("--original-reason", required=True)
+    historical.add_argument(
+        "--acknowledge-historical-clearance", action="store_true", required=True
+    )
     copy_parser = actions.add_parser("copy-diagnostics")
     copy_parser.add_argument("--print", action="store_true")
     return parser
@@ -1354,6 +1817,18 @@ def main() -> int:
             return 0
         if args.action == "recover":
             print(json.dumps(recover(args.confirm), sort_keys=True))
+            return 0
+        if args.action == "clear-resolved-lifecycle":
+            print(
+                json.dumps(
+                    clear_resolved_lifecycle(
+                        args.incident_reference,
+                        args.latch_sha256,
+                        args.original_reason,
+                    ),
+                    sort_keys=True,
+                )
+            )
             return 0
         return copy_diagnostics(args.print)
     except (RecoveryBlocked, OSError, subprocess.TimeoutExpired) as error:
