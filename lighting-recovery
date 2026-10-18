@@ -21,6 +21,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -63,6 +64,8 @@ OPENRGB_CONFIG: Final = (
 )
 DISABLED_DETECTOR: Final = "ASUS Aura SMBus Motherboard"
 REQUIRED_DETECTOR: Final = "ASUS Aura Motherboard"
+SERVICE_START_TIMEOUT: Final = 125.0
+LIFECYCLE_READY_POLL_SECONDS: Final = 0.1
 
 LIFECYCLE_ARGV: Final = (
     "/usr/bin/bash",
@@ -1018,6 +1021,26 @@ def _verify_service_and_hardware(failure_time: float) -> dict[str, object]:
     return health_value
 
 
+def _wait_for_authoritative_lifecycle_ready(deadline: float) -> None:
+    """Wait for the lifecycle's own state record after systemd accepts READY."""
+    while True:
+        state = _read_service_state().get("state")
+        if state == "ready":
+            return
+        if state in {"failed", "clean-stopped"}:
+            raise RecoveryBlocked(
+                "Recovery blocked: the single service start did not reach "
+                "authoritative lifecycle readiness; manual review is required."
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RecoveryBlocked(
+                "Recovery blocked: the single service start did not reach "
+                "authoritative lifecycle readiness; manual review is required."
+            )
+        time.sleep(min(LIFECYCLE_READY_POLL_SECONDS, remaining))
+
+
 def prepare_document() -> dict[str, object]:
     raw, record = _failure_record()
     message = _failure_message(record)
@@ -1176,12 +1199,13 @@ def _recover_lifecycle(
             "Recovery blocked: the reviewed service-boundary acknowledgment failed."
         )
 
+    start_deadline = time.monotonic() + SERVICE_START_TIMEOUT
     start = subprocess.run(
         [SYSTEMCTL, "--user", "start", SERVICE_NAME],
         check=False,
         capture_output=True,
         text=True,
-        timeout=125,
+        timeout=SERVICE_START_TIMEOUT,
     )
     if start.returncode != 0:
         raise RecoveryBlocked(
@@ -1191,6 +1215,7 @@ def _recover_lifecycle(
     failure_time, _ = _timestamp(record)
     if failure_time is None:  # preflight already rejects this; retain fail-closed form.
         raise RecoveryBlocked("Recovery blocked: the incident timestamp is invalid.")
+    _wait_for_authoritative_lifecycle_ready(start_deadline)
     _verify_service_and_hardware(failure_time)
     if failure_path.read_bytes() != raw:
         raise RecoveryBlocked(

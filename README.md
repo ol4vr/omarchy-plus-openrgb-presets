@@ -206,8 +206,8 @@ Stable diagnostic mappings are:
 | `LGT-TET-001` | unreviewed Tetris writer/control failure | Tetris | blocked |
 | `LGT-TET-002` | writer exited unexpectedly | Tetris | blocked |
 | `LGT-TET-003` | writer failed to quiesce | Tetris | blocked |
-| `LGT-TET-101` | reviewed legacy lifecycle-count false positive | Tetris | health-gated confirmation |
-| `LGT-TET-102` | reviewed legacy Spectrum Effects-name false positive | Tetris | health-gated confirmation |
+| `LGT-TET-101` | reviewed legacy lifecycle-count false positive | Tetris | health-gated explicit action |
+| `LGT-TET-102` | reviewed legacy Spectrum Effects-name false positive | Tetris | health-gated explicit action |
 | `LGT-CTL-001` | controller inventory, mode, LED count, or write failure | controller | blocked |
 | `LGT-CTL-002` | required SPD5118 endpoint missing or unreadable | controller | blocked |
 | `LGT-KRN-001` | kernel journal or relevant I2C/SMBus/SPD error | kernel | blocked |
@@ -216,6 +216,24 @@ Stable diagnostic mappings are:
 Exact backend messages and conservative prefixes assign these display codes.
 Only the exact two reviewed legacy messages or the exact correlated deliberate
 lifecycle boundary—not their display codes—can enter recovery.
+
+Version 0.4.23 is a source-only candidate correcting the first v0.4.22
+lifecycle-recovery attempt. A single Recover click now performs the read-only
+preparation and immediately submits its incident-and-configuration-bound token;
+there is no second confirmation control or countdown. The action remains
+disabled for the complete transaction, while the backend recovery singleton
+continues to reject concurrent callers.
+
+The helper no longer treats completion of `systemctl start` as authoritative
+application readiness. Because the reviewed notify unit permits child-process
+notifications, systemd can accept an SDK readiness signal before the lifecycle
+has published its own `ready` record. After the one permitted start, recovery
+now waits within the existing 125-second start budget for that record and only
+then runs the unchanged identity, lock, seven-controller, four-SPD5118,
+Effects, and journal gates. It never starts the service a second time or retries
+failed acceptance. The compact failure row also reserves space for the stable
+error code and a short `Recovery needed`, `Recovery blocked`, or manual-review
+status; action feedback and the original reason remain in diagnostics.
 
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.

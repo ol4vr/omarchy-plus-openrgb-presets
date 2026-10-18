@@ -1,4 +1,4 @@
-"""Focused source-only validation for OpenRGB Presets 0.4.22."""
+"""Focused source-only validation for OpenRGB Presets 0.4.23."""
 
 from __future__ import annotations
 
@@ -326,7 +326,7 @@ class PresetTests(unittest.TestCase):
 
     def test_manifest_and_panel_order(self) -> None:
         manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.4.22")
+        self.assertEqual(manifest["version"], "0.4.23")
         self.assertEqual(manifest["kinds"], ["bar-widget"])
         self.assertNotIn("service", manifest["entryPoints"])
         self.assertFalse((ROOT / "Service.qml").exists())
@@ -393,17 +393,41 @@ class PresetTests(unittest.TestCase):
         self.assertIn("rowSpacing: Style.space(7)", panel)
         self.assertIn('text: "󰍛"', panel)
         self.assertIn('? "Lighting animations stopped"', panel)
-        self.assertIn('"Recovery needed · " + root.failureCode', panel)
-        self.assertIn('"Animation stopped · Recovery required · "', panel)
+        self.assertIn("id: compactErrorCode", panel)
+        self.assertIn("text: root.failureCode", panel)
+        self.assertIn('? "Recovery needed"', panel)
+        self.assertIn('? "Recovery blocked"', panel)
+        self.assertIn(': "Manual review required"', panel)
+        self.assertIn("parent.width - compactErrorCode.implicitWidth", panel)
+        compact_row = panel.split("id: tetrisToggle", 1)[1].split(
+            "id: diagnosticDetails", 1
+        )[0]
+        self.assertNotIn("failureDescription", compact_row)
         self.assertIn('? "Active" : "Static lighting"', panel)
-        self.assertIn('? "Confirm" : "Recover"', panel)
+        self.assertIn('text: root.recoveryAttemptActive ? "Working" : "Recover"', panel)
         self.assertIn('text: "󰆏  Copy diagnostics"', panel)
-        self.assertIn('text: "Original reason: " + root.failureReason', panel)
+        self.assertIn('"Original reason: " + root.failureReason', panel)
+        self.assertIn('"Latest action: " + root.recoveryFeedback', panel)
         self.assertIn("root.diagnosticsExpanded = !root.diagnosticsExpanded", panel)
-        self.assertIn("onClicked: root.recoveryConfirmationPending", panel)
+        self.assertIn("onClicked: root.beginRecovery()", panel)
+        self.assertIn('root.recoveryAction = "recover"', panel)
+        self.assertIn("recoveryDispatchTimer.restart()", panel)
+        self.assertIn(
+            "if (!lightingFailure || recoveryProc.running || recoveryAttemptActive)",
+            panel,
+        )
+        self.assertNotIn("recoveryConfirmationPending", panel)
+        self.assertNotIn("confirmationTimer", panel)
+        self.assertNotIn("function confirmRecovery", panel)
+        self.assertNotIn("function cancelRecovery", panel)
+        self.assertNotIn('text: "Confirm"', panel)
+        self.assertNotIn("interval: 15000", panel)
+        self.assertIn(
+            "anchors.right: tetrisToggle.failed ? recoveryControls.left : toggleTrack.left",
+            panel,
+        )
         self.assertIn("onActivateRequested: root.applySelectedPreset()", panel)
         self.assertNotIn("onActivateRequested: root.beginRecovery()", panel)
-        self.assertNotIn("onActivateRequested: root.confirmRecovery()", panel)
         self.assertIn("root.activePresetData.mode", panel)
         self.assertGreaterEqual(panel.count("fontSizeMode: Text.HorizontalFit"), 2)
         self.assertIn("maximumLineCount: 1", panel)

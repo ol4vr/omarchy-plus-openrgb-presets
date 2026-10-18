@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -309,14 +310,82 @@ class LightingRecoveryTests(unittest.TestCase):
             mock.patch.object(
                 recovery.subprocess, "run", return_value=completed
             ) as run,
+            mock.patch.object(
+                recovery, "_wait_for_authoritative_lifecycle_ready"
+            ) as wait,
             mock.patch.object(recovery, "_verify_service_and_hardware") as verify,
         ):
             value = recovery.recover(token)
         self.assertEqual(value["state"], "recovered")
+        wait.assert_called_once()
         verify.assert_called_once_with(1_792_000_000.0)
         self.assertFalse(self.failure.exists())
         self.assertEqual(
             (self.failure.parent / "ram-tetris-enabled").read_bytes(), b"off\n"
+        )
+        starts = [
+            call
+            for call in run.call_args_list
+            if call.args[0][:3] == [recovery.SYSTEMCTL, "--user", "start"]
+        ]
+        self.assertEqual(len(starts), 1)
+
+    def test_lifecycle_wait_uses_authoritative_ready_record(self):
+        states = ({"state": "stopping"}, {"state": "starting"}, {"state": "ready"})
+        with (
+            mock.patch.object(recovery, "_read_service_state", side_effect=states),
+            mock.patch.object(recovery.time, "sleep") as sleep,
+        ):
+            recovery._wait_for_authoritative_lifecycle_ready(time.monotonic() + 10)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_post_start_acceptance_failure_preserves_latch_and_evidence(self):
+        failure_raw = self.write_failure(
+            "writer termination was not preceded by an authenticated lifecycle stop request"
+        )
+        lifecycle_raw = self.write_lifecycle_state()
+        token = recovery._lifecycle_confirmation_token(
+            failure_raw, lifecycle_raw, self.config_raw
+        )
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery,
+                "_verify_lifecycle_recovery_preflight",
+                return_value=(lifecycle_raw, self.config_raw),
+            ),
+            mock.patch.object(recovery, "OPENRGB_CONFIG", self.openrgb_config),
+            mock.patch.object(
+                recovery.subprocess, "run", return_value=completed
+            ) as run,
+            mock.patch.object(
+                recovery, "_wait_for_authoritative_lifecycle_ready"
+            ) as wait,
+            mock.patch.object(
+                recovery,
+                "_verify_service_and_hardware",
+                side_effect=recovery.RecoveryBlocked(
+                    "Recovery blocked: post-start acceptance failed."
+                ),
+            ),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "acceptance failed"),
+        ):
+            recovery.recover(token)
+        wait.assert_called_once()
+        self.assertEqual(self.failure.read_bytes(), failure_raw)
+        self.assertEqual(self.lifecycle_state.read_bytes(), lifecycle_raw)
+        self.assertEqual(
+            (self.failure.parent / "ram-tetris-enabled").read_bytes(), b"off\n"
+        )
+        reference = recovery._incident_reference(failure_raw)
+        evidence = self.failure.parent / "recovery-evidence"
+        self.assertEqual(
+            (evidence / f"{reference}.failure.json").read_bytes(), failure_raw
+        )
+        self.assertEqual(
+            (evidence / f"{reference}.lifecycle-state.json").read_bytes(),
+            lifecycle_raw,
         )
         starts = [
             call

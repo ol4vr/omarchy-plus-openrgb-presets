@@ -47,7 +47,8 @@ Panel {
   property string recoveryAction: ""
   property string recoveryToken: ""
   property string recoveryFeedback: ""
-  property bool recoveryConfirmationPending: false
+  property bool recoveryAttemptActive: false
+  property bool recoveryAttemptBlocked: false
   property bool diagnosticsExpanded: false
   property string recoveryProcessOutput: ""
   property string recoveryProcessError: ""
@@ -283,10 +284,13 @@ Panel {
       failureSubsystem = String(state.subsystem || "unknown")
       recoveryStatus = String(state.recovery_status || "")
       recoverySummary = String(state.recovery_summary || "")
-      if (previousReference !== "" && previousReference !== failureReference)
+      if (previousReference !== "" && previousReference !== failureReference) {
         recoveryFeedback = ""
+        recoveryAttemptBlocked = false
+      }
       if (!lightingFailure) {
-        recoveryConfirmationPending = false
+        recoveryAttemptActive = false
+        recoveryAttemptBlocked = false
         recoveryToken = ""
       }
     } catch (error) {
@@ -306,8 +310,10 @@ Panel {
   }
 
   function beginRecovery() {
-    if (!lightingFailure || recoveryProc.running || recoveryConfirmationPending)
+    if (!lightingFailure || recoveryProc.running || recoveryAttemptActive)
       return
+    recoveryAttemptActive = true
+    recoveryAttemptBlocked = false
     recoveryAction = "prepare"
     recoveryFeedback = "Checking recovery safety…"
     recoveryProcessOutput = ""
@@ -315,26 +321,8 @@ Panel {
     recoveryProc.running = true
   }
 
-  function confirmRecovery() {
-    if (!recoveryConfirmationPending || recoveryToken === ""
-        || recoveryProc.running)
-      return
-    recoveryAction = "recover"
-    recoveryFeedback = "Recovering safely…"
-    recoveryProcessOutput = ""
-    recoveryProcessError = ""
-    recoveryProc.running = true
-  }
-
-  function cancelRecovery() {
-    recoveryConfirmationPending = false
-    recoveryToken = ""
-    recoveryFeedback = "Recovery confirmation cancelled."
-    confirmationTimer.stop()
-  }
-
   function copyDiagnostics() {
-    if (!lightingFailure || recoveryProc.running) return
+    if (!lightingFailure || recoveryProc.running || recoveryAttemptActive) return
     recoveryAction = "copy-diagnostics"
     recoveryFeedback = "Copying diagnostics…"
     recoveryProcessOutput = ""
@@ -453,7 +441,8 @@ Panel {
     onExited: function(exitCode) {
       var action = root.recoveryAction
       if (exitCode !== 0) {
-        root.recoveryConfirmationPending = false
+        root.recoveryAttemptActive = false
+        if (action !== "copy-diagnostics") root.recoveryAttemptBlocked = true
         root.recoveryToken = ""
         root.recoveryFeedback = root.recoveryProcessError !== ""
           ? root.recoveryProcessError
@@ -463,33 +452,47 @@ Panel {
           var result = JSON.parse(root.recoveryProcessOutput)
           if (action === "prepare") {
             root.recoveryToken = String(result.confirmation_token || "")
-            root.recoveryConfirmationPending = root.recoveryToken !== ""
-            root.recoveryFeedback = String(result.message || "Confirm recovery.")
-            if (root.recoveryConfirmationPending) confirmationTimer.restart()
+            if (root.recoveryToken === "") {
+              root.recoveryAttemptActive = false
+              root.recoveryAttemptBlocked = true
+              root.recoveryFeedback = "Recovery preparation did not bind the incident."
+            } else {
+              root.recoveryAction = "recover"
+              root.recoveryFeedback = "Recovering safely…"
+              root.recoveryProcessOutput = ""
+              root.recoveryProcessError = ""
+              recoveryDispatchTimer.restart()
+            }
           } else if (action === "recover") {
-            root.recoveryConfirmationPending = false
+            root.recoveryAttemptActive = false
+            root.recoveryAttemptBlocked = false
             root.recoveryToken = ""
             root.recoveryFeedback = String(result.message || "Recovery complete.")
-            confirmationTimer.stop()
             if (!tetrisStatusProc.running) tetrisStatusProc.running = true
           } else {
             root.recoveryFeedback = String(result.message || "Diagnostics copied.")
           }
         } catch (error) {
-          root.recoveryConfirmationPending = false
+          root.recoveryAttemptActive = false
+          if (action !== "copy-diagnostics") root.recoveryAttemptBlocked = true
           root.recoveryToken = ""
           root.recoveryFeedback = "Recovery response was invalid."
         }
       }
-      root.recoveryAction = ""
+      if (root.recoveryAction === action)
+        root.recoveryAction = ""
     }
   }
 
   Timer {
-    id: confirmationTimer
-    interval: 15000
+    id: recoveryDispatchTimer
+    interval: 0
     repeat: false
-    onTriggered: root.cancelRecovery()
+    onTriggered: {
+      if (root.recoveryAttemptActive && root.recoveryToken !== ""
+          && !recoveryProc.running)
+        recoveryProc.running = true
+    }
   }
 
   Process {
@@ -521,7 +524,7 @@ Panel {
     running: root.opened
     onTriggered: {
       if (!tetrisStatusProc.running && !tetrisActionProc.running
-          && !recoveryProc.running && !root.recoveryConfirmationPending)
+          && !recoveryProc.running && !root.recoveryAttemptActive)
         tetrisStatusProc.running = true
     }
   }
@@ -716,13 +719,13 @@ Panel {
           readonly property color accentColor: failed
             ? "#F7768E"
             : root.ramTetrisPreference ? "#9ECE6A" : "#565F89"
-          readonly property string compactStatus: root.recoveryFeedback !== ""
-            ? root.recoveryFeedback + " · " + root.failureCode
-              + " · " + root.failureDescription
-            : root.failureScope === "lighting"
-              ? "Recovery needed · " + root.failureCode + " · " + root.failureDescription
-              : "Animation stopped · Recovery required · " + root.failureCode
-                + " · " + root.failureDescription
+          readonly property string compactRecoveryStatus: root.recoveryAttemptActive
+            ? "Recovery in progress"
+            : root.recoveryAttemptBlocked || root.recoveryStatus === "blocked"
+              ? "Recovery blocked"
+              : root.recoveryStatus === "available"
+              ? "Recovery needed"
+              : "Manual review required"
 
           width: parent.width
           height: Style.space(failed ? 58 : 46)
@@ -746,7 +749,7 @@ Panel {
             id: tetrisLabels
             anchors.left: tetrisIcon.right
             anchors.leftMargin: Style.space(8)
-            anchors.right: failed ? recoveryControls.left : toggleTrack.left
+            anchors.right: tetrisToggle.failed ? recoveryControls.left : toggleTrack.left
             anchors.rightMargin: Style.space(10)
             anchors.verticalCenter: parent.verticalCenter
             spacing: Style.space(1)
@@ -764,18 +767,36 @@ Panel {
               elide: Text.ElideRight
             }
 
-            Text {
+            Row {
               width: parent.width
-              text: tetrisToggle.failed
-                ? tetrisToggle.compactStatus
-                : tetrisActionProc.running
+              spacing: Style.space(6)
+
+              Text {
+                id: compactErrorCode
+                visible: tetrisToggle.failed
+                text: root.failureCode
+                color: tetrisToggle.accentColor
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 0.5
+              }
+
+              Text {
+                width: tetrisToggle.failed
+                  ? parent.width - compactErrorCode.implicitWidth - Style.space(6)
+                  : parent.width
+                text: tetrisToggle.failed
+                  ? "· " + tetrisToggle.compactRecoveryStatus
+                  : tetrisActionProc.running
                   ? "UPDATING…"
                   : root.ramTetrisPreference ? "Active" : "Static lighting"
-              color: tetrisToggle.accentColor
-              font.family: root.contentFontFamily
-              font.pixelSize: Style.font.caption
-              font.letterSpacing: 0.5
-              elide: Text.ElideRight
+                color: tetrisToggle.accentColor
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.caption
+                font.letterSpacing: 0.5
+                elide: Text.ElideRight
+              }
             }
           }
 
@@ -837,38 +858,13 @@ Panel {
             }
 
             Rectangle {
-              visible: root.recoveryConfirmationPending
-              width: visible ? Style.space(28) : 0
-              height: Style.space(28)
-              radius: Style.cornerRadius
-              color: Qt.rgba(tetrisToggle.accentColor.r, tetrisToggle.accentColor.g, tetrisToggle.accentColor.b, 0.08)
-              border.width: visible ? 1 : 0
-              border.color: Qt.rgba(tetrisToggle.accentColor.r, tetrisToggle.accentColor.g, tetrisToggle.accentColor.b, 0.35)
-
-              Text {
-                anchors.centerIn: parent
-                text: "󰜺"
-                color: tetrisToggle.accentColor
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.body
-              }
-
-              MouseArea {
-                anchors.fill: parent
-                cursorShape: Qt.PointingHandCursor
-                enabled: !recoveryProc.running
-                onClicked: root.cancelRecovery()
-              }
-            }
-
-            Rectangle {
-              width: root.recoveryConfirmationPending ? Style.space(82) : Style.space(76)
+              width: Style.space(76)
               height: Style.space(28)
               radius: Style.cornerRadius
               color: Qt.rgba(tetrisToggle.accentColor.r, tetrisToggle.accentColor.g, tetrisToggle.accentColor.b, 0.18)
               border.width: 1
               border.color: tetrisToggle.accentColor
-              opacity: recoveryProc.running ? 0.55 : 1
+              opacity: root.recoveryAttemptActive ? 0.55 : 1
 
               Row {
                 anchors.centerIn: parent
@@ -882,9 +878,7 @@ Panel {
                 }
 
                 Text {
-                  text: recoveryProc.running
-                    ? "Checking"
-                    : root.recoveryConfirmationPending ? "Confirm" : "Recover"
+                  text: root.recoveryAttemptActive ? "Working" : "Recover"
                   color: tetrisToggle.accentColor
                   font.family: root.contentFontFamily
                   font.pixelSize: Style.font.caption
@@ -895,10 +889,8 @@ Panel {
               MouseArea {
                 anchors.fill: parent
                 cursorShape: Qt.PointingHandCursor
-                enabled: !recoveryProc.running
-                onClicked: root.recoveryConfirmationPending
-                  ? root.confirmRecovery()
-                  : root.beginRecovery()
+                enabled: !root.recoveryAttemptActive && !recoveryProc.running
+                onClicked: root.beginRecovery()
               }
             }
           }
@@ -972,7 +964,9 @@ Panel {
               Text {
                 id: originalReason
                 width: parent.width
-                text: "Original reason: " + root.failureReason
+                text: (root.recoveryFeedback !== ""
+                  ? "Latest action: " + root.recoveryFeedback + "\n"
+                  : "") + "Original reason: " + root.failureReason
                 color: root.contentForeground
                 opacity: 0.82
                 font.family: root.contentFontFamily
@@ -1006,7 +1000,7 @@ Panel {
                 MouseArea {
                   anchors.fill: parent
                   cursorShape: Qt.PointingHandCursor
-                  enabled: !recoveryProc.running
+                  enabled: !recoveryProc.running && !root.recoveryAttemptActive
                   onClicked: root.copyDiagnostics()
                 }
               }
