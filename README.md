@@ -247,6 +247,29 @@ RGB write, or Tetris activation. General recovery eligibility, the Lighting
 Control UI, palettes, static arrays, cadence, Effects profiles, lifecycle, and
 systemd unit behavior are unchanged.
 
+Version 0.4.25 corrects the RAM Tetris preset-transition race diagnosed from
+incident `LR-3903E50F10DAA4FD`. Writer startup now takes the existing preset
+operation singleton and refuses every present stop marker before spawning, so
+an active `preset-change` or `user-off` operation cannot receive a replacement
+writer. It retains that singleton and the existing exclusive write gate until
+the child publishes a
+PID/start-token-bound receipt proving that it owns the unchanged writer
+singleton, closing the marker-publication window without a timing delay. A
+successful transition removes its marker and releases ownership before the
+lifecycle can start exactly one replacement; failed, stale, malformed, or
+ambiguous marker state remains stopped.
+
+The lifecycle now retains the writer's actual wait status. Exit status 75 is
+reported specifically as singleton-lock refusal, nonzero exits and observable
+signals retain their status, and only a zero exit paired with the exact
+PID/start-token-bound local-stop receipt is accepted as an ordinary local stop.
+Resume restoration also
+repeats the complete service-health gate and republishes the verified
+replacement SDK identity even when the unit was already ready. A failed resume
+restore or health gate exits fail closed instead of leaving the pre-suspend SDK
+identity recorded as current. Presets, palettes, Effects assignments, service
+ownership, recovery eligibility, and hardware health gates are unchanged.
+
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
 The experimental orange, blue, and red Sunrise gradients are therefore stored
@@ -515,6 +538,7 @@ qmllint -I "$OMARCHY_PATH/shell" \
 "$PLUGIN_DIR/tests/test-lifecycle-duplicate-prevention"
 "$PLUGIN_DIR/tests/test-lifecycle-inhibitors"
 /usr/bin/bash "$PLUGIN_DIR/tests/test-lifecycle-tetris-handoff"
+"$PLUGIN_DIR/tests/test-lifecycle-tetris-reconciliation"
 "$PLUGIN_DIR/tests/test-independent-lifecycle"
 /usr/bin/python3 "$PLUGIN_DIR/tests/test-presets.py"
 /usr/bin/python3 "$PLUGIN_DIR/tests/test-ram-tetris.py"
@@ -733,6 +757,18 @@ substitute for the v0.4.22 safety protocol. Preserve the active preset,
 preference, failure latch, lifecycle service state, and any retained recovery
 evidence. Rollback does not start or stop the service, SDK, Quickshell, RAM
 Tetris, Effects, or a preset.
+
+## Roll back the 0.4.25 Tetris transition repair
+
+Redeploy exact published v0.4.24 commit
+`52522b3a596260c19483862a15d6aad1d6e72b3d`. Version 0.4.24 can start a
+replacement writer while `apply-preset` still owns a local stop marker and the
+writer singleton, discards the resulting child status, and retains the
+pre-suspend SDK identity after a successful replacement. Perform rollback only
+with RAM Tetris OFF, zero writer owners, a free writer lock, and the established
+healthy service, SDK, controller, SPD5118, Effects, and kernel-history gates.
+Preserve every failure latch and incident record; rollback does not authorize a
+service operation, preset write, Tetris activation, or evidence clearance.
 
 ## Remove
 

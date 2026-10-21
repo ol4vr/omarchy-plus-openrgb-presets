@@ -229,6 +229,19 @@ EXACT_FAILURES: Final = {
 PREFIX_FAILURES: Final = (
     (
         (
+            "RAM Tetris writer refused the singleton lock",
+            "RAM Tetris writer terminated by signal",
+            "RAM Tetris writer exited unexpectedly with status",
+        ),
+        FailureClass(
+            "LGT-TET-002",
+            "tetris",
+            "tetris",
+            "The RAM Tetris writer stopped unexpectedly.",
+        ),
+    ),
+    (
+        (
             "OpenRGB SDK",
             "OpenRGB listener",
             "OpenRGB closed",

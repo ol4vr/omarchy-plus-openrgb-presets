@@ -1,0 +1,326 @@
+#!/usr/bin/bash
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+readonly REPOSITORY_ROOT="$(/usr/bin/readlink -f "$(/usr/bin/dirname "${BASH_SOURCE[0]}")/..")"
+readonly TEST_ROOT="$(/usr/bin/mktemp -d)"
+readonly BIN_DIR="${TEST_ROOT}/bin"
+readonly START_LOG="${TEST_ROOT}/writer-starts"
+readonly FAILURE_LOG="${TEST_ROOT}/writer-failures"
+readonly IDENTITY_LOG="${TEST_ROOT}/service-identities"
+declare -a OWNED_PIDS=()
+
+test_cleanup() {
+  local pid
+  for pid in "${OWNED_PIDS[@]}"; do
+    kill -TERM "${pid}" 2>/dev/null || true
+  done
+  wait 2>/dev/null || true
+  /usr/bin/rm -rf -- "${TEST_ROOT}"
+}
+trap test_cleanup EXIT
+
+/usr/bin/mkdir -p \
+  "${BIN_DIR}" \
+  "${TEST_ROOT}/runtime" \
+  "${TEST_ROOT}/state/omarchy-plus/openrgb-presets"
+: >"${START_LOG}"
+: >"${FAILURE_LOG}"
+: >"${IDENTITY_LOG}"
+
+/usr/bin/printf '%s\n' \
+  '#!/usr/bin/bash' \
+  'set -o errexit' \
+  'case "${1:-}" in' \
+  '  run)' \
+  '    printf "%s\n" start >>"${FAKE_START_LOG}"' \
+  '    start="$(/usr/bin/awk '\''{print $22}'\'' "/proc/$$/stat")"' \
+  '    printf '\''{"message":"RAM Tetris writer owns singleton","pid":%s,"pid_start":"%s","state":"starting"}\n'\'' "$$" "${start}" >"${FAKE_STATUS_FILE}"' \
+  '    trap '\''exit 0'\'' TERM INT' \
+  '    while true; do /usr/bin/sleep 0.02; done' \
+  '    ;;' \
+  '  fail)' \
+  '    printf "%s\n" "${2}" >>"${FAKE_FAILURE_LOG}"' \
+  '    printf "%s\n" failed >"${FAKE_FAILURE_FILE}"' \
+  '    ;;' \
+  '  completed-local-stop)' \
+  '    shift' \
+  '    while (( $# )); do' \
+  '      case "$1" in --pid) pid="$2"; shift 2 ;; --start) start="$2"; shift 2 ;; *) exit 64 ;; esac' \
+  '    done' \
+  '    /usr/bin/python3 - "${FAKE_STATUS_FILE}" "${pid}" "${start}" <<'\''PY'\''' \
+  'import json' \
+  'import sys' \
+  'from pathlib import Path' \
+  'path = Path(sys.argv[1])' \
+  'if not path.exists():' \
+  '    raise SystemExit(1)' \
+  'value = json.loads(path.read_text(encoding="utf-8"))' \
+  'if value.get("pid") != int(sys.argv[2]) or value.get("pid_start") != sys.argv[3]:' \
+  '    raise SystemExit(1)' \
+  'if value.get("state") == "stopped" and value.get("message") == "RAM Tetris stopped for preset-change":' \
+  '    print("preset-change")' \
+  'elif value.get("state") == "off" and value.get("message") == "RAM Tetris off; static DDR5 restored":' \
+  '    print("user-off")' \
+  'else:' \
+  '    raise SystemExit(1)' \
+  'PY' \
+  '    ;;' \
+  '  writer-started)' \
+  '    shift' \
+  '    while (( $# )); do' \
+  '      case "$1" in --pid) pid="$2"; shift 2 ;; --start) start="$2"; shift 2 ;; *) exit 64 ;; esac' \
+  '    done' \
+  '    /usr/bin/python3 - "${FAKE_STATUS_FILE}" "${pid}" "${start}" <<'\''PY'\''' \
+  'import json' \
+  'import sys' \
+  'from pathlib import Path' \
+  'path = Path(sys.argv[1])' \
+  'if not path.exists():' \
+  '    raise SystemExit(1)' \
+  'value = json.loads(path.read_text(encoding="utf-8"))' \
+  'if value.get("pid") != int(sys.argv[2]) or value.get("pid_start") != sys.argv[3]:' \
+  '    raise SystemExit(1)' \
+  'raise SystemExit(0 if value.get("state") in {"starting", "running"} else 1)' \
+  'PY' \
+  '    ;;' \
+  '  *) exit 64 ;;' \
+  'esac' >"${BIN_DIR}/ram-tetris"
+/usr/bin/chmod 0755 "${BIN_DIR}/ram-tetris"
+
+/usr/bin/printf '%s\n' \
+  '#!/usr/bin/bash' \
+  'exit 0' >"${BIN_DIR}/systemd-notify"
+/usr/bin/chmod 0755 "${BIN_DIR}/systemd-notify"
+
+export XDG_STATE_HOME="${TEST_ROOT}/state"
+export OPENRGB_RUNTIME_DIR="${TEST_ROOT}/runtime"
+export RAM_TETRIS="${BIN_DIR}/ram-tetris"
+export SYSTEMD_NOTIFY_BIN="${BIN_DIR}/systemd-notify"
+export FAKE_START_LOG="${START_LOG}"
+export FAKE_FAILURE_LOG="${FAILURE_LOG}"
+export FAKE_FAILURE_FILE="${TEST_ROOT}/state/omarchy-plus/openrgb-presets/ram-tetris-failure.json"
+export FAKE_STOP_FILE="${TEST_ROOT}/runtime/ram-tetris.stop"
+export FAKE_STATUS_FILE="${TEST_ROOT}/runtime/ram-tetris-status.json"
+
+# shellcheck source=../openrgb-lifecycle
+source "${REPOSITORY_ROOT}/openrgb-lifecycle"
+
+is_server_listener() {
+  return 0
+}
+
+is_tetris_process() {
+  is_same_process "${1:-}" "${2:-}"
+}
+
+server_pid=4242
+server_start_time=server-start
+
+reset_case() {
+  if [[ -n "${tetris_pid}" ]] && is_same_process "${tetris_pid}" "${tetris_start_time}"; then
+    kill -TERM "${tetris_pid}" 2>/dev/null || true
+    wait "${tetris_pid}" 2>/dev/null || true
+  fi
+  clear_tetris_identity
+  /usr/bin/rm -f -- \
+    "${TETRIS_STOP_FILE}" \
+    "${TETRIS_FAILURE_FILE}" \
+    "${TETRIS_STATUS_FILE}"
+  : >"${START_LOG}"
+  : >"${FAILURE_LOG}"
+  /usr/bin/printf '%s\n' on >"${TETRIS_PREFERENCE_FILE}"
+  /usr/bin/printf '%s\n' electric-sunrise >"${ACTIVE_PRESET_FILE}"
+  suspended=false
+}
+
+write_local_stop() {
+  /usr/bin/printf '{"reason":"%s","time":1}\n' "${1}" >"${TETRIS_STOP_FILE}"
+}
+
+wait_until_exited() {
+  local pid="${1}"
+  local start="${2}"
+  local attempt
+  for attempt in {1..200}; do
+    process_has_exited "${pid}" "${start}" && return 0
+    /usr/bin/sleep 0.005
+  done
+  return 1
+}
+
+spawn_exit_writer() {
+  local status="${1}"
+  local stop_reason="${2:-}"
+  local gate="${TEST_ROOT}/release-${RANDOM}-${RANDOM}"
+  (
+    while [[ ! -e "${gate}" ]]; do /usr/bin/sleep 0.005; done
+    exit "${status}"
+  ) &
+  tetris_pid=$!
+  OWNED_PIDS+=("${tetris_pid}")
+  tetris_start_time="$(process_start_time "${tetris_pid}")"
+  if [[ "${stop_reason}" == preset-change ]]; then
+    /usr/bin/printf \
+      '{"message":"RAM Tetris stopped for preset-change","pid":%s,"pid_start":"%s","state":"stopped"}\n' \
+      "${tetris_pid}" "${tetris_start_time}" >"${TETRIS_STATUS_FILE}"
+  elif [[ "${stop_reason}" == user-off ]]; then
+    /usr/bin/printf \
+      '{"message":"RAM Tetris off; static DDR5 restored","pid":%s,"pid_start":"%s","state":"off"}\n' \
+      "${tetris_pid}" "${tetris_start_time}" >"${TETRIS_STATUS_FILE}"
+  fi
+  : >"${gate}"
+  wait_until_exited "${tetris_pid}" "${tetris_start_time}"
+}
+
+assert_no_start() {
+  [[ ! -s "${START_LOG}" ]]
+  [[ -z "${tetris_pid}" ]]
+}
+
+pass_count=0
+pass() {
+  pass_count=$((pass_count + 1))
+  /usr/bin/printf 'PASS: %s\n' "${1}"
+}
+
+# Reproduce the October 21 ordering: apply-preset owns its operation lock,
+# publishes preset-change, and owns the writer singleton while applying.
+reset_case
+write_local_stop preset-change
+exec {operation_fd}>"${PRESET_OPERATION_LOCK_FILE}"
+"${FLOCK_BIN}" "${operation_fd}"
+exec {writer_fd}>"${TETRIS_LOCK_FILE}"
+"${FLOCK_BIN}" "${writer_fd}"
+reconcile_tetris
+assert_no_start
+pass 'preset-change marker and held locks block replacement startup'
+
+# The old writer may exit while the transition remains active.  Its valid
+# local stop is normal, but the replacement must still not launch.
+spawn_exit_writer 0 preset-change
+reconcile_tetris
+assert_no_start
+[[ ! -e "${TETRIS_FAILURE_FILE}" ]]
+pass 'writer exit during preset transition does not start a replacement'
+
+# Completion removes the marker and releases both owners.  Repeated
+# reconciliation must construct exactly one replacement writer.
+"${FLOCK_BIN}" -u "${writer_fd}"
+close_fd "${writer_fd}"
+"${FLOCK_BIN}" -u "${operation_fd}"
+close_fd "${operation_fd}"
+/usr/bin/rm -- "${TETRIS_STOP_FILE}"
+reconcile_tetris
+reconcile_tetris
+[[ "$(/usr/bin/wc -l <"${START_LOG}")" -eq 1 ]]
+is_tetris_process "${tetris_pid}" "${tetris_start_time}"
+tetris_writer_started "${tetris_pid}" "${tetris_start_time}"
+exec {operation_probe_fd}>"${PRESET_OPERATION_LOCK_FILE}"
+"${FLOCK_BIN}" -n "${operation_probe_fd}"
+close_fd "${operation_probe_fd}"
+exec {write_probe_fd}>"${TETRIS_WRITE_LOCK_FILE}"
+"${FLOCK_BIN}" -n "${write_probe_fd}"
+close_fd "${write_probe_fd}"
+pass 'completed transition starts exactly one replacement writer'
+
+reset_case
+write_local_stop preset-change
+exec {operation_fd}>"${PRESET_OPERATION_LOCK_FILE}"
+"${FLOCK_BIN}" "${operation_fd}"
+spawn_exit_writer 0 preset-change
+/usr/bin/rm -- "${TETRIS_STOP_FILE}"
+"${FLOCK_BIN}" -u "${operation_fd}"
+close_fd "${operation_fd}"
+reconcile_tetris
+[[ ! -e "${TETRIS_FAILURE_FILE}" ]]
+[[ "$(/usr/bin/wc -l <"${START_LOG}")" -eq 1 ]]
+is_tetris_process "${tetris_pid}" "${tetris_start_time}"
+pass 'bound stop receipt survives marker removal between lifecycle polls'
+
+reset_case
+write_local_stop user-off
+reconcile_tetris
+assert_no_start
+pass 'user-off marker never starts a replacement writer'
+
+reset_case
+spawn_exit_writer 1
+reconcile_tetris
+[[ "$(<"${FAILURE_LOG}")" == *'exited unexpectedly with status 1'* ]]
+reconcile_tetris
+assert_no_start
+pass 'unexpected nonzero writer exit latches without automatic retry'
+
+reset_case
+/usr/bin/printf '%s\n' '{malformed' >"${TETRIS_STOP_FILE}"
+reconcile_tetris
+assert_no_start
+/usr/bin/rm -- "${TETRIS_STOP_FILE}"
+write_local_stop preset-change
+reconcile_tetris
+assert_no_start
+pass 'malformed or stale stop markers remain fail closed'
+
+reset_case
+spawn_exit_writer 75
+reconcile_tetris
+[[ "$(<"${FAILURE_LOG}")" == *'singleton lock (exit status 75)'* ]]
+pass 'writer exit status 75 is retained as lock-acquisition refusal'
+
+reset_case
+gate="${TEST_ROOT}/signal-gate"
+(
+  trap 'exit 143' TERM
+  : >"${gate}"
+  while true; do /usr/bin/sleep 0.02; done
+) &
+tetris_pid=$!
+OWNED_PIDS+=("${tetris_pid}")
+tetris_start_time="$(process_start_time "${tetris_pid}")"
+while [[ ! -e "${gate}" ]]; do /usr/bin/sleep 0.005; done
+kill -TERM "${tetris_pid}"
+wait_until_exited "${tetris_pid}" "${tetris_start_time}"
+reconcile_tetris
+[[ "$(<"${FAILURE_LOG}")" == *'terminated by signal 15 (wait status 143)'* ]]
+pass 'signal termination retains the observable wait status'
+
+# A successful post-resume health gate republishes the replacement SDK
+# identity even when systemd readiness was already established.  A failed gate
+# cannot publish an unverified replacement.
+reset_case
+/usr/bin/printf '%s\n' off >"${TETRIS_PREFERENCE_FILE}"
+service_mode=true
+service_ready=true
+server_pid=5252
+server_start_time=verified-resume-sdk
+inhibitor_pid=6262
+inhibitor_start_time=inhibitor-start
+monitor_pid=7272
+monitor_start_time=monitor-start
+health_ok=true
+validate_service_health() {
+  [[ "${health_ok}" == true ]]
+}
+mark_service_state() {
+  /usr/bin/printf '%s %s %s\n' "${1}" "${server_pid}" "${server_start_time}" >>"${IDENTITY_LOG}"
+}
+notify_service_ready
+[[ "$(<"${IDENTITY_LOG}")" == 'ready 5252 verified-resume-sdk' ]]
+server_pid=5353
+server_start_time=unverified-sdk
+health_ok=false
+if notify_service_ready; then
+  exit 1
+fi
+[[ "$(/usr/bin/wc -l <"${IDENTITY_LOG}")" -eq 1 ]]
+restore_completion="$(<"${REPOSITORY_ROOT}/openrgb-lifecycle")"
+restore_completion="${restore_completion#*while true; do}"
+[[ "${restore_completion}" == *'if ! notify_service_ready; then'* ]]
+[[ "${restore_completion}" != *'service_ready}" == false'* ]]
+pass 'verified resume identity is republished and unverified replacement is rejected'
+
+[[ "${pass_count}" -eq 10 ]]
+/usr/bin/printf 'Lifecycle Tetris reconciliation: PASS (%s process-level cases)\n' "${pass_count}"

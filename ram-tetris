@@ -765,7 +765,48 @@ class RuntimeControl:
     def status(self, state: str, message: str, **extra: object) -> None:
         _write_json(
             self.status_path,
-            {"state": state, "message": message, "pid": os.getpid(), **extra},
+            {
+                "state": state,
+                "message": message,
+                "pid": os.getpid(),
+                "pid_start": _process_start_token(os.getpid()),
+                **extra,
+            },
+        )
+
+    def completed_local_stop(self, pid: int, start_token: str) -> str | None:
+        try:
+            value = json.loads(self.status_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return None
+        if (
+            not isinstance(value, dict)
+            or value.get("pid") != pid
+            or value.get("pid_start") != start_token
+        ):
+            return None
+        if (
+            value.get("state") == "stopped"
+            and value.get("message") == "RAM Tetris stopped for preset-change"
+        ):
+            return "preset-change"
+        if (
+            value.get("state") == "off"
+            and value.get("message") == "RAM Tetris off; static DDR5 restored"
+        ):
+            return "user-off"
+        return None
+
+    def writer_started(self, pid: int, start_token: str) -> bool:
+        try:
+            value = json.loads(self.status_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return False
+        return bool(
+            isinstance(value, dict)
+            and value.get("pid") == pid
+            and value.get("pid_start") == start_token
+            and value.get("state") in {"starting", "running"}
         )
 
     def fail(self, message: str) -> None:
@@ -1095,8 +1136,14 @@ def _run(args: argparse.Namespace) -> int:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 75
-        if control.stop_reason() is not None:
-            return 75
+        try:
+            if control.stop_request() is not None:
+                return 76
+        except SafetyStop as error:
+            control.fail(str(error))
+            print(f"RAM Tetris refused startup: {error}", file=sys.stderr)
+            return 1
+        control.status("starting", "RAM Tetris writer owns singleton")
         sdk = OpenRGBSDK()
         writer: TetrisWriter | None = None
 
@@ -1274,6 +1321,12 @@ def build_parser() -> argparse.ArgumentParser:
     stop.add_argument("--lifecycle-pid", type=int)
     stop.add_argument("--lifecycle-start")
     actions.add_parser("clear-stop")
+    completed_stop = actions.add_parser("completed-local-stop")
+    completed_stop.add_argument("--pid", type=int, required=True)
+    completed_stop.add_argument("--start", required=True)
+    writer_started = actions.add_parser("writer-started")
+    writer_started.add_argument("--pid", type=int, required=True)
+    writer_started.add_argument("--start", required=True)
     clear_failure = actions.add_parser("clear-failure")
     clear_failure.add_argument(
         "--acknowledge-reviewed-recovery", action="store_true", required=True
@@ -1338,6 +1391,14 @@ def main() -> int:
         except FileNotFoundError:
             pass
         return 0
+    if args.action == "completed-local-stop":
+        reason = control.completed_local_stop(args.pid, args.start)
+        if reason is None:
+            return 1
+        print(reason)
+        return 0
+    if args.action == "writer-started":
+        return 0 if control.writer_started(args.pid, args.start) else 1
     if args.action == "clear-failure":
         raise SystemExit(
             "direct failure clearance is disabled; use the classified "

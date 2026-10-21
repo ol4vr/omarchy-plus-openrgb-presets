@@ -170,6 +170,18 @@ class LightingRecoveryTests(unittest.TestCase):
             "OpenRGB returned an invalid SDK packet": ("LGT-SDK-001", "sdk"),
             "Effects profile has no effects": ("LGT-EFX-001", "effects"),
             "RAM Tetris preference changed": ("LGT-TET-001", "tetris"),
+            "RAM Tetris writer refused the singleton lock (exit status 75); static restoration was not attempted": (
+                "LGT-TET-002",
+                "tetris",
+            ),
+            "RAM Tetris writer terminated by signal 15 (wait status 143); static restoration was not attempted": (
+                "LGT-TET-002",
+                "tetris",
+            ),
+            "RAM Tetris writer exited unexpectedly with status 1; static restoration was not attempted": (
+                "LGT-TET-002",
+                "tetris",
+            ),
             "lifecycle stop request identity does not match writer": (
                 "LGT-LIF-003",
                 "lifecycle",

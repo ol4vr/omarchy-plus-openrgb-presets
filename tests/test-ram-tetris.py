@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Focused offline validation for the v0.4.21 RAM Tetris integration."""
+"""Focused offline validation for the v0.4.25 RAM Tetris integration."""
 
 from __future__ import annotations
 
@@ -891,6 +891,8 @@ class RuntimeSafetyTests(unittest.TestCase):
                 ("enable",),
                 ("disable",),
                 ("request-stop", "user-off"),
+                ("completed-local-stop", "--pid", "1", "--start", "1"),
+                ("writer-started", "--pid", "1", "--start", "1"),
                 ("clear-stop",),
                 ("fail", "simulated communication failure"),
                 ("clear-failure", "--acknowledge-reviewed-recovery"),
@@ -910,7 +912,12 @@ class RuntimeSafetyTests(unittest.TestCase):
                 subprocess.run(
                     [entrypoint, *command],
                     env=env,
-                    check=command[0] != "clear-failure",
+                    check=command[0]
+                    not in {
+                        "clear-failure",
+                        "completed-local-stop",
+                        "writer-started",
+                    },
                     capture_output=True,
                     text=True,
                 )
@@ -951,6 +958,116 @@ class RuntimeSafetyTests(unittest.TestCase):
                     check=False,
                 )
             self.assertEqual(result.returncode, 75)
+
+    def test_valid_stop_marker_refuses_start_with_distinct_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory, "state/omarchy-plus/openrgb-presets")
+            runtime_root = Path(directory, "runtime/omarchy-plus/openrgb-presets")
+            state.mkdir(parents=True)
+            runtime_root.mkdir(parents=True)
+            (state / "active-preset").write_text("horde-red\n")
+            (state / "ram-tetris-enabled").write_text("on\n")
+            env = os.environ | {
+                "XDG_STATE_HOME": str(Path(directory, "state")),
+                "XDG_RUNTIME_DIR": str(Path(directory, "runtime")),
+            }
+            subprocess.run(
+                [ROOT / "ram-tetris", "request-stop", "preset-change"],
+                env=env,
+                check=True,
+            )
+            result = subprocess.run(
+                [
+                    ROOT / "ram-tetris",
+                    "run",
+                    "--server-pid",
+                    "1",
+                    "--server-start",
+                    "1",
+                    "--lifecycle-pid",
+                    "1",
+                    "--lifecycle-start",
+                    "1",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 76)
+            self.assertFalse((state / "ram-tetris-failure.json").exists())
+
+    def test_malformed_stop_marker_fails_closed_before_hardware(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory, "state/omarchy-plus/openrgb-presets")
+            runtime_root = Path(directory, "runtime/omarchy-plus/openrgb-presets")
+            state.mkdir(parents=True)
+            runtime_root.mkdir(parents=True)
+            (state / "active-preset").write_text("horde-red\n")
+            (state / "ram-tetris-enabled").write_text("on\n")
+            (runtime_root / "ram-tetris.stop").write_text("{malformed\n")
+            env = os.environ | {
+                "XDG_STATE_HOME": str(Path(directory, "state")),
+                "XDG_RUNTIME_DIR": str(Path(directory, "runtime")),
+            }
+            result = subprocess.run(
+                [
+                    ROOT / "ram-tetris",
+                    "run",
+                    "--server-pid",
+                    "1",
+                    "--server-start",
+                    "1",
+                    "--lifecycle-pid",
+                    "1",
+                    "--lifecycle-start",
+                    "1",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("stop request is unreadable", result.stderr)
+            failure = json.loads((state / "ram-tetris-failure.json").read_text())
+            self.assertEqual(
+                failure["message"], "RAM Tetris stop request is unreadable"
+            )
+
+    def test_completed_local_stop_receipt_is_bound_to_writer_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {
+                "XDG_STATE_HOME": str(Path(directory, "state")),
+                "XDG_RUNTIME_DIR": str(Path(directory, "runtime")),
+            }
+            with (
+                mock.patch.dict(os.environ, environment, clear=False),
+                mock.patch.object(
+                    runtime, "_process_start_token", return_value="writer-start"
+                ),
+            ):
+                control = runtime.RuntimeControl()
+                control.status("starting", "RAM Tetris writer owns singleton")
+                self.assertTrue(control.writer_started(os.getpid(), "writer-start"))
+                self.assertFalse(control.writer_started(os.getpid(), "changed-start"))
+                control.status(
+                    "stopped",
+                    "RAM Tetris stopped for preset-change",
+                    preset="electric-sunrise",
+                    writes=4,
+                )
+                self.assertEqual(
+                    control.completed_local_stop(os.getpid(), "writer-start"),
+                    "preset-change",
+                )
+                self.assertIsNone(
+                    control.completed_local_stop(os.getpid(), "changed-start")
+                )
+                self.assertIsNone(
+                    control.completed_local_stop(os.getpid() + 1, "writer-start")
+                )
+                self.assertFalse(control.writer_started(os.getpid(), "writer-start"))
 
     def test_lifecycle_stop_cli_requires_bound_process_identities(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1560,7 +1677,8 @@ class IntegrationSourceTests(unittest.TestCase):
         reconcile = lifecycle.split("reconcile_tetris() {", 1)[1].split(
             "expected_server_command() {", 1
         )[0]
-        self.assertIn("! tetris_local_stop_requested", reconcile)
+        self.assertIn("process_has_exited", reconcile)
+        self.assertIn("record_tetris_exit_failure", reconcile)
         self.assertNotIn('"state": "running"', reconcile)
 
     def test_unexpected_sdk_or_inhibitor_loss_has_no_recovery_branch(self):
@@ -1597,11 +1715,16 @@ class IntegrationSourceTests(unittest.TestCase):
             "stop_tetris() {", 1
         )[0]
         self.assertNotIn("clear-stop", start_function)
+        self.assertIn('"${PRESET_OPERATION_LOCK_FILE}"', start_function)
+        locked_start = lifecycle.split("start_tetris_locked() {", 1)[1].split(
+            "start_tetris() {", 1
+        )[0]
+        self.assertIn('[[ ! -e "${TETRIS_STOP_FILE}" ]] || return 0', locked_start)
         self.assertIn(
-            "if control.stop_reason() is not None:\n            return 75", runner
+            "if control.stop_request() is not None:\n                return 76", runner
         )
         black_gate = '[[ "$(tetris_selected_preset)" != black ]] || return 0'
-        self.assertIn(black_gate, start_function)
+        self.assertIn(black_gate, locked_start)
 
     def test_effect_profiles_still_have_only_six_non_ddr_assignments(self):
         for profile in (ROOT / "effects-profiles").iterdir():

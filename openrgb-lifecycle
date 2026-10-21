@@ -33,6 +33,7 @@ readonly LIFECYCLE_LOCK_FILE="${RUNTIME_DIR}/lifecycle.lock"
 readonly SERVER_LOG_FILE="${OPENRGB_SERVER_LOG:-${RUNTIME_DIR}/openrgb-server.log}"
 readonly TETRIS_LOG_FILE="${OPENRGB_TETRIS_LOG:-${RUNTIME_DIR}/ram-tetris.log}"
 readonly STATE_ROOT="${XDG_STATE_HOME:-${HOME}/.local/state}/omarchy-plus/openrgb-presets"
+readonly PRESET_OPERATION_LOCK_FILE="${STATE_ROOT}/apply.flock"
 readonly TETRIS_PREFERENCE_FILE="${STATE_ROOT}/ram-tetris-enabled"
 readonly ACTIVE_PRESET_FILE="${STATE_ROOT}/active-preset"
 readonly TETRIS_FAILURE_FILE="${STATE_ROOT}/ram-tetris-failure.json"
@@ -70,6 +71,7 @@ shutting_down=false
 service_mode=false
 service_ready=false
 shutdown_deadline=0
+wait_exit_status=''
 
 log() {
   /usr/bin/printf '%s\n' "$*"
@@ -151,14 +153,16 @@ wait_for_process_exit() {
 
   for ((attempt = 0; attempt < attempts; attempt++)); do
     if process_has_exited "${pid}" "${expected_start}"; then
-      wait "${pid}" 2>/dev/null || true
+      wait_exit_status=0
+      wait "${pid}" 2>/dev/null || wait_exit_status=$?
       return 0
     fi
     shutdown_time_available || return 1
     "${SLEEP_BIN}" "${delay}"
   done
   if process_has_exited "${pid}" "${expected_start}"; then
-    wait "${pid}" 2>/dev/null || true
+    wait_exit_status=0
+    wait "${pid}" 2>/dev/null || wait_exit_status=$?
     return 0
   fi
   return 1
@@ -422,17 +426,61 @@ clear_tetris_identity() {
   tetris_start_time=''
 }
 
-tetris_local_stop_requested() {
-  [[ -r "${TETRIS_STOP_FILE}" ]] \
-    && /usr/bin/grep -Eq \
-      '"reason"[[:space:]]*:[[:space:]]*"(user-off|preset-change)"' \
-      "${TETRIS_STOP_FILE}"
+tetris_completed_local_stop() {
+  local pid="${1}"
+  local start_time="${2}"
+  local reason=''
+
+  reason="$("${RAM_TETRIS}" completed-local-stop \
+    --pid "${pid}" --start "${start_time}" 2>/dev/null || true)"
+  [[ "${reason}" == @(user-off|preset-change) ]]
 }
 
-start_tetris() {
+tetris_writer_started() {
+  local pid="${1}"
+  local start_time="${2}"
+
+  "${RAM_TETRIS}" writer-started \
+    --pid "${pid}" --start "${start_time}" >/dev/null 2>&1
+}
+
+record_tetris_exit_failure() {
+  local status="${1}"
+  local message=''
+  local signal_number=''
+
+  if [[ "${status}" -eq 0 ]]; then
+    message='RAM Tetris writer exited unexpectedly; static restoration was not attempted'
+  elif [[ "${status}" -eq 75 ]]; then
+    message='RAM Tetris writer refused the singleton lock (exit status 75); static restoration was not attempted'
+  elif [[ "${status}" -gt 128 ]]; then
+    signal_number=$((status - 128))
+    message="RAM Tetris writer terminated by signal ${signal_number} (wait status ${status}); static restoration was not attempted"
+  else
+    message="RAM Tetris writer exited unexpectedly with status ${status}; static restoration was not attempted"
+  fi
+  log "${message}"
+  if [[ ! -e "${TETRIS_FAILURE_FILE}" ]]; then
+    "${RAM_TETRIS}" fail "${message}" >/dev/null 2>&1 || true
+  fi
+}
+
+reap_tetris() {
+  wait_exit_status=0
+  wait "${tetris_pid}" 2>/dev/null || wait_exit_status=$?
+  clear_tetris_identity
+}
+
+start_tetris_locked() {
   local attempt
+  local exited_pid=''
+  local exited_start_time=''
   local lifecycle_start=''
 
+  # Any marker, including one that is malformed or left behind by an
+  # interrupted operation, blocks startup.  Only the owning operation may
+  # remove it; ambiguous state remains fail closed.
+  [[ ! -e "${TETRIS_STOP_FILE}" ]] || return 0
   [[ "${suspended}" == false ]] || return 0
   tetris_preference_enabled || return 0
   [[ "$(tetris_selected_preset)" != black ]] || return 0
@@ -445,6 +493,8 @@ start_tetris() {
   lifecycle_start="$(process_start_time $$)"
   (
     close_lock_for_child
+    close_fd "${operation_lock_fd}"
+    close_fd "${start_write_lock_fd}"
     exec "${SETPRIV_BIN}" --pdeathsig TERM "${RAM_TETRIS}" run \
       --server-pid "${server_pid}" \
       --server-start "${server_start_time}" \
@@ -455,7 +505,8 @@ start_tetris() {
   tetris_start_time=''
   for attempt in {1..20}; do
     tetris_start_time="$(process_start_time "${tetris_pid}" 2>/dev/null || true)"
-    if is_tetris_process "${tetris_pid}" "${tetris_start_time}"; then
+    if is_tetris_process "${tetris_pid}" "${tetris_start_time}" \
+      && tetris_writer_started "${tetris_pid}" "${tetris_start_time}"; then
       log "RAM Tetris started as PID ${tetris_pid} (start ${tetris_start_time})"
       return 0
     fi
@@ -465,16 +516,54 @@ start_tetris() {
     "${SLEEP_BIN}" 0.05
   done
   if process_has_exited "${tetris_pid}" "${tetris_start_time}"; then
-    wait "${tetris_pid}" 2>/dev/null || true
+    exited_pid="${tetris_pid}"
+    exited_start_time="${tetris_start_time}"
+    reap_tetris
+    if [[ "${wait_exit_status}" -eq 0 ]] \
+      && tetris_completed_local_stop "${exited_pid}" "${exited_start_time}"; then
+      log 'RAM Tetris completed a valid local stop before startup confirmation'
+    else
+      record_tetris_exit_failure "${wait_exit_status}"
+    fi
   else
     log "Refusing to wait without a verified RAM Tetris child identity"
+    clear_tetris_identity
   fi
-  clear_tetris_identity
   return 1
+}
+
+start_tetris() {
+  local operation_lock_fd=''
+  local start_write_lock_fd=''
+  local old_umask=''
+  local result=0
+
+  old_umask="$(umask)"
+  umask 077
+  exec {operation_lock_fd}>"${PRESET_OPERATION_LOCK_FILE}"
+  umask "${old_umask}"
+  if ! "${FLOCK_BIN}" -n "${operation_lock_fd}"; then
+    close_fd "${operation_lock_fd}"
+    return 0
+  fi
+  old_umask="$(umask)"
+  umask 077
+  exec {start_write_lock_fd}>"${TETRIS_WRITE_LOCK_FILE}"
+  umask "${old_umask}"
+  if ! "${FLOCK_BIN}" -n "${start_write_lock_fd}"; then
+    close_fd "${start_write_lock_fd}"
+    close_fd "${operation_lock_fd}"
+    return 0
+  fi
+  start_tetris_locked || result=$?
+  close_fd "${start_write_lock_fd}"
+  close_fd "${operation_lock_fd}"
+  return "${result}"
 }
 
 stop_tetris() {
   local reason="${1:-handoff}"
+  local exit_status=''
   local lifecycle_start=''
   local stop_lock_fd=''
   local stop_temp=''
@@ -531,13 +620,25 @@ stop_tetris() {
   fi
 
   if wait_for_process_exit "${tetris_pid}" "${tetris_start_time}" 100 0.05; then
+    exit_status="${wait_exit_status}"
     clear_tetris_identity
+    if [[ "${exit_status}" -ne 0 ]]; then
+      record_tetris_exit_failure "${exit_status}"
+      return 1
+    fi
+    log "RAM Tetris completed authenticated ${reason} stop"
     return 0
   fi
   if is_tetris_process "${tetris_pid}" "${tetris_start_time}"; then
     kill -TERM "${tetris_pid}" 2>/dev/null || true
     if ! wait_for_process_exit "${tetris_pid}" "${tetris_start_time}" 20 0.1; then
       log "RAM Tetris did not exit before the lifecycle shutdown deadline"
+      return 1
+    fi
+    exit_status="${wait_exit_status}"
+    if [[ "${exit_status}" -ne 0 ]]; then
+      clear_tetris_identity
+      record_tetris_exit_failure "${exit_status}"
       return 1
     fi
   else
@@ -548,12 +649,21 @@ stop_tetris() {
 }
 
 reconcile_tetris() {
-  if [[ -n "${tetris_pid}" ]] && ! is_same_process "${tetris_pid}" "${tetris_start_time}"; then
-    wait "${tetris_pid}" 2>/dev/null || true
-    clear_tetris_identity
-    if [[ ! -e "${TETRIS_FAILURE_FILE}" ]] \
-      && ! tetris_local_stop_requested; then
-      "${RAM_TETRIS}" fail 'RAM Tetris writer exited unexpectedly; static restoration was not attempted' >/dev/null 2>&1 || true
+  local exited_pid=''
+  local exited_start_time=''
+  local exit_status=''
+
+  if [[ -n "${tetris_pid}" ]] \
+    && process_has_exited "${tetris_pid}" "${tetris_start_time}"; then
+    exited_pid="${tetris_pid}"
+    exited_start_time="${tetris_start_time}"
+    reap_tetris
+    exit_status="${wait_exit_status}"
+    if [[ "${exit_status}" -eq 0 ]] \
+      && tetris_completed_local_stop "${exited_pid}" "${exited_start_time}"; then
+      log 'RAM Tetris completed a valid local stop'
+    else
+      record_tetris_exit_failure "${exit_status}"
     fi
   fi
   if ! tetris_preference_enabled; then
@@ -905,7 +1015,7 @@ validate_service_health() {
 
 notify_service_ready() {
   [[ "${service_mode}" == true ]] || return 0
-  validate_service_health
+  validate_service_health || return 1
   if tetris_preference_enabled \
     && [[ "$(tetris_selected_preset)" != black ]] \
     && [[ ! -e "${TETRIS_FAILURE_FILE}" ]]; then
@@ -1090,15 +1200,13 @@ main() {
           /usr/bin/printf '%s\n' 'RAM Tetris reconciliation failed during lifecycle startup' >&2
           return 1
         fi
-        if [[ "${service_ready}" == false ]] && ! notify_service_ready; then
+        if ! notify_service_ready; then
           /usr/bin/printf '%s\n' 'Independent lifecycle health validation failed' >&2
           return 1
         fi
       else
         "${RAM_TETRIS}" fail 'Saved preset restoration failed; RAM Tetris was not started' >/dev/null 2>&1 || true
-        if [[ "${service_ready}" == false ]]; then
-          return 1
-        fi
+        return 1
       fi
       restore_pid=''
       restore_start_time=''
