@@ -160,6 +160,45 @@ class LightingRecoveryTests(unittest.TestCase):
             path.chmod(0o600)
         return failure_raw, boundary_raw, self.config_raw, current_raw
 
+    def write_reviewed_software_race_records(self) -> tuple[bytes, bytes]:
+        failure_raw = (
+            b'{"message": "RAM Tetris writer exited unexpectedly; static restoration '
+            b'was not attempted", "pid": 1174336, "state": "failed", '
+            b'"time": 1792561532.70337}\n'
+        )
+        current_raw = (
+            json.dumps(
+                {
+                    "boot_id": "boot-a",
+                    "lifecycle_pid": 51,
+                    "lifecycle_start": "5100",
+                    "reason": recovery.HISTORICAL_READY_REASON,
+                    "server_pid": 52,
+                    "server_start": "5200",
+                    "state": "ready",
+                    "time": 1_792_580_872.6454194,
+                },
+                sort_keys=True,
+            ).encode()
+            + b"\n"
+        )
+        self.failure.parent.mkdir(parents=True, exist_ok=True)
+        self.failure.parent.chmod(0o700)
+        for path, raw in (
+            (self.failure, failure_raw),
+            (self.lifecycle_state, current_raw),
+            (self.failure.parent / "ram-tetris-enabled", b"off\n"),
+        ):
+            path.write_bytes(raw)
+            path.chmod(0o600)
+        self.assertEqual(
+            hashlib.sha256(failure_raw).hexdigest(),
+            recovery.REVIEWED_SOFTWARE_RACE_ALLOWLIST[
+                "LR-3903E50F10DAA4FD"
+            ].latch_sha256,
+        )
+        return failure_raw, current_raw
+
     def test_stable_code_mapping_and_subsystems(self):
         cases = {
             "writer termination was not preceded by an authenticated lifecycle stop request": (
@@ -1166,6 +1205,384 @@ class LightingRecoveryTests(unittest.TestCase):
                     recovery.HISTORICAL_CLEARANCE_REFERENCE,
                     recovery.HISTORICAL_CLEARANCE_LATCH_SHA256,
                     recovery.HISTORICAL_CLEARANCE_REASON,
+                )
+        finally:
+            os.close(descriptor)
+        self.assertEqual(self.failure.read_bytes(), failure_raw)
+
+    def test_reviewed_software_race_cli_requires_explicit_acknowledgement(self):
+        reviewed = recovery.REVIEWED_SOFTWARE_RACE_ALLOWLIST[
+            "LR-3903E50F10DAA4FD"
+        ]
+        arguments = [
+            "clear-reviewed-software-race",
+            "--incident-reference",
+            reviewed.incident_reference,
+            "--latch-sha256",
+            reviewed.latch_sha256,
+            "--error-code",
+            reviewed.code,
+            "--original-reason",
+            reviewed.original_reason,
+        ]
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            recovery.build_parser().parse_args(arguments)
+        parsed = recovery.build_parser().parse_args(
+            arguments + ["--acknowledge-reviewed-software-race"]
+        )
+        self.assertEqual(parsed.action, "clear-reviewed-software-race")
+        self.assertTrue(parsed.acknowledge_reviewed_software_race)
+
+    def test_reviewed_software_race_accepts_only_exact_allowlisted_binding(self):
+        reviewed = recovery.REVIEWED_SOFTWARE_RACE_ALLOWLIST[
+            "LR-3903E50F10DAA4FD"
+        ]
+        self.assertEqual(
+            recovery._reviewed_software_race_authorization(
+                reviewed.incident_reference,
+                reviewed.latch_sha256,
+                reviewed.code,
+                reviewed.original_reason,
+            ),
+            reviewed,
+        )
+        cases = (
+            ("LR-WRONG", reviewed.latch_sha256, reviewed.code, reviewed.original_reason),
+            (
+                reviewed.incident_reference,
+                "0" * 64,
+                reviewed.code,
+                reviewed.original_reason,
+            ),
+            (
+                reviewed.incident_reference,
+                reviewed.latch_sha256,
+                "LGT-TET-001",
+                reviewed.original_reason,
+            ),
+            (
+                reviewed.incident_reference,
+                reviewed.latch_sha256,
+                reviewed.code,
+                "different reason",
+            ),
+        )
+        for reference, checksum, code, reason in cases:
+            with (
+                self.subTest(reference=reference, checksum=checksum, code=code),
+                self.assertRaisesRegex(recovery.RecoveryBlocked, "allowlisted"),
+            ):
+                recovery._reviewed_software_race_authorization(
+                    reference, checksum, code, reason
+                )
+        self.assertFalse(
+            recovery.classify_reason(reviewed.original_reason).reviewed_recovery
+        )
+        self.assertNotIn(reviewed.original_reason, recovery.ELIGIBLE_REASONS)
+
+    def test_reviewed_software_race_requires_corrected_source_ancestry(self):
+        reviewed = recovery.REVIEWED_SOFTWARE_RACE_ALLOWLIST[
+            "LR-3903E50F10DAA4FD"
+        ]
+        commands = (
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "a" * 40 + "\n", ""),
+            subprocess.CompletedProcess([], 1, "", "not an ancestor"),
+        )
+        with (
+            mock.patch.object(recovery.subprocess, "run", side_effect=commands),
+            self.assertRaisesRegex(
+                recovery.RecoveryBlocked, "does not contain the reviewed"
+            ),
+        ):
+            recovery._verify_corrected_source_revision(
+                reviewed.minimum_corrected_source
+            )
+
+    def test_reviewed_software_race_preflight_binds_runtime_and_evidence(self):
+        failure_raw, current_raw = self.write_reviewed_software_race_records()
+        reviewed = recovery.REVIEWED_SOFTWARE_RACE_ALLOWLIST[
+            "LR-3903E50F10DAA4FD"
+        ]
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery, "_verify_corrected_source_revision", return_value="a" * 40
+            ),
+            mock.patch.object(
+                recovery, "_detector_policy_is_reviewed", return_value=self.config_raw
+            ),
+            mock.patch.object(
+                recovery, "_verify_historical_running_environment"
+            ) as runtime_verify,
+            mock.patch.object(recovery, "_verify_service_and_hardware") as health,
+        ):
+            binding = recovery._software_race_clearance_preflight(
+                reviewed.incident_reference,
+                reviewed.latch_sha256,
+                reviewed.code,
+                reviewed.original_reason,
+            )
+        self.assertEqual(
+            binding,
+            recovery.SoftwareRaceClearanceBinding(
+                failure_raw,
+                current_raw,
+                self.config_raw,
+                1_792_561_532.70337,
+                "a" * 40,
+            ),
+        )
+        runtime_verify.assert_called_once()
+        health.assert_called_once_with(1_792_561_532.70337)
+
+    def test_reviewed_software_race_propagates_runtime_health_failures(self):
+        reviewed = recovery.REVIEWED_SOFTWARE_RACE_ALLOWLIST[
+            "LR-3903E50F10DAA4FD"
+        ]
+        cases = (
+            ("runtime", "a RAM Tetris writer is active"),
+            ("runtime", "lifecycle or SDK ownership is ambiguous"),
+            ("health", "accepted controller inventory is incomplete"),
+            ("health", "four SPD5118 endpoints were not verified"),
+            ("health", "relevant kernel communication errors exist"),
+        )
+        for verifier, message in cases:
+            with self.subTest(verifier=verifier, message=message):
+                failure_raw, _ = self.write_reviewed_software_race_records()
+                runtime_effect = (
+                    recovery.RecoveryBlocked(message) if verifier == "runtime" else None
+                )
+                health_effect = (
+                    recovery.RecoveryBlocked(message) if verifier == "health" else None
+                )
+                with (
+                    self.patched_environment(),
+                    mock.patch.object(
+                        recovery,
+                        "_verify_corrected_source_revision",
+                        return_value="a" * 40,
+                    ),
+                    mock.patch.object(
+                        recovery,
+                        "_detector_policy_is_reviewed",
+                        return_value=self.config_raw,
+                    ),
+                    mock.patch.object(
+                        recovery,
+                        "_verify_historical_running_environment",
+                        side_effect=runtime_effect,
+                    ),
+                    mock.patch.object(
+                        recovery,
+                        "_verify_service_and_hardware",
+                        side_effect=health_effect,
+                    ),
+                    self.assertRaisesRegex(recovery.RecoveryBlocked, message),
+                ):
+                    recovery._software_race_clearance_preflight(
+                        reviewed.incident_reference,
+                        reviewed.latch_sha256,
+                        reviewed.code,
+                        reviewed.original_reason,
+                    )
+                self.assertEqual(self.failure.read_bytes(), failure_raw)
+
+    def test_reviewed_software_race_clearance_is_read_only_except_evidence_and_latch(self):
+        failure_raw, current_raw = self.write_reviewed_software_race_records()
+        reviewed = recovery.REVIEWED_SOFTWARE_RACE_ALLOWLIST[
+            "LR-3903E50F10DAA4FD"
+        ]
+        binding = recovery.SoftwareRaceClearanceBinding(
+            failure_raw,
+            current_raw,
+            self.config_raw,
+            1_792_561_532.70337,
+            "a" * 40,
+        )
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery,
+                "_software_race_clearance_preflight",
+                return_value=binding,
+            ) as preflight,
+            mock.patch.object(
+                recovery, "_verify_software_race_continuity"
+            ) as continuity,
+            mock.patch.object(
+                recovery.subprocess,
+                "run",
+                side_effect=AssertionError("no service or RGB operation is permitted"),
+            ),
+        ):
+            result = recovery.clear_reviewed_software_race(
+                reviewed.incident_reference,
+                reviewed.latch_sha256,
+                reviewed.code,
+                reviewed.original_reason,
+            )
+        self.assertEqual(
+            result,
+            {
+                "failure": False,
+                "incident_reference": reviewed.incident_reference,
+                "message": (
+                    "Reviewed software-race latch cleared. RAM Tetris remains OFF."
+                ),
+                "preference": False,
+                "state": "off",
+            },
+        )
+        self.assertEqual(preflight.call_count, 2)
+        continuity.assert_called_once_with(reviewed, binding)
+        self.assertFalse(self.failure.exists())
+        self.assertEqual(
+            (self.failure.parent / "ram-tetris-enabled").read_bytes(), b"off\n"
+        )
+        evidence = self.failure.parent / "recovery-evidence"
+        for kind, raw in (
+            ("failure", failure_raw),
+            ("lifecycle-state", current_raw),
+            ("openrgb-config", self.config_raw),
+        ):
+            path = evidence / f"{reviewed.incident_reference}.{kind}.json"
+            self.assertEqual(path.read_bytes(), raw)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_reviewed_software_race_rejects_altered_or_unwritable_evidence(self):
+        for case in ("altered", "changed-after-review", "write-failure"):
+            with self.subTest(case=case):
+                failure_raw, current_raw = self.write_reviewed_software_race_records()
+                reviewed = recovery.REVIEWED_SOFTWARE_RACE_ALLOWLIST[
+                    "LR-3903E50F10DAA4FD"
+                ]
+                binding = recovery.SoftwareRaceClearanceBinding(
+                    failure_raw,
+                    current_raw,
+                    self.config_raw,
+                    1_792_561_532.70337,
+                    "a" * 40,
+                )
+                evidence = self.failure.parent / "recovery-evidence"
+                evidence.mkdir(exist_ok=True)
+                evidence.chmod(0o700)
+                preflight = mock.patch.object(
+                    recovery,
+                    "_software_race_clearance_preflight",
+                    return_value=binding,
+                )
+                if case == "altered":
+                    target = evidence / f"{reviewed.incident_reference}.failure.json"
+                    target.write_bytes(b"altered\n")
+                    target.chmod(0o600)
+                    preserve = mock.patch.object(
+                        recovery, "_preserve_evidence", wraps=recovery._preserve_evidence
+                    )
+                elif case == "changed-after-review":
+                    calls = 0
+
+                    def review(
+                        *_args,
+                        evidence=evidence,
+                        reviewed=reviewed,
+                        binding=binding,
+                    ):
+                        nonlocal calls
+                        calls += 1
+                        if calls == 2:
+                            target = (
+                                evidence
+                                / f"{reviewed.incident_reference}.failure.json"
+                            )
+                            target.write_bytes(b"altered after review\n")
+                        return binding
+
+                    preflight = mock.patch.object(
+                        recovery,
+                        "_software_race_clearance_preflight",
+                        side_effect=review,
+                    )
+                    preserve = mock.patch.object(
+                        recovery, "_preserve_evidence", wraps=recovery._preserve_evidence
+                    )
+                else:
+                    preserve = mock.patch.object(
+                        recovery,
+                        "_preserve_evidence",
+                        side_effect=OSError("evidence write failed"),
+                    )
+                with (
+                    self.patched_environment(),
+                    preflight,
+                    preserve,
+                    self.assertRaises((recovery.RecoveryBlocked, OSError)),
+                ):
+                    recovery.clear_reviewed_software_race(
+                        reviewed.incident_reference,
+                        reviewed.latch_sha256,
+                        reviewed.code,
+                        reviewed.original_reason,
+                    )
+                self.assertEqual(self.failure.read_bytes(), failure_raw)
+
+    def test_reviewed_software_race_detects_latch_change_before_unlink(self):
+        failure_raw, current_raw = self.write_reviewed_software_race_records()
+        reviewed = recovery.REVIEWED_SOFTWARE_RACE_ALLOWLIST[
+            "LR-3903E50F10DAA4FD"
+        ]
+        binding = recovery.SoftwareRaceClearanceBinding(
+            failure_raw,
+            current_raw,
+            self.config_raw,
+            1_792_561_532.70337,
+            "a" * 40,
+        )
+        calls = 0
+
+        def preflight(*_args):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                self.failure.write_bytes(failure_raw + b"changed")
+            return binding
+
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery, "_software_race_clearance_preflight", side_effect=preflight
+            ),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "changed before clearance"),
+        ):
+            recovery.clear_reviewed_software_race(
+                reviewed.incident_reference,
+                reviewed.latch_sha256,
+                reviewed.code,
+                reviewed.original_reason,
+            )
+        self.assertTrue(self.failure.exists())
+
+    def test_concurrent_reviewed_software_race_clearance_is_blocked(self):
+        failure_raw, _ = self.write_reviewed_software_race_records()
+        reviewed = recovery.REVIEWED_SOFTWARE_RACE_ALLOWLIST[
+            "LR-3903E50F10DAA4FD"
+        ]
+        self.runtime.mkdir(parents=True)
+        self.runtime.chmod(0o700)
+        descriptor = os.open(
+            self.runtime / "lighting-recovery.lock", os.O_WRONLY | os.O_CREAT, 0o600
+        )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with (
+                self.patched_environment(),
+                self.assertRaisesRegex(recovery.RecoveryBlocked, "another recovery"),
+            ):
+                recovery.clear_reviewed_software_race(
+                    reviewed.incident_reference,
+                    reviewed.latch_sha256,
+                    reviewed.code,
+                    reviewed.original_reason,
                 )
         finally:
             os.close(descriptor)

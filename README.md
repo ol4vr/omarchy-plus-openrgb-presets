@@ -204,7 +204,7 @@ Stable diagnostic mappings are:
 | `LGT-EFX-002` | preset application failed after Tetris quiesced | Effects | blocked |
 | `LGT-EFX-003` | saved preset restoration failed | Effects | blocked |
 | `LGT-TET-001` | unreviewed Tetris writer/control failure | Tetris | blocked |
-| `LGT-TET-002` | writer exited unexpectedly | Tetris | blocked |
+| `LGT-TET-002` | writer exited unexpectedly | Tetris | blocked; source-reviewed administrative clearance only |
 | `LGT-TET-003` | writer failed to quiesce | Tetris | blocked |
 | `LGT-TET-101` | reviewed legacy lifecycle-count false positive | Tetris | health-gated explicit action |
 | `LGT-TET-102` | reviewed legacy Spectrum Effects-name false positive | Tetris | health-gated explicit action |
@@ -269,6 +269,40 @@ replacement SDK identity even when the unit was already ready. A failed resume
 restore or health gate exits fail closed instead of leaving the pre-suspend SDK
 identity recorded as current. Presets, palettes, Effects assignments, service
 ownership, recovery eligibility, and hardware health gates are unchanged.
+
+Version 0.4.26 adds a reusable but fail-closed administrative clearance for
+source-reviewed software races. `clear-reviewed-software-race` does not expand
+the normal Recover action: eligibility comes only from a source-controlled
+allowlist, whose first and only entry binds `LR-3903E50F10DAA4FD` to its exact
+`LGT-TET-002` reason, full latch checksum, and the v0.4.25 correction commit
+`749c85b00f095a232908736c31c3df945ddb5b55`. The installed checkout must be
+clean and contain that revision.
+
+The command takes the existing recovery singleton, requires Tetris OFF with no
+writer or write-lock owner, and verifies the healthy service, lifecycle, SDK,
+listener, inhibitor, monitor, cgroup, seven controllers, four SPD5118 sensors,
+Effects assignment, detector policy, and kernel history. It preserves private
+byte-identical failure, lifecycle, and OpenRGB-configuration evidence, repeats
+all authorization and health checks, and unlinks only the unchanged protected
+latch with a parent-directory fsync. A final health pass requires the same
+source, lifecycle, SDK, and configuration identities and returns normal OFF
+state. It never starts or restarts a service, selects a preset, writes RGB
+data, or activates Tetris. Every incident absent from the allowlist is refused.
+
+The reviewed command requires all explicit bindings:
+
+```bash
+~/.config/omarchy/plugins/io.github.ol4vr.openrgb-presets/lighting-recovery \
+  clear-reviewed-software-race \
+  --incident-reference LR-3903E50F10DAA4FD \
+  --latch-sha256 3903e50f10daa4fd45eed42c4953a476708107874dc447fd69a30352812b6f24 \
+  --error-code LGT-TET-002 \
+  --original-reason 'RAM Tetris writer exited unexpectedly; static restoration was not attempted' \
+  --acknowledge-reviewed-software-race
+```
+
+This is an administrative command, not a general failure-latch override. A
+future reviewed software race requires a new source entry and release.
 
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
@@ -769,6 +803,15 @@ with RAM Tetris OFF, zero writer owners, a free writer lock, and the established
 healthy service, SDK, controller, SPD5118, Effects, and kernel-history gates.
 Preserve every failure latch and incident record; rollback does not authorize a
 service operation, preset write, Tetris activation, or evidence clearance.
+
+## Roll back the 0.4.26 reviewed software-race clearance
+
+Redeploy exact published v0.4.25 commit
+`749c85b00f095a232908736c31c3df945ddb5b55`. This removes only the reviewed
+software-race administrative subcommand and its source allowlist. Preserve the
+failure latch and every retained evidence file. Rollback does not authorize a
+service operation, preset write, Tetris activation, evidence removal, or use of
+the general Recover action for `LGT-TET-002`.
 
 ## Remove
 

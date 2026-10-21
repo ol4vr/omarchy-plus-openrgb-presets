@@ -8,9 +8,9 @@ leaves the preference OFF. Lifecycle recovery may acknowledge the reviewed
 boundary and start the user service exactly once; no path restarts a service,
 starts a writer or effect, or selects a preset.
 
-The clear-resolved-lifecycle administrative path is separately hard-bound to
-one already-recovered historical incident. It performs no service operation;
-it only removes the unchanged latch after two complete healthy-state reviews.
+The administrative clearance paths are separately bound to source-reviewed
+incidents. They perform no service operation; they only remove an unchanged
+latch after two complete healthy-state reviews and protected evidence capture.
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ SERVICE_GUARD: Final = Path(
     os.environ.get("OPENRGB_SERVICE_GUARD", ROOT / "openrgb-service-guard")
 )
 SYSTEMCTL: Final = os.environ.get("SYSTEMCTL_BIN", "/usr/bin/systemctl")
+GIT: Final = os.environ.get("GIT_BIN", "/usr/bin/git")
 JOURNALCTL: Final = os.environ.get("JOURNALCTL_BIN", "/usr/bin/journalctl")
 PACMAN: Final = os.environ.get("PACMAN_BIN", "/usr/bin/pacman")
 SS: Final = os.environ.get("SS_BIN", "/usr/bin/ss")
@@ -165,6 +166,43 @@ class HistoricalClearanceBinding:
     boundary_raw: bytes
     config_raw: bytes
     current_state_raw: bytes
+
+
+@dataclass(frozen=True)
+class ReviewedSoftwareRace:
+    code: str
+    incident_reference: str
+    latch_sha256: str
+    original_reason: str
+    minimum_corrected_source: str
+
+
+@dataclass(frozen=True)
+class SoftwareRaceClearanceBinding:
+    failure_raw: bytes
+    current_state_raw: bytes
+    config_raw: bytes
+    failure_time: float
+    source_revision: str
+
+
+# Every entry requires a source change and review. The command-line arguments
+# can select an entry but can never create eligibility for an unlisted latch.
+REVIEWED_SOFTWARE_RACE_ALLOWLIST: Final = {
+    "LR-3903E50F10DAA4FD": ReviewedSoftwareRace(
+        code="LGT-TET-002",
+        incident_reference="LR-3903E50F10DAA4FD",
+        latch_sha256=(
+            "3903e50f10daa4fd45eed42c4953a4767"
+            "08107874dc447fd69a30352812b6f24"
+        ),
+        original_reason=(
+            "RAM Tetris writer exited unexpectedly; static restoration was not "
+            "attempted"
+        ),
+        minimum_corrected_source="749c85b00f095a232908736c31c3df945ddb5b55",
+    )
+}
 
 
 EXACT_FAILURES: Final = {
@@ -462,6 +500,53 @@ def _failure_message(value: dict[str, object]) -> str:
 
 def _incident_reference(raw: bytes) -> str:
     return "LR-" + hashlib.sha256(raw).hexdigest()[:16].upper()
+
+
+def _verify_corrected_source_revision(minimum_revision: str) -> str:
+    status = subprocess.run(
+        [GIT, "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if status.returncode != 0 or status.stdout:
+        raise RecoveryBlocked(
+            "Recovery blocked: the installed OpenRGB Presets source is not clean."
+        )
+    revision = subprocess.run(
+        [GIT, "-C", str(ROOT), "rev-parse", "HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    current = revision.stdout.strip()
+    if revision.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", current):
+        raise RecoveryBlocked(
+            "Recovery blocked: the installed OpenRGB Presets revision is unreadable."
+        )
+    ancestry = subprocess.run(
+        [
+            GIT,
+            "-C",
+            str(ROOT),
+            "merge-base",
+            "--is-ancestor",
+            minimum_revision,
+            current,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if ancestry.returncode != 0:
+        raise RecoveryBlocked(
+            "Recovery blocked: the installed OpenRGB Presets revision does not "
+            "contain the reviewed software-race correction."
+        )
+    return current
 
 
 def _timestamp(value: dict[str, object]) -> tuple[float | None, str]:
@@ -1399,6 +1484,136 @@ def _historical_clearance_preflight(
     )
 
 
+def _reviewed_software_race_authorization(
+    incident_reference: str,
+    latch_sha256: str,
+    error_code: str,
+    original_reason: str,
+) -> ReviewedSoftwareRace:
+    reviewed = REVIEWED_SOFTWARE_RACE_ALLOWLIST.get(incident_reference)
+    if (
+        reviewed is None
+        or latch_sha256 != reviewed.latch_sha256
+        or error_code != reviewed.code
+        or original_reason != reviewed.original_reason
+    ):
+        raise RecoveryBlocked(
+            "Reviewed software-race clearance refused: authorization does not "
+            "match an allowlisted incident."
+        )
+    return reviewed
+
+
+def _software_race_clearance_preflight(
+    incident_reference: str,
+    latch_sha256: str,
+    error_code: str,
+    original_reason: str,
+) -> SoftwareRaceClearanceBinding:
+    reviewed = _reviewed_software_race_authorization(
+        incident_reference, latch_sha256, error_code, original_reason
+    )
+    failure_path = state_root() / "ram-tetris-failure.json"
+    failure_raw = _read_protected_bytes(failure_path, "software-race failure latch")
+    if (
+        hashlib.sha256(failure_raw).hexdigest() != reviewed.latch_sha256
+        or _incident_reference(failure_raw) != reviewed.incident_reference
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: the reviewed software-race latch bytes changed."
+        )
+    failure = _json_record(failure_raw, "software-race failure latch")
+    failure_class = classify_reason(_failure_message(failure))
+    if (
+        _failure_message(failure) != reviewed.original_reason
+        or failure_class.code != reviewed.code
+        or failure.get("state") != "failed"
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: the reviewed software-race classification changed."
+        )
+    failure_time, _ = _timestamp(failure)
+    if failure_time is None:
+        raise RecoveryBlocked(
+            "Recovery blocked: the software-race incident timestamp is invalid."
+        )
+
+    source_revision = _verify_corrected_source_revision(
+        reviewed.minimum_corrected_source
+    )
+    current_state_path = state_root() / "lifecycle-service-state.json"
+    current_state_raw = _read_protected_bytes(
+        current_state_path, "current lifecycle state"
+    )
+    current = _json_record(current_state_raw, "current lifecycle state")
+    current_time = current.get("time")
+    if (
+        current.get("state") != "ready"
+        or current.get("reason") != HISTORICAL_READY_REASON
+        or not isinstance(current_time, (int, float))
+        or isinstance(current_time, bool)
+        or float(current_time) <= failure_time
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: the incident has not been replaced by an "
+            "authoritative healthy lifecycle."
+        )
+
+    config_raw = _detector_policy_is_reviewed()
+    _verify_historical_running_environment(current, config_raw)
+    _verify_service_and_hardware(failure_time)
+    if _read_protected_bytes(failure_path, "software-race failure latch") != failure_raw:
+        raise RecoveryBlocked(
+            "Recovery blocked: the software-race latch changed during review."
+        )
+    if (
+        _read_protected_bytes(current_state_path, "current lifecycle state")
+        != current_state_raw
+        or _detector_policy_is_reviewed() != config_raw
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: lifecycle or configuration evidence changed during review."
+        )
+    return SoftwareRaceClearanceBinding(
+        failure_raw=failure_raw,
+        current_state_raw=current_state_raw,
+        config_raw=config_raw,
+        failure_time=failure_time,
+        source_revision=source_revision,
+    )
+
+
+def _verify_software_race_continuity(
+    reviewed: ReviewedSoftwareRace, binding: SoftwareRaceClearanceBinding
+) -> None:
+    if (
+        _verify_corrected_source_revision(reviewed.minimum_corrected_source)
+        != binding.source_revision
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: the installed source changed during clearance."
+        )
+    current_state_path = state_root() / "lifecycle-service-state.json"
+    current_state_raw = _read_protected_bytes(
+        current_state_path, "current lifecycle state"
+    )
+    if current_state_raw != binding.current_state_raw:
+        raise RecoveryBlocked(
+            "Recovery blocked: lifecycle identity changed during clearance."
+        )
+    current = _json_record(current_state_raw, "current lifecycle state")
+    _verify_historical_running_environment(current, binding.config_raw)
+    _verify_service_and_hardware(binding.failure_time)
+    if (
+        _read_protected_bytes(current_state_path, "current lifecycle state")
+        != binding.current_state_raw
+        or _detector_policy_is_reviewed() != binding.config_raw
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: service or configuration continuity changed."
+        )
+
+
 def _wait_for_authoritative_lifecycle_ready(deadline: float) -> None:
     """Wait for the lifecycle's own state record after systemd accepts READY."""
     while True:
@@ -1505,7 +1720,10 @@ def _preserve_evidence(raw: bytes, reference: str, kind: str = "failure") -> Pat
     try:
         descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
-        if destination.read_bytes() != raw:
+        if (
+            _read_protected_bytes(destination, f"retained {kind} evidence")
+            != raw
+        ):
             raise RecoveryBlocked(
                 "Recovery blocked: retained evidence does not match the current record."
             )
@@ -1529,7 +1747,7 @@ def _preserve_evidence(raw: bytes, reference: str, kind: str = "failure") -> Pat
     return destination
 
 
-def _unlink_unchanged_historical_latch(expected: bytes) -> None:
+def _unlink_unchanged_latch(expected: bytes) -> None:
     path = state_root() / "ram-tetris-failure.json"
     _require_private_directory(path.parent, "historical failure-latch directory")
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -1537,7 +1755,7 @@ def _unlink_unchanged_historical_latch(expected: bytes) -> None:
         descriptor = os.open(path, flags)
     except OSError as error:
         raise RecoveryBlocked(
-            "Recovery blocked: the historical failure latch is unavailable."
+            "Recovery blocked: the failure latch is unavailable."
         ) from error
     try:
         metadata = os.fstat(descriptor)
@@ -1547,14 +1765,14 @@ def _unlink_unchanged_historical_latch(expected: bytes) -> None:
             or metadata.st_mode & 0o077
         ):
             raise RecoveryBlocked(
-                "Recovery blocked: the historical failure latch is not protected."
+                "Recovery blocked: the failure latch is not protected."
             )
         chunks: list[bytes] = []
         while chunk := os.read(descriptor, 65_536):
             chunks.append(chunk)
         if b"".join(chunks) != expected:
             raise RecoveryBlocked(
-                "Recovery blocked: the historical failure latch changed before clearance."
+                "Recovery blocked: the failure latch changed before clearance."
             )
         path_metadata = path.lstat()
         if (
@@ -1562,7 +1780,7 @@ def _unlink_unchanged_historical_latch(expected: bytes) -> None:
             or path_metadata.st_ino != metadata.st_ino
         ):
             raise RecoveryBlocked(
-                "Recovery blocked: the historical failure latch identity changed."
+                "Recovery blocked: the failure latch identity changed."
             )
         path.unlink()
         _fsync_directory(path.parent)
@@ -1740,11 +1958,72 @@ def clear_resolved_lifecycle(
             raise RecoveryBlocked(
                 "Recovery blocked: incident or health bindings changed before clearance."
             )
-        _unlink_unchanged_historical_latch(first.failure_raw)
+        _unlink_unchanged_latch(first.failure_raw)
         return {
             "state": "cleared",
             "incident_reference": HISTORICAL_CLEARANCE_REFERENCE,
             "message": "Historical lifecycle failure cleared. RAM Tetris remains OFF.",
+        }
+    finally:
+        os.close(lock_fd)
+
+
+def clear_reviewed_software_race(
+    incident_reference: str,
+    latch_sha256: str,
+    error_code: str,
+    original_reason: str,
+) -> dict[str, object]:
+    """Clear one source-allowlisted, corrected software-race latch."""
+    root = runtime_root()
+    _private_directory(root)
+    lock_fd = os.open(root / "lighting-recovery.lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RecoveryBlocked(
+                "Recovery blocked: another recovery is active."
+            ) from error
+
+        reviewed = _reviewed_software_race_authorization(
+            incident_reference, latch_sha256, error_code, original_reason
+        )
+        first = _software_race_clearance_preflight(
+            incident_reference, latch_sha256, error_code, original_reason
+        )
+        for raw, kind in (
+            (first.failure_raw, "failure"),
+            (first.current_state_raw, "lifecycle-state"),
+            (first.config_raw, "openrgb-config"),
+        ):
+            _preserve_evidence(raw, reviewed.incident_reference, kind)
+
+        second = _software_race_clearance_preflight(
+            incident_reference, latch_sha256, error_code, original_reason
+        )
+        if second != first:
+            raise RecoveryBlocked(
+                "Recovery blocked: incident or health bindings changed before clearance."
+            )
+        for raw, kind in (
+            (second.failure_raw, "failure"),
+            (second.current_state_raw, "lifecycle-state"),
+            (second.config_raw, "openrgb-config"),
+        ):
+            _preserve_evidence(raw, reviewed.incident_reference, kind)
+        _unlink_unchanged_latch(first.failure_raw)
+        _verify_software_race_continuity(reviewed, first)
+        if (state_root() / "ram-tetris-failure.json").exists():
+            raise RecoveryBlocked(
+                "Recovery blocked: the reviewed software-race latch remains present."
+            )
+        return {
+            "failure": False,
+            "incident_reference": reviewed.incident_reference,
+            "message": "Reviewed software-race latch cleared. RAM Tetris remains OFF.",
+            "preference": False,
+            "state": "off",
         }
     finally:
         os.close(lock_fd)
@@ -1814,6 +2093,14 @@ def build_parser() -> argparse.ArgumentParser:
     historical.add_argument(
         "--acknowledge-historical-clearance", action="store_true", required=True
     )
+    software_race = actions.add_parser("clear-reviewed-software-race")
+    software_race.add_argument("--incident-reference", required=True)
+    software_race.add_argument("--latch-sha256", required=True)
+    software_race.add_argument("--error-code", required=True)
+    software_race.add_argument("--original-reason", required=True)
+    software_race.add_argument(
+        "--acknowledge-reviewed-software-race", action="store_true", required=True
+    )
     copy_parser = actions.add_parser("copy-diagnostics")
     copy_parser.add_argument("--print", action="store_true")
     return parser
@@ -1837,6 +2124,19 @@ def main() -> int:
                     clear_resolved_lifecycle(
                         args.incident_reference,
                         args.latch_sha256,
+                        args.original_reason,
+                    ),
+                    sort_keys=True,
+                )
+            )
+            return 0
+        if args.action == "clear-reviewed-software-race":
+            print(
+                json.dumps(
+                    clear_reviewed_software_race(
+                        args.incident_reference,
+                        args.latch_sha256,
+                        args.error_code,
                         args.original_reason,
                     ),
                     sort_keys=True,
