@@ -1211,9 +1211,7 @@ class LightingRecoveryTests(unittest.TestCase):
         self.assertEqual(self.failure.read_bytes(), failure_raw)
 
     def test_reviewed_software_race_cli_requires_explicit_acknowledgement(self):
-        reviewed = recovery.REVIEWED_SOFTWARE_RACE_ALLOWLIST[
-            "LR-3903E50F10DAA4FD"
-        ]
+        reviewed = recovery.REVIEWED_SOFTWARE_RACE_ALLOWLIST["LR-3903E50F10DAA4FD"]
         arguments = [
             "clear-reviewed-software-race",
             "--incident-reference",
@@ -1234,9 +1232,7 @@ class LightingRecoveryTests(unittest.TestCase):
         self.assertTrue(parsed.acknowledge_reviewed_software_race)
 
     def test_reviewed_software_race_accepts_only_exact_allowlisted_binding(self):
-        reviewed = recovery.REVIEWED_SOFTWARE_RACE_ALLOWLIST[
-            "LR-3903E50F10DAA4FD"
-        ]
+        reviewed = recovery.REVIEWED_SOFTWARE_RACE_ALLOWLIST["LR-3903E50F10DAA4FD"]
         self.assertEqual(
             recovery._reviewed_software_race_authorization(
                 reviewed.incident_reference,
@@ -1247,7 +1243,12 @@ class LightingRecoveryTests(unittest.TestCase):
             reviewed,
         )
         cases = (
-            ("LR-WRONG", reviewed.latch_sha256, reviewed.code, reviewed.original_reason),
+            (
+                "LR-WRONG",
+                reviewed.latch_sha256,
+                reviewed.code,
+                reviewed.original_reason,
+            ),
             (
                 reviewed.incident_reference,
                 "0" * 64,
@@ -1281,9 +1282,7 @@ class LightingRecoveryTests(unittest.TestCase):
         self.assertNotIn(reviewed.original_reason, recovery.ELIGIBLE_REASONS)
 
     def test_reviewed_software_race_requires_corrected_source_ancestry(self):
-        reviewed = recovery.REVIEWED_SOFTWARE_RACE_ALLOWLIST[
-            "LR-3903E50F10DAA4FD"
-        ]
+        reviewed = recovery.REVIEWED_SOFTWARE_RACE_ALLOWLIST["LR-3903E50F10DAA4FD"]
         commands = (
             subprocess.CompletedProcess([], 0, "", ""),
             subprocess.CompletedProcess([], 0, "a" * 40 + "\n", ""),
@@ -1301,9 +1300,7 @@ class LightingRecoveryTests(unittest.TestCase):
 
     def test_reviewed_software_race_preflight_binds_runtime_and_evidence(self):
         failure_raw, current_raw = self.write_reviewed_software_race_records()
-        reviewed = recovery.REVIEWED_SOFTWARE_RACE_ALLOWLIST[
-            "LR-3903E50F10DAA4FD"
-        ]
+        reviewed = recovery.REVIEWED_SOFTWARE_RACE_ALLOWLIST["LR-3903E50F10DAA4FD"]
         with (
             self.patched_environment(),
             mock.patch.object(
@@ -1337,9 +1334,7 @@ class LightingRecoveryTests(unittest.TestCase):
         health.assert_called_once_with(1_792_561_532.70337)
 
     def test_reviewed_software_race_propagates_runtime_health_failures(self):
-        reviewed = recovery.REVIEWED_SOFTWARE_RACE_ALLOWLIST[
-            "LR-3903E50F10DAA4FD"
-        ]
+        reviewed = recovery.REVIEWED_SOFTWARE_RACE_ALLOWLIST["LR-3903E50F10DAA4FD"]
         cases = (
             ("runtime", "a RAM Tetris writer is active"),
             ("runtime", "lifecycle or SDK ownership is ambiguous"),
@@ -1388,11 +1383,11 @@ class LightingRecoveryTests(unittest.TestCase):
                     )
                 self.assertEqual(self.failure.read_bytes(), failure_raw)
 
-    def test_reviewed_software_race_clearance_is_read_only_except_evidence_and_latch(self):
+    def test_reviewed_software_race_clearance_is_read_only_except_evidence_and_latch(
+        self,
+    ):
         failure_raw, current_raw = self.write_reviewed_software_race_records()
-        reviewed = recovery.REVIEWED_SOFTWARE_RACE_ALLOWLIST[
-            "LR-3903E50F10DAA4FD"
-        ]
+        reviewed = recovery.REVIEWED_SOFTWARE_RACE_ALLOWLIST["LR-3903E50F10DAA4FD"]
         binding = recovery.SoftwareRaceClearanceBinding(
             failure_raw,
             current_raw,
@@ -1477,7 +1472,9 @@ class LightingRecoveryTests(unittest.TestCase):
                     target.write_bytes(b"altered\n")
                     target.chmod(0o600)
                     preserve = mock.patch.object(
-                        recovery, "_preserve_evidence", wraps=recovery._preserve_evidence
+                        recovery,
+                        "_preserve_evidence",
+                        wraps=recovery._preserve_evidence,
                     )
                 elif case == "changed-after-review":
                     calls = 0
@@ -1492,8 +1489,7 @@ class LightingRecoveryTests(unittest.TestCase):
                         calls += 1
                         if calls == 2:
                             target = (
-                                evidence
-                                / f"{reviewed.incident_reference}.failure.json"
+                                evidence / f"{reviewed.incident_reference}.failure.json"
                             )
                             target.write_bytes(b"altered after review\n")
                         return binding
@@ -1504,7 +1500,9 @@ class LightingRecoveryTests(unittest.TestCase):
                         side_effect=review,
                     )
                     preserve = mock.patch.object(
-                        recovery, "_preserve_evidence", wraps=recovery._preserve_evidence
+                        recovery,
+                        "_preserve_evidence",
+                        wraps=recovery._preserve_evidence,
                     )
                 else:
                     preserve = mock.patch.object(
@@ -1528,9 +1526,7 @@ class LightingRecoveryTests(unittest.TestCase):
 
     def test_reviewed_software_race_detects_latch_change_before_unlink(self):
         failure_raw, current_raw = self.write_reviewed_software_race_records()
-        reviewed = recovery.REVIEWED_SOFTWARE_RACE_ALLOWLIST[
-            "LR-3903E50F10DAA4FD"
-        ]
+        reviewed = recovery.REVIEWED_SOFTWARE_RACE_ALLOWLIST["LR-3903E50F10DAA4FD"]
         binding = recovery.SoftwareRaceClearanceBinding(
             failure_raw,
             current_raw,
@@ -1552,7 +1548,9 @@ class LightingRecoveryTests(unittest.TestCase):
             mock.patch.object(
                 recovery, "_software_race_clearance_preflight", side_effect=preflight
             ),
-            self.assertRaisesRegex(recovery.RecoveryBlocked, "changed before clearance"),
+            self.assertRaisesRegex(
+                recovery.RecoveryBlocked, "changed before clearance"
+            ),
         ):
             recovery.clear_reviewed_software_race(
                 reviewed.incident_reference,
@@ -1564,9 +1562,7 @@ class LightingRecoveryTests(unittest.TestCase):
 
     def test_concurrent_reviewed_software_race_clearance_is_blocked(self):
         failure_raw, _ = self.write_reviewed_software_race_records()
-        reviewed = recovery.REVIEWED_SOFTWARE_RACE_ALLOWLIST[
-            "LR-3903E50F10DAA4FD"
-        ]
+        reviewed = recovery.REVIEWED_SOFTWARE_RACE_ALLOWLIST["LR-3903E50F10DAA4FD"]
         self.runtime.mkdir(parents=True)
         self.runtime.chmod(0o700)
         descriptor = os.open(
