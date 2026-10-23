@@ -149,6 +149,13 @@ RELEVANT_KERNEL_ERROR: Final = re.compile(
     r"(?:error|fail|timed out|timeout|error -[0-9]+)",
     re.IGNORECASE,
 )
+SUSPEND_RESUME_EVENT: Final = re.compile(
+    r"(?:PM: suspend (?:entry|exit)|ACPI: PM: Low-level resume complete)",
+    re.IGNORECASE,
+)
+JOURNAL_CURSOR_BOOT_ID: Final = re.compile(
+    r"(?:^|;)b=([0-9a-f]{32})(?:;|$)", re.IGNORECASE
+)
 
 
 @dataclass(frozen=True)
@@ -186,6 +193,36 @@ class SoftwareRaceClearanceBinding:
     source_revision: str
 
 
+@dataclass(frozen=True)
+class ReviewedHardwareHealth:
+    code: str
+    incident_reference: str
+    latch_sha256: str
+    original_reason: str
+    stability_directory: str
+    stability_manifest_sha256: str
+    observed_source_revision: str
+
+
+@dataclass(frozen=True)
+class StabilityEvidence:
+    files: tuple[tuple[str, bytes], ...]
+    journal_cursor: str
+    observation_start: float
+    observation_end: float
+
+
+@dataclass(frozen=True)
+class HardwareHealthClearanceBinding:
+    failure_raw: bytes
+    current_state_raw: bytes
+    config_raw: bytes
+    stability: StabilityEvidence
+    historical_kernel_raw: bytes
+    failure_time: float
+    source_revision: str
+
+
 # Every entry requires a source change and review. The command-line arguments
 # can select an entry but can never create eligibility for an unlisted latch.
 REVIEWED_SOFTWARE_RACE_ALLOWLIST: Final = {
@@ -203,6 +240,42 @@ REVIEWED_SOFTWARE_RACE_ALLOWLIST: Final = {
         minimum_corrected_source="749c85b00f095a232908736c31c3df945ddb5b55",
     )
 }
+
+
+# Hardware clearance is never inferred from LGT-CTL-002.  This single entry is
+# bound to the owner-reviewed latch and the complete protected stability
+# observation.  Adding another incident requires a source change and review.
+REVIEWED_HARDWARE_HEALTH_ALLOWLIST: Final = {
+    "LR-E8FE394802531DE7": ReviewedHardwareHealth(
+        code="LGT-CTL-002",
+        incident_reference="LR-E8FE394802531DE7",
+        latch_sha256=(
+            "e8fe394802531de7e636be00d781a7c4"
+            "6b9c290041f994a1dce46ed4fe45469d"
+        ),
+        original_reason="10-0053 temperature is unreadable",
+        stability_directory=(
+            "LR-E8FE394802531DE7-spd5118-stability-20261023T075800+0200"
+        ),
+        stability_manifest_sha256=(
+            "3189b7c1846f8edc4327c22319eca739"
+            "d671803696cb15fe78245ccbcdbc0234"
+        ),
+        observed_source_revision="e7d66ee00cd35a7aa95e873bd6c051bf41254763",
+    )
+}
+
+STABILITY_MANIFEST_FILES: Final = frozenset(
+    {
+        "metadata.txt",
+        "samples.tsv",
+        "kernel-all.log",
+        "kernel-reader.stderr",
+        "kernel-relevant.log",
+        "summary.tsv",
+    }
+)
+STABILITY_DIRECTORY_FILES: Final = STABILITY_MANIFEST_FILES | {"manifest.sha256"}
 
 
 EXACT_FAILURES: Final = {
@@ -544,7 +617,7 @@ def _verify_corrected_source_revision(minimum_revision: str) -> str:
     if ancestry.returncode != 0:
         raise RecoveryBlocked(
             "Recovery blocked: the installed OpenRGB Presets revision does not "
-            "contain the reviewed software-race correction."
+            "contain the reviewed minimum revision."
         )
     return current
 
@@ -725,6 +798,321 @@ def _kernel_errors_since(timestamp: float) -> None:
         raise RecoveryBlocked(
             "Recovery blocked: relevant kernel communication errors exist."
         )
+
+
+def _parse_observation_time(value: str, label: str) -> float:
+    try:
+        parsed = datetime.fromisoformat(value.replace(",", "."))
+    except ValueError as error:
+        raise RecoveryBlocked(
+            f"Recovery blocked: stability {label} is invalid."
+        ) from error
+    if parsed.tzinfo is None:
+        raise RecoveryBlocked(f"Recovery blocked: stability {label} has no timezone.")
+    return parsed.timestamp()
+
+
+def _key_value_document(raw: bytes, label: str) -> dict[str, str]:
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise RecoveryBlocked(f"Recovery blocked: {label} is unreadable.") from error
+    values: dict[str, str] = {}
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if not separator or not key or key in values:
+            raise RecoveryBlocked(f"Recovery blocked: {label} is invalid.")
+        values[key] = value
+    return values
+
+
+def _verify_stability_samples(raw: bytes) -> None:
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise RecoveryBlocked(
+            "Recovery blocked: stability samples are unreadable."
+        ) from error
+    expected_header = (
+        "sample\twall_time\tmonotonic_s\tendpoint\tstatus\ttemp_mc\tdetail"
+    )
+    if not lines or lines[0] != expected_header or len(lines) != 241:
+        raise RecoveryBlocked("Recovery blocked: stability samples are incomplete.")
+    expected_endpoints = {"10-0050", "10-0051", "10-0052", "10-0053"}
+    samples: dict[int, set[str]] = {}
+    sample_clock: dict[int, tuple[str, str]] = {}
+    previous_monotonic: float | None = None
+    for line in lines[1:]:
+        fields = line.split("\t")
+        if len(fields) != 7:
+            raise RecoveryBlocked("Recovery blocked: stability samples are invalid.")
+        sample_text, wall, monotonic, endpoint, status, temperature, detail = fields
+        try:
+            sample = int(sample_text)
+            monotonic_value = float(monotonic)
+            temperature_value = int(temperature)
+        except ValueError as error:
+            raise RecoveryBlocked(
+                "Recovery blocked: stability samples are invalid."
+            ) from error
+        if (
+            sample not in range(1, 61)
+            or endpoint not in expected_endpoints
+            or status != "ok"
+            or temperature_value <= 0
+            or detail != "-"
+        ):
+            raise RecoveryBlocked(
+                "Recovery blocked: stability samples contain a failed reading."
+            )
+        _parse_observation_time(wall, "sample timestamp")
+        clock = sample_clock.setdefault(sample, (wall, monotonic))
+        if clock != (wall, monotonic):
+            raise RecoveryBlocked(
+                "Recovery blocked: stability sample timing is inconsistent."
+            )
+        endpoints = samples.setdefault(sample, set())
+        if endpoint in endpoints:
+            raise RecoveryBlocked(
+                "Recovery blocked: stability samples contain a duplicate endpoint."
+            )
+        endpoints.add(endpoint)
+        if len(endpoints) == 4:
+            if previous_monotonic is not None and monotonic_value <= previous_monotonic:
+                raise RecoveryBlocked(
+                    "Recovery blocked: stability sample timing is not monotonic."
+                )
+            previous_monotonic = monotonic_value
+    if set(samples) != set(range(1, 61)) or any(
+        endpoints != expected_endpoints for endpoints in samples.values()
+    ):
+        raise RecoveryBlocked("Recovery blocked: stability samples are incomplete.")
+
+
+def _verify_stability_summary(raw: bytes) -> None:
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise RecoveryBlocked(
+            "Recovery blocked: stability summary is unreadable."
+        ) from error
+    expected_header = (
+        "endpoint\tsamples\tok\tfailures\tmissing\tmalformed\tmin_mc\tmax_mc\tfinal_mc"
+    )
+    expected_endpoints = {"10-0050", "10-0051", "10-0052", "10-0053"}
+    if not lines or lines[0] != expected_header or len(lines) != 5:
+        raise RecoveryBlocked("Recovery blocked: stability summary is incomplete.")
+    seen: set[str] = set()
+    for line in lines[1:]:
+        fields = line.split("\t")
+        if len(fields) != 9 or fields[0] not in expected_endpoints:
+            raise RecoveryBlocked("Recovery blocked: stability summary is invalid.")
+        endpoint = fields[0]
+        if endpoint in seen:
+            raise RecoveryBlocked(
+                "Recovery blocked: stability summary contains a duplicate endpoint."
+            )
+        seen.add(endpoint)
+        try:
+            samples, ok, failures, missing, malformed, minimum, maximum, final = (
+                int(value) for value in fields[1:]
+            )
+        except ValueError as error:
+            raise RecoveryBlocked(
+                "Recovery blocked: stability summary is invalid."
+            ) from error
+        if (
+            (samples, ok, failures, missing, malformed) != (60, 60, 0, 0, 0)
+            or minimum <= 0
+            or maximum < minimum
+            or not minimum <= final <= maximum
+        ):
+            raise RecoveryBlocked(
+                "Recovery blocked: stability summary contains a failed reading."
+            )
+    if seen != expected_endpoints:
+        raise RecoveryBlocked("Recovery blocked: stability summary is incomplete.")
+
+
+def _verify_stability_evidence(
+    reviewed: ReviewedHardwareHealth,
+) -> StabilityEvidence:
+    root = state_root() / "recovery-evidence" / reviewed.stability_directory
+    _require_private_directory(root, "SPD5118 stability evidence directory")
+    try:
+        names = {entry.name for entry in root.iterdir()}
+    except OSError as error:
+        raise RecoveryBlocked(
+            "Recovery blocked: SPD5118 stability evidence is unreadable."
+        ) from error
+    if names != STABILITY_DIRECTORY_FILES:
+        raise RecoveryBlocked(
+            "Recovery blocked: SPD5118 stability evidence inventory changed."
+        )
+    files = {
+        name: _read_protected_bytes(root / name, f"stability evidence {name}")
+        for name in sorted(names)
+    }
+    manifest_raw = files["manifest.sha256"]
+    if hashlib.sha256(manifest_raw).hexdigest() != reviewed.stability_manifest_sha256:
+        raise RecoveryBlocked(
+            "Recovery blocked: SPD5118 stability manifest changed."
+        )
+    try:
+        manifest_lines = manifest_raw.decode("ascii").splitlines()
+    except UnicodeDecodeError as error:
+        raise RecoveryBlocked(
+            "Recovery blocked: SPD5118 stability manifest is unreadable."
+        ) from error
+    manifest: dict[str, str] = {}
+    for line in manifest_lines:
+        match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9._-]*)", line)
+        if match is None or match.group(2) in manifest:
+            raise RecoveryBlocked(
+                "Recovery blocked: SPD5118 stability manifest is invalid."
+            )
+        manifest[match.group(2)] = match.group(1)
+    if set(manifest) != STABILITY_MANIFEST_FILES:
+        raise RecoveryBlocked(
+            "Recovery blocked: SPD5118 stability manifest is incomplete."
+        )
+    for name, expected in manifest.items():
+        if hashlib.sha256(files[name]).hexdigest() != expected:
+            raise RecoveryBlocked(
+                f"Recovery blocked: stability evidence checksum failed: {name}."
+            )
+
+    metadata = _key_value_document(files["metadata.txt"], "stability metadata")
+    expected_keys = {
+        "incident",
+        "plugin_version",
+        "plugin_revision",
+        "latch_sha256_before",
+        "kernel_cursor",
+        "started",
+        "ended",
+        "samples_completed",
+        "stop_reason",
+        "latch_sha256_after",
+    }
+    if set(metadata) != expected_keys or (
+        metadata["incident"] != reviewed.incident_reference
+        or metadata["plugin_version"] != "0.4.26"
+        or metadata["plugin_revision"] != reviewed.observed_source_revision
+        or metadata["latch_sha256_before"] != reviewed.latch_sha256
+        or metadata["latch_sha256_after"] != reviewed.latch_sha256
+        or metadata["samples_completed"] != "60"
+        or metadata["stop_reason"] != "complete"
+    ):
+        raise RecoveryBlocked("Recovery blocked: stability metadata is invalid.")
+    cursor = metadata["kernel_cursor"]
+    cursor_boot = JOURNAL_CURSOR_BOOT_ID.search(cursor)
+    if cursor_boot is None or cursor_boot.group(1).lower() != _current_boot_id().replace(
+        "-", ""
+    ).lower():
+        raise RecoveryBlocked(
+            "Recovery blocked: stability evidence belongs to another boot."
+        )
+    started = _parse_observation_time(metadata["started"], "start time")
+    ended = _parse_observation_time(metadata["ended"], "end time")
+    if not 60 <= ended - started <= 65 or ended > time.time():
+        raise RecoveryBlocked(
+            "Recovery blocked: stability observation duration is invalid."
+        )
+    if files["kernel-reader.stderr"] or files["kernel-relevant.log"]:
+        raise RecoveryBlocked(
+            "Recovery blocked: stability observation recorded a kernel failure."
+        )
+    try:
+        kernel_lines = files["kernel-all.log"].decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise RecoveryBlocked(
+            "Recovery blocked: stability kernel evidence is unreadable."
+        ) from error
+    if any(
+        RELEVANT_KERNEL_ERROR.search(line) or SUSPEND_RESUME_EVENT.search(line)
+        for line in kernel_lines
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: stability window contains a hardware or sleep event."
+        )
+    _verify_stability_samples(files["samples.tsv"])
+    _verify_stability_summary(files["summary.tsv"])
+    return StabilityEvidence(
+        files=tuple(sorted(files.items())),
+        journal_cursor=cursor,
+        observation_start=started,
+        observation_end=ended,
+    )
+
+
+def _kernel_history_after_observation(cursor: str) -> None:
+    journal = subprocess.run(
+        [
+            JOURNALCTL,
+            "-k",
+            "--after-cursor",
+            cursor,
+            "--show-cursor",
+            "--no-pager",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if journal.returncode != 0 or "-- cursor: " not in journal.stdout:
+        raise RecoveryBlocked(
+            "Recovery blocked: post-observation kernel history is unreadable."
+        )
+    if any(RELEVANT_KERNEL_ERROR.search(line) for line in journal.stdout.splitlines()):
+        raise RecoveryBlocked(
+            "Recovery blocked: a kernel communication error followed the observation."
+        )
+    if any(SUSPEND_RESUME_EVENT.search(line) for line in journal.stdout.splitlines()):
+        raise RecoveryBlocked(
+            "Recovery blocked: suspend or resume followed the stability observation."
+        )
+
+
+def _historical_kernel_evidence(
+    failure_time: float, observation_start: float
+) -> bytes:
+    journal = subprocess.run(
+        [
+            JOURNALCTL,
+            "-k",
+            f"--since=@{failure_time}",
+            f"--until=@{observation_start}",
+            "--no-pager",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if journal.returncode != 0:
+        raise RecoveryBlocked(
+            "Recovery blocked: historical kernel evidence is unreadable."
+        )
+    retained = [
+        line
+        for line in journal.stdout.splitlines()
+        if RELEVANT_KERNEL_ERROR.search(line) or SUSPEND_RESUME_EVENT.search(line)
+    ]
+    if not retained or not any(
+        RELEVANT_KERNEL_ERROR.search(line) and "spd5118" in line.lower()
+        for line in retained
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: reviewed historical SPD5118 errors are unavailable."
+        )
+    document = {
+        "failure_time": failure_time,
+        "observation_start": observation_start,
+        "retained_lines": retained,
+    }
+    return (json.dumps(document, sort_keys=True) + "\n").encode()
 
 
 def _validate_lifecycle_boundary(
@@ -1093,7 +1481,9 @@ def status_document() -> dict[str, object]:
     }
 
 
-def _verify_service_and_hardware(failure_time: float) -> dict[str, object]:
+def _verify_service_and_hardware(
+    failure_time: float | None,
+) -> dict[str, object]:
     value = _read_service_state()
     if value.get("state") != "ready":
         raise RecoveryBlocked(
@@ -1201,7 +1591,8 @@ def _verify_service_and_hardware(failure_time: float) -> dict[str, object]:
             "Recovery blocked: four SPD5118 endpoints were not verified."
         )
 
-    _kernel_errors_since(failure_time)
+    if failure_time is not None:
+        _kernel_errors_since(failure_time)
     return health_value
 
 
@@ -1614,6 +2005,171 @@ def _verify_software_race_continuity(
         )
 
 
+def _reviewed_hardware_health_authorization(
+    incident_reference: str,
+    latch_sha256: str,
+    error_code: str,
+    original_reason: str,
+    stability_manifest_sha256: str,
+) -> ReviewedHardwareHealth:
+    reviewed = REVIEWED_HARDWARE_HEALTH_ALLOWLIST.get(incident_reference)
+    if (
+        reviewed is None
+        or latch_sha256 != reviewed.latch_sha256
+        or error_code != reviewed.code
+        or original_reason != reviewed.original_reason
+        or stability_manifest_sha256 != reviewed.stability_manifest_sha256
+    ):
+        raise RecoveryBlocked(
+            "Reviewed hardware-health clearance refused: authorization does not "
+            "match an allowlisted incident and stability observation."
+        )
+    return reviewed
+
+
+def _hardware_health_clearance_preflight(
+    incident_reference: str,
+    latch_sha256: str,
+    error_code: str,
+    original_reason: str,
+    stability_manifest_sha256: str,
+) -> HardwareHealthClearanceBinding:
+    reviewed = _reviewed_hardware_health_authorization(
+        incident_reference,
+        latch_sha256,
+        error_code,
+        original_reason,
+        stability_manifest_sha256,
+    )
+    failure_path = state_root() / "ram-tetris-failure.json"
+    failure_raw = _read_protected_bytes(failure_path, "hardware-health failure latch")
+    if (
+        hashlib.sha256(failure_raw).hexdigest() != reviewed.latch_sha256
+        or _incident_reference(failure_raw) != reviewed.incident_reference
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: the reviewed hardware-health latch bytes changed."
+        )
+    failure = _json_record(failure_raw, "hardware-health failure latch")
+    failure_class = classify_reason(_failure_message(failure))
+    if (
+        _failure_message(failure) != reviewed.original_reason
+        or failure_class.code != reviewed.code
+        or failure.get("state") != "failed"
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: the reviewed hardware-health classification changed."
+        )
+    failure_time, _ = _timestamp(failure)
+    if failure_time is None:
+        raise RecoveryBlocked(
+            "Recovery blocked: the hardware-health incident timestamp is invalid."
+        )
+
+    source_revision = _verify_corrected_source_revision(
+        reviewed.observed_source_revision
+    )
+    stability = _verify_stability_evidence(reviewed)
+    if stability.observation_start <= failure_time:
+        raise RecoveryBlocked(
+            "Recovery blocked: the stability observation predates the incident."
+        )
+
+    current_state_path = state_root() / "lifecycle-service-state.json"
+    current_state_raw = _read_protected_bytes(
+        current_state_path, "current lifecycle state"
+    )
+    current = _json_record(current_state_raw, "current lifecycle state")
+    current_time = current.get("time")
+    if (
+        current.get("state") != "ready"
+        or current.get("reason") != HISTORICAL_READY_REASON
+        or current.get("boot_id") != _current_boot_id()
+        or not isinstance(current_time, (int, float))
+        or isinstance(current_time, bool)
+        or float(current_time) <= failure_time
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: the incident has no authoritative healthy lifecycle."
+        )
+
+    config_raw = _detector_policy_is_reviewed()
+    _verify_historical_running_environment(current, config_raw)
+    _verify_service_and_hardware(None)
+    _kernel_history_after_observation(stability.journal_cursor)
+    historical_kernel_raw = _historical_kernel_evidence(
+        failure_time, stability.observation_start
+    )
+    if _read_protected_bytes(failure_path, "hardware-health failure latch") != failure_raw:
+        raise RecoveryBlocked(
+            "Recovery blocked: the hardware-health latch changed during review."
+        )
+    if (
+        _read_protected_bytes(current_state_path, "current lifecycle state")
+        != current_state_raw
+        or _detector_policy_is_reviewed() != config_raw
+        or _verify_stability_evidence(reviewed) != stability
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: lifecycle, configuration, or stability evidence changed."
+        )
+    return HardwareHealthClearanceBinding(
+        failure_raw=failure_raw,
+        current_state_raw=current_state_raw,
+        config_raw=config_raw,
+        stability=stability,
+        historical_kernel_raw=historical_kernel_raw,
+        failure_time=failure_time,
+        source_revision=source_revision,
+    )
+
+
+def _verify_hardware_health_continuity(
+    reviewed: ReviewedHardwareHealth, binding: HardwareHealthClearanceBinding
+) -> None:
+    if (
+        _verify_corrected_source_revision(reviewed.observed_source_revision)
+        != binding.source_revision
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: installed source changed during hardware clearance."
+        )
+    current_state_path = state_root() / "lifecycle-service-state.json"
+    current_state_raw = _read_protected_bytes(
+        current_state_path, "current lifecycle state"
+    )
+    if current_state_raw != binding.current_state_raw:
+        raise RecoveryBlocked(
+            "Recovery blocked: lifecycle identity changed during hardware clearance."
+        )
+    current = _json_record(current_state_raw, "current lifecycle state")
+    _verify_historical_running_environment(current, binding.config_raw)
+    if _verify_stability_evidence(reviewed) != binding.stability:
+        raise RecoveryBlocked(
+            "Recovery blocked: stability evidence changed during hardware clearance."
+        )
+    if (
+        _historical_kernel_evidence(
+            binding.failure_time,
+            binding.stability.observation_start,
+        )
+        != binding.historical_kernel_raw
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: historical kernel evidence changed during clearance."
+        )
+    _verify_service_and_hardware(None)
+    _kernel_history_after_observation(binding.stability.journal_cursor)
+    if (
+        _read_protected_bytes(current_state_path, "current lifecycle state")
+        != binding.current_state_raw
+        or _detector_policy_is_reviewed() != binding.config_raw
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: service or configuration continuity changed."
+        )
+
+
 def _wait_for_authoritative_lifecycle_ready(deadline: float) -> None:
     """Wait for the lifecycle's own state record after systemd accepts READY."""
     while True:
@@ -1743,6 +2299,66 @@ def _preserve_evidence(raw: bytes, reference: str, kind: str = "failure") -> Pat
         raise RecoveryBlocked(
             "Recovery blocked: retained evidence readback did not match."
         )
+    _fsync_directory(evidence_root)
+    return destination
+
+
+def _preserve_stability_evidence(
+    reviewed: ReviewedHardwareHealth, stability: StabilityEvidence
+) -> Path:
+    evidence_root = state_root() / "recovery-evidence"
+    _private_directory(state_root())
+    _private_directory(evidence_root)
+    destination = evidence_root / (
+        f"{reviewed.incident_reference}.hardware-health-observation"
+    )
+    try:
+        destination.mkdir(mode=0o700)
+    except FileExistsError:
+        _require_private_directory(
+            destination, "retained hardware-health observation directory"
+        )
+    expected = dict(stability.files)
+    try:
+        existing = {entry.name for entry in destination.iterdir()}
+    except OSError as error:
+        raise RecoveryBlocked(
+            "Recovery blocked: retained hardware-health observation is unreadable."
+        ) from error
+    if not existing.issubset(expected):
+        raise RecoveryBlocked(
+            "Recovery blocked: retained hardware-health observation has extra files."
+        )
+    for name, raw in stability.files:
+        path = destination / name
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            if _read_protected_bytes(path, f"retained stability evidence {name}") != raw:
+                raise RecoveryBlocked(
+                    "Recovery blocked: retained hardware-health observation changed."
+                )
+            continue
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        if _read_protected_bytes(path, f"retained stability evidence {name}") != raw:
+            raise RecoveryBlocked(
+                "Recovery blocked: retained hardware-health observation readback changed."
+            )
+    if {entry.name for entry in destination.iterdir()} != set(expected):
+        raise RecoveryBlocked(
+            "Recovery blocked: retained hardware-health observation is incomplete."
+        )
+    _fsync_directory(destination)
     _fsync_directory(evidence_root)
     return destination
 
@@ -2029,6 +2645,86 @@ def clear_reviewed_software_race(
         os.close(lock_fd)
 
 
+def clear_reviewed_hardware_health(
+    incident_reference: str,
+    latch_sha256: str,
+    error_code: str,
+    original_reason: str,
+    stability_manifest_sha256: str,
+) -> dict[str, object]:
+    """Clear one source-allowlisted, independently observed hardware latch."""
+    root = runtime_root()
+    _private_directory(root)
+    lock_fd = os.open(root / "lighting-recovery.lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RecoveryBlocked(
+                "Recovery blocked: another recovery is active."
+            ) from error
+
+        reviewed = _reviewed_hardware_health_authorization(
+            incident_reference,
+            latch_sha256,
+            error_code,
+            original_reason,
+            stability_manifest_sha256,
+        )
+        first = _hardware_health_clearance_preflight(
+            incident_reference,
+            latch_sha256,
+            error_code,
+            original_reason,
+            stability_manifest_sha256,
+        )
+        for raw, kind in (
+            (first.failure_raw, "failure"),
+            (first.current_state_raw, "lifecycle-state"),
+            (first.config_raw, "openrgb-config"),
+            (first.historical_kernel_raw, "hardware-kernel-history"),
+        ):
+            _preserve_evidence(raw, reviewed.incident_reference, kind)
+        _preserve_stability_evidence(reviewed, first.stability)
+
+        second = _hardware_health_clearance_preflight(
+            incident_reference,
+            latch_sha256,
+            error_code,
+            original_reason,
+            stability_manifest_sha256,
+        )
+        if second != first:
+            raise RecoveryBlocked(
+                "Recovery blocked: incident or health bindings changed before clearance."
+            )
+        for raw, kind in (
+            (second.failure_raw, "failure"),
+            (second.current_state_raw, "lifecycle-state"),
+            (second.config_raw, "openrgb-config"),
+            (second.historical_kernel_raw, "hardware-kernel-history"),
+        ):
+            _preserve_evidence(raw, reviewed.incident_reference, kind)
+        _preserve_stability_evidence(reviewed, second.stability)
+        _unlink_unchanged_latch(first.failure_raw)
+        _verify_hardware_health_continuity(reviewed, first)
+        if (state_root() / "ram-tetris-failure.json").exists():
+            raise RecoveryBlocked(
+                "Recovery blocked: the reviewed hardware-health latch remains present."
+            )
+        return {
+            "failure": False,
+            "incident_reference": reviewed.incident_reference,
+            "message": (
+                "Reviewed hardware-health latch cleared. RAM Tetris remains OFF."
+            ),
+            "preference": False,
+            "state": "off",
+        }
+    finally:
+        os.close(lock_fd)
+
+
 def _truncate(value: str, limit: int) -> str:
     normalized = " ".join(value.split())
     if len(normalized) <= limit:
@@ -2101,6 +2797,15 @@ def build_parser() -> argparse.ArgumentParser:
     software_race.add_argument(
         "--acknowledge-reviewed-software-race", action="store_true", required=True
     )
+    hardware_health = actions.add_parser("clear-reviewed-hardware-health")
+    hardware_health.add_argument("--incident-reference", required=True)
+    hardware_health.add_argument("--latch-sha256", required=True)
+    hardware_health.add_argument("--error-code", required=True)
+    hardware_health.add_argument("--original-reason", required=True)
+    hardware_health.add_argument("--stability-manifest-sha256", required=True)
+    hardware_health.add_argument(
+        "--acknowledge-reviewed-hardware-health", action="store_true", required=True
+    )
     copy_parser = actions.add_parser("copy-diagnostics")
     copy_parser.add_argument("--print", action="store_true")
     return parser
@@ -2138,6 +2843,20 @@ def main() -> int:
                         args.latch_sha256,
                         args.error_code,
                         args.original_reason,
+                    ),
+                    sort_keys=True,
+                )
+            )
+            return 0
+        if args.action == "clear-reviewed-hardware-health":
+            print(
+                json.dumps(
+                    clear_reviewed_hardware_health(
+                        args.incident_reference,
+                        args.latch_sha256,
+                        args.error_code,
+                        args.original_reason,
+                        args.stability_manifest_sha256,
                     ),
                     sort_keys=True,
                 )

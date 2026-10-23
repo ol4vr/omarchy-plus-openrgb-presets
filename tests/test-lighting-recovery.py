@@ -199,6 +199,137 @@ class LightingRecoveryTests(unittest.TestCase):
         )
         return failure_raw, current_raw
 
+    def write_reviewed_hardware_health_records(
+        self,
+    ) -> tuple[
+        object,
+        bytes,
+        bytes,
+        object,
+    ]:
+        base = recovery.REVIEWED_HARDWARE_HEALTH_ALLOWLIST[
+            "LR-E8FE394802531DE7"
+        ]
+        failure_raw = (
+            b'{"message": "10-0053 temperature is unreadable", "pid": 2295616, '
+            b'"state": "failed", "time": 1792651066.1584392}\n'
+        )
+        self.assertEqual(hashlib.sha256(failure_raw).hexdigest(), base.latch_sha256)
+        now = time.time()
+        started = now - 120
+        ended = started + 61
+        started_text = recovery.datetime.fromtimestamp(
+            started, recovery.UTC
+        ).isoformat(timespec="microseconds")
+        ended_text = recovery.datetime.fromtimestamp(
+            ended, recovery.UTC
+        ).isoformat(timespec="microseconds")
+        boot_id = "a" * 32
+        cursor = f"s=test;i=1;b={boot_id};m=1;t=1;x=1"
+        metadata = "\n".join(
+            (
+                f"incident={base.incident_reference}",
+                "plugin_version=0.4.26",
+                f"plugin_revision={base.observed_source_revision}",
+                f"latch_sha256_before={base.latch_sha256}",
+                f"kernel_cursor={cursor}",
+                f"started={started_text}",
+                f"ended={ended_text}",
+                "samples_completed=60",
+                "stop_reason=complete",
+                f"latch_sha256_after={base.latch_sha256}",
+                "",
+            )
+        ).encode()
+        endpoints = ("10-0050", "10-0051", "10-0052", "10-0053")
+        sample_lines = [
+            "sample\twall_time\tmonotonic_s\tendpoint\tstatus\ttemp_mc\tdetail"
+        ]
+        for sample in range(1, 61):
+            wall = recovery.datetime.fromtimestamp(
+                started + sample, recovery.UTC
+            ).isoformat(timespec="microseconds")
+            for offset, endpoint in enumerate(endpoints):
+                sample_lines.append(
+                    f"{sample}\t{wall}\t{1000 + sample:.2f}\t{endpoint}"
+                    f"\tok\t{36000 + offset * 1000}\t-"
+                )
+        samples = ("\n".join(sample_lines) + "\n").encode()
+        summary_lines = [
+            (
+                "endpoint\tsamples\tok\tfailures\tmissing\tmalformed"
+                "\tmin_mc\tmax_mc\tfinal_mc"
+            )
+        ]
+        for offset, endpoint in enumerate(endpoints):
+            value = 36000 + offset * 1000
+            summary_lines.append(
+                f"{endpoint}\t60\t60\t0\t0\t0\t{value}\t{value}\t{value}"
+            )
+        summary = ("\n".join(summary_lines) + "\n").encode()
+        evidence_files = {
+            "metadata.txt": metadata,
+            "samples.tsv": samples,
+            "kernel-all.log": b"",
+            "kernel-reader.stderr": b"",
+            "kernel-relevant.log": b"",
+            "summary.tsv": summary,
+        }
+        manifest = b"".join(
+            f"{hashlib.sha256(evidence_files[name]).hexdigest()}  {name}\n".encode()
+            for name in sorted(evidence_files)
+        )
+        reviewed = recovery.ReviewedHardwareHealth(
+            code=base.code,
+            incident_reference=base.incident_reference,
+            latch_sha256=base.latch_sha256,
+            original_reason=base.original_reason,
+            stability_directory=base.stability_directory,
+            stability_manifest_sha256=hashlib.sha256(manifest).hexdigest(),
+            observed_source_revision=base.observed_source_revision,
+        )
+        evidence_files["manifest.sha256"] = manifest
+        evidence = (
+            self.failure.parent / "recovery-evidence" / reviewed.stability_directory
+        )
+        evidence.mkdir(parents=True)
+        self.failure.parent.chmod(0o700)
+        evidence.parent.chmod(0o700)
+        evidence.chmod(0o700)
+        for name, raw in evidence_files.items():
+            path = evidence / name
+            path.write_bytes(raw)
+            path.chmod(0o600)
+        current_raw = (
+            json.dumps(
+                {
+                    "boot_id": boot_id,
+                    "lifecycle_pid": 51,
+                    "lifecycle_start": "5100",
+                    "reason": recovery.HISTORICAL_READY_REASON,
+                    "server_pid": 52,
+                    "server_start": "5200",
+                    "state": "ready",
+                    "time": ended + 1,
+                },
+                sort_keys=True,
+            ).encode()
+            + b"\n"
+        )
+        for path, raw in (
+            (self.failure, failure_raw),
+            (self.lifecycle_state, current_raw),
+            (self.failure.parent / "ram-tetris-enabled", b"off\n"),
+        ):
+            path.write_bytes(raw)
+            path.chmod(0o600)
+        with (
+            self.patched_environment(),
+            mock.patch.object(recovery, "_current_boot_id", return_value=boot_id),
+        ):
+            stability = recovery._verify_stability_evidence(reviewed)
+        return reviewed, failure_raw, current_raw, stability
+
     def test_stable_code_mapping_and_subsystems(self):
         cases = {
             "writer termination was not preceded by an authenticated lifecycle stop request": (
@@ -1579,6 +1710,406 @@ class LightingRecoveryTests(unittest.TestCase):
                     reviewed.latch_sha256,
                     reviewed.code,
                     reviewed.original_reason,
+                )
+        finally:
+            os.close(descriptor)
+        self.assertEqual(self.failure.read_bytes(), failure_raw)
+
+    def test_reviewed_hardware_health_cli_requires_explicit_acknowledgement(self):
+        reviewed = recovery.REVIEWED_HARDWARE_HEALTH_ALLOWLIST[
+            "LR-E8FE394802531DE7"
+        ]
+        arguments = [
+            "clear-reviewed-hardware-health",
+            "--incident-reference",
+            reviewed.incident_reference,
+            "--latch-sha256",
+            reviewed.latch_sha256,
+            "--error-code",
+            reviewed.code,
+            "--original-reason",
+            reviewed.original_reason,
+            "--stability-manifest-sha256",
+            reviewed.stability_manifest_sha256,
+        ]
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            recovery.build_parser().parse_args(arguments)
+        parsed = recovery.build_parser().parse_args(
+            arguments + ["--acknowledge-reviewed-hardware-health"]
+        )
+        self.assertEqual(parsed.action, "clear-reviewed-hardware-health")
+        self.assertTrue(parsed.acknowledge_reviewed_hardware_health)
+
+    def test_reviewed_hardware_health_accepts_only_exact_binding(self):
+        reviewed = recovery.REVIEWED_HARDWARE_HEALTH_ALLOWLIST[
+            "LR-E8FE394802531DE7"
+        ]
+        self.assertEqual(
+            recovery._reviewed_hardware_health_authorization(
+                reviewed.incident_reference,
+                reviewed.latch_sha256,
+                reviewed.code,
+                reviewed.original_reason,
+                reviewed.stability_manifest_sha256,
+            ),
+            reviewed,
+        )
+        values = [
+            reviewed.incident_reference,
+            reviewed.latch_sha256,
+            reviewed.code,
+            reviewed.original_reason,
+            reviewed.stability_manifest_sha256,
+        ]
+        replacements = (
+            "LR-WRONG",
+            "0" * 64,
+            "LGT-CTL-001",
+            "different reason",
+            "1" * 64,
+        )
+        for index, replacement in enumerate(replacements):
+            changed = values.copy()
+            changed[index] = replacement
+            with (
+                self.subTest(index=index),
+                self.assertRaisesRegex(recovery.RecoveryBlocked, "allowlisted"),
+            ):
+                recovery._reviewed_hardware_health_authorization(*changed)
+        self.assertFalse(
+            recovery.classify_reason(reviewed.original_reason).reviewed_recovery
+        )
+
+    def test_reviewed_hardware_health_verifies_complete_stability_evidence(self):
+        reviewed, _, _, expected = self.write_reviewed_hardware_health_records()
+        with (
+            self.patched_environment(),
+            mock.patch.dict(
+                recovery.REVIEWED_HARDWARE_HEALTH_ALLOWLIST,
+                {reviewed.incident_reference: reviewed},
+            ),
+            mock.patch.object(recovery, "_current_boot_id", return_value="a" * 32),
+        ):
+            actual = recovery._verify_stability_evidence(reviewed)
+        self.assertEqual(actual, expected)
+        self.assertEqual(len(actual.files), 7)
+
+    def test_reviewed_hardware_health_rejects_changed_or_incomplete_evidence(self):
+        for case in ("changed", "incomplete"):
+            with self.subTest(case=case):
+                reviewed, failure_raw, _, _ = (
+                    self.write_reviewed_hardware_health_records()
+                )
+                evidence = (
+                    self.failure.parent
+                    / "recovery-evidence"
+                    / reviewed.stability_directory
+                )
+                if case == "changed":
+                    (evidence / "samples.tsv").write_bytes(b"changed\n")
+                else:
+                    (evidence / "summary.tsv").unlink()
+                with (
+                    self.patched_environment(),
+                    mock.patch.object(
+                        recovery, "_current_boot_id", return_value="a" * 32
+                    ),
+                    self.assertRaises(recovery.RecoveryBlocked),
+                ):
+                    recovery._verify_stability_evidence(reviewed)
+                self.assertEqual(self.failure.read_bytes(), failure_raw)
+                self.tearDown()
+                self.setUp()
+
+    def test_reviewed_hardware_health_rejects_boot_or_post_observation_event(self):
+        reviewed, _, _, _ = self.write_reviewed_hardware_health_records()
+        with (
+            self.patched_environment(),
+            mock.patch.object(recovery, "_current_boot_id", return_value="b" * 32),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "another boot"),
+        ):
+            recovery._verify_stability_evidence(reviewed)
+
+        events = (
+            "kernel: spd5118 10-0053: failed to read: error -6",
+            "kernel: PM: suspend entry (deep)",
+        )
+        for event in events:
+            result = subprocess.CompletedProcess(
+                [], 0, f"{event}\n-- cursor: current\n", ""
+            )
+            with (
+                self.subTest(event=event),
+                mock.patch.object(recovery.subprocess, "run", return_value=result),
+                self.assertRaises(recovery.RecoveryBlocked),
+            ):
+                recovery._kernel_history_after_observation("test-cursor")
+
+    def test_reviewed_hardware_health_preflight_binds_all_evidence(self):
+        reviewed, failure_raw, current_raw, stability = (
+            self.write_reviewed_hardware_health_records()
+        )
+        historical = b'{"retained_lines":["spd5118 error -6"]}\n'
+        with (
+            self.patched_environment(),
+            mock.patch.dict(
+                recovery.REVIEWED_HARDWARE_HEALTH_ALLOWLIST,
+                {reviewed.incident_reference: reviewed},
+            ),
+            mock.patch.object(recovery, "_current_boot_id", return_value="a" * 32),
+            mock.patch.object(
+                recovery, "_verify_corrected_source_revision", return_value="c" * 40
+            ),
+            mock.patch.object(
+                recovery, "_detector_policy_is_reviewed", return_value=self.config_raw
+            ),
+            mock.patch.object(
+                recovery, "_verify_historical_running_environment"
+            ) as runtime_verify,
+            mock.patch.object(
+                recovery, "_verify_service_and_hardware", return_value={}
+            ) as health,
+            mock.patch.object(recovery, "_kernel_history_after_observation") as kernel,
+            mock.patch.object(
+                recovery, "_historical_kernel_evidence", return_value=historical
+            ),
+        ):
+            binding = recovery._hardware_health_clearance_preflight(
+                reviewed.incident_reference,
+                reviewed.latch_sha256,
+                reviewed.code,
+                reviewed.original_reason,
+                reviewed.stability_manifest_sha256,
+            )
+        self.assertEqual(binding.failure_raw, failure_raw)
+        self.assertEqual(binding.current_state_raw, current_raw)
+        self.assertEqual(binding.config_raw, self.config_raw)
+        self.assertEqual(binding.stability, stability)
+        self.assertEqual(binding.historical_kernel_raw, historical)
+        runtime_verify.assert_called_once()
+        health.assert_called_once_with(None)
+        kernel.assert_called_once_with(stability.journal_cursor)
+
+    def test_reviewed_hardware_health_propagates_runtime_and_hardware_failures(self):
+        reviewed, failure_raw, _, _ = self.write_reviewed_hardware_health_records()
+        cases = (
+            ("runtime", "RAM Tetris preference is not OFF"),
+            ("runtime", "SDK identity is not healthy"),
+            ("health", "accepted controller inventory is incomplete"),
+            ("health", "10-0053 temperature is unreadable"),
+        )
+        for verifier, message in cases:
+            runtime_effect = (
+                recovery.RecoveryBlocked(message) if verifier == "runtime" else None
+            )
+            health_effect = (
+                recovery.RecoveryBlocked(message) if verifier == "health" else None
+            )
+            with (
+                self.subTest(verifier=verifier, message=message),
+                self.patched_environment(),
+                mock.patch.dict(
+                    recovery.REVIEWED_HARDWARE_HEALTH_ALLOWLIST,
+                    {reviewed.incident_reference: reviewed},
+                ),
+                mock.patch.object(
+                    recovery, "_current_boot_id", return_value="a" * 32
+                ),
+                mock.patch.object(
+                    recovery,
+                    "_verify_corrected_source_revision",
+                    return_value="c" * 40,
+                ),
+                mock.patch.object(
+                    recovery,
+                    "_detector_policy_is_reviewed",
+                    return_value=self.config_raw,
+                ),
+                mock.patch.object(
+                    recovery,
+                    "_verify_historical_running_environment",
+                    side_effect=runtime_effect,
+                ),
+                mock.patch.object(
+                    recovery,
+                    "_verify_service_and_hardware",
+                    side_effect=health_effect,
+                ),
+                mock.patch.object(recovery, "_kernel_history_after_observation"),
+                mock.patch.object(
+                    recovery, "_historical_kernel_evidence", return_value=b"{}\n"
+                ),
+                self.assertRaisesRegex(recovery.RecoveryBlocked, message),
+            ):
+                recovery._hardware_health_clearance_preflight(
+                    reviewed.incident_reference,
+                    reviewed.latch_sha256,
+                    reviewed.code,
+                    reviewed.original_reason,
+                    reviewed.stability_manifest_sha256,
+                )
+        self.assertEqual(self.failure.read_bytes(), failure_raw)
+
+    def test_reviewed_hardware_health_clearance_preserves_evidence_without_operations(
+        self,
+    ):
+        reviewed, failure_raw, current_raw, stability = (
+            self.write_reviewed_hardware_health_records()
+        )
+        historical = b'{"retained_lines":["spd5118 error -6"]}\n'
+        binding = recovery.HardwareHealthClearanceBinding(
+            failure_raw,
+            current_raw,
+            self.config_raw,
+            stability,
+            historical,
+            1_792_651_066.1584392,
+            "c" * 40,
+        )
+        with (
+            self.patched_environment(),
+            mock.patch.dict(
+                recovery.REVIEWED_HARDWARE_HEALTH_ALLOWLIST,
+                {reviewed.incident_reference: reviewed},
+            ),
+            mock.patch.object(
+                recovery,
+                "_hardware_health_clearance_preflight",
+                return_value=binding,
+            ) as preflight,
+            mock.patch.object(
+                recovery, "_verify_hardware_health_continuity"
+            ) as continuity,
+            mock.patch.object(
+                recovery.subprocess,
+                "run",
+                side_effect=AssertionError("no service or RGB operation is permitted"),
+            ),
+        ):
+            result = recovery.clear_reviewed_hardware_health(
+                reviewed.incident_reference,
+                reviewed.latch_sha256,
+                reviewed.code,
+                reviewed.original_reason,
+                reviewed.stability_manifest_sha256,
+            )
+        self.assertFalse(result["failure"])
+        self.assertEqual(result["state"], "off")
+        self.assertEqual(preflight.call_count, 2)
+        continuity.assert_called_once_with(reviewed, binding)
+        self.assertFalse(self.failure.exists())
+        self.assertEqual(
+            (self.failure.parent / "ram-tetris-enabled").read_bytes(), b"off\n"
+        )
+        evidence = self.failure.parent / "recovery-evidence"
+        for kind, raw in (
+            ("failure", failure_raw),
+            ("lifecycle-state", current_raw),
+            ("openrgb-config", self.config_raw),
+            ("hardware-kernel-history", historical),
+        ):
+            self.assertEqual(
+                (evidence / f"{reviewed.incident_reference}.{kind}.json").read_bytes(),
+                raw,
+            )
+        retained = evidence / (
+            f"{reviewed.incident_reference}.hardware-health-observation"
+        )
+        self.assertEqual(
+            {path.name for path in retained.iterdir()},
+            {name for name, _raw in stability.files},
+        )
+
+    def test_reviewed_hardware_health_rejects_preservation_or_latch_change(self):
+        for case in ("preservation", "latch-change"):
+            with self.subTest(case=case):
+                reviewed, failure_raw, current_raw, stability = (
+                    self.write_reviewed_hardware_health_records()
+                )
+                binding = recovery.HardwareHealthClearanceBinding(
+                    failure_raw,
+                    current_raw,
+                    self.config_raw,
+                    stability,
+                    b"{}\n",
+                    1_792_651_066.1584392,
+                    "c" * 40,
+                )
+                calls = 0
+
+                def preflight(
+                    *_args,
+                    case=case,
+                    failure_raw=failure_raw,
+                    binding=binding,
+                ):
+                    nonlocal calls
+                    calls += 1
+                    if case == "latch-change" and calls == 2:
+                        self.failure.write_bytes(failure_raw + b"changed")
+                    return binding
+
+                preservation = (
+                    mock.patch.object(
+                        recovery,
+                        "_preserve_evidence",
+                        side_effect=OSError("evidence write failed"),
+                    )
+                    if case == "preservation"
+                    else mock.patch.object(
+                        recovery,
+                        "_preserve_evidence",
+                        wraps=recovery._preserve_evidence,
+                    )
+                )
+                with (
+                    self.patched_environment(),
+                    mock.patch.dict(
+                        recovery.REVIEWED_HARDWARE_HEALTH_ALLOWLIST,
+                        {reviewed.incident_reference: reviewed},
+                    ),
+                    mock.patch.object(
+                        recovery,
+                        "_hardware_health_clearance_preflight",
+                        side_effect=preflight,
+                    ),
+                    preservation,
+                    self.assertRaises((recovery.RecoveryBlocked, OSError)),
+                ):
+                    recovery.clear_reviewed_hardware_health(
+                        reviewed.incident_reference,
+                        reviewed.latch_sha256,
+                        reviewed.code,
+                        reviewed.original_reason,
+                        reviewed.stability_manifest_sha256,
+                    )
+                self.assertTrue(self.failure.exists())
+                self.tearDown()
+                self.setUp()
+
+    def test_concurrent_reviewed_hardware_health_clearance_is_blocked(self):
+        reviewed, failure_raw, _, _ = self.write_reviewed_hardware_health_records()
+        self.runtime.mkdir(parents=True)
+        self.runtime.chmod(0o700)
+        descriptor = os.open(
+            self.runtime / "lighting-recovery.lock", os.O_WRONLY | os.O_CREAT, 0o600
+        )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with (
+                self.patched_environment(),
+                mock.patch.dict(
+                    recovery.REVIEWED_HARDWARE_HEALTH_ALLOWLIST,
+                    {reviewed.incident_reference: reviewed},
+                ),
+                self.assertRaisesRegex(recovery.RecoveryBlocked, "another recovery"),
+            ):
+                recovery.clear_reviewed_hardware_health(
+                    reviewed.incident_reference,
+                    reviewed.latch_sha256,
+                    reviewed.code,
+                    reviewed.original_reason,
+                    reviewed.stability_manifest_sha256,
                 )
         finally:
             os.close(descriptor)

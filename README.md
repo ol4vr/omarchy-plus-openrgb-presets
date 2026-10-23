@@ -304,6 +304,47 @@ The reviewed command requires all explicit bindings:
 This is an administrative command, not a general failure-latch override. A
 future reviewed software race requires a new source entry and release.
 
+Version 0.4.27 adds a separate, incident-bound administrative clearance for
+the transient SPD5118 failure `LR-E8FE394802531DE7`. The command accepts only
+that incident's exact `LGT-CTL-002` reason, latch checksum, and independently
+verified 60-second stability-manifest checksum. General Recover eligibility
+and every other hardware failure remain blocked.
+
+`clear-reviewed-hardware-health` requires the protected observation directory
+to contain exactly its reviewed seven files with mode-protected ownership,
+valid checksums, 240 successful sensor reads, and no observation-window kernel
+error. Its journal cursor must belong to the current boot, and any later
+suspend, resume, relevant I2C/SMBus/SPD error, missing sensor, controller or SDK
+identity change, active writer, owned write lock, or ON Tetris preference
+refuses clearance. Historical resume errors remain retained evidence rather
+than being reclassified as clean history.
+
+Under the existing recovery singleton, the command verifies the complete
+service, unit, package, detector, lifecycle, SDK, listener, cgroup,
+seven-controller, four-DIMM, four-SPD5118, preset, and Effects contract twice.
+It preserves byte-identical latch, lifecycle, OpenRGB configuration, historical
+kernel, and complete stability-observation evidence before removing only the
+unchanged latch with inode validation and parent-directory fsync. A final
+continuity check leaves Tetris OFF. It performs no service operation, preset
+selection, RGB write, or Tetris activation.
+
+The reviewed command requires all explicit bindings:
+
+```bash
+~/.config/omarchy/plugins/io.github.ol4vr.openrgb-presets/lighting-recovery \
+  clear-reviewed-hardware-health \
+  --incident-reference LR-E8FE394802531DE7 \
+  --latch-sha256 e8fe394802531de7e636be00d781a7c46b9c290041f994a1dce46ed4fe45469d \
+  --error-code LGT-CTL-002 \
+  --original-reason '10-0053 temperature is unreadable' \
+  --stability-manifest-sha256 3189b7c1846f8edc4327c22319eca739d671803696cb15fe78245ccbcdbc0234 \
+  --acknowledge-reviewed-hardware-health
+```
+
+This command is source preparation only until the reviewed version is
+published, deployed, Tetris is explicitly left OFF, and the owner separately
+authorizes the live clearance.
+
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
 The experimental orange, blue, and red Sunrise gradients are therefore stored
@@ -812,6 +853,16 @@ software-race administrative subcommand and its source allowlist. Preserve the
 failure latch and every retained evidence file. Rollback does not authorize a
 service operation, preset write, Tetris activation, evidence removal, or use of
 the general Recover action for `LGT-TET-002`.
+
+## Roll back the 0.4.27 reviewed hardware-health clearance
+
+Redeploy exact published v0.4.26 commit
+`e7d66ee00cd35a7aa95e873bd6c051bf41254763`. This removes only the
+incident-bound SPD5118 administrative command and its source allowlist.
+Preserve the latch, stability observation, retained kernel history, and every
+other recovery artifact. Rollback does not authorize changing the Tetris
+preference, operating the service, writing RGB state, or clearing any hardware
+failure.
 
 ## Remove
 
