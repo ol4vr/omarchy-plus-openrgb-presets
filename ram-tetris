@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import glob
+import hashlib
 import importlib
 import json
 import os
@@ -34,6 +35,8 @@ core = importlib.import_module("ram_tetris_core")
 
 HOST = "127.0.0.1"
 PORT = 6742
+SOURCE_VERSION = "0.4.30"
+SOURCE_PATH = "ram-tetris"
 EXPECTED_CONTROLLER_COUNT = 7
 HARDWARE_GATE_ATTEMPTS = 15
 HARDWARE_GATE_RETRY_SECONDS = 1.0
@@ -252,6 +255,41 @@ def _write_json(path: Path, value: object) -> None:
 
 def _write_json_if_absent(path: Path, value: object) -> bool:
     return _atomic_text_if_absent(path, json.dumps(value, sort_keys=True) + "\n")
+
+
+def _source_provenance() -> dict[str, str]:
+    """Return bounded source identity for future recovery classification."""
+
+    try:
+        revision = subprocess.run(
+            [
+                "/usr/bin/git",
+                "-C",
+                str(Path(__file__).resolve().parent),
+                "rev-parse",
+                "HEAD",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        value = revision.stdout.strip()
+        if revision.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", value):
+            value = "unavailable"
+    except (OSError, subprocess.TimeoutExpired):
+        value = "unavailable"
+    try:
+        source_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    except OSError:
+        source_sha256 = "unavailable"
+    return {
+        "component": "ram-tetris",
+        "version": SOURCE_VERSION,
+        "revision": value,
+        "path": SOURCE_PATH,
+        "sha256": source_sha256,
+    }
 
 
 def _preference() -> bool:
@@ -999,6 +1037,7 @@ class RuntimeControl:
             "message": message,
             "pid": os.getpid(),
             "time": time.time(),
+            "source": _source_provenance(),
         }
         if evidence:
             value["evidence_version"] = 1

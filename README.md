@@ -395,6 +395,68 @@ lifecycle exit. These labels change diagnostics only: no retry, fallback
 signal, relaxed identity match, automatic recovery, or recovery eligibility is
 introduced.
 
+Version 0.4.30 adds a reusable, evidence-qualified recovery category for a
+transient read failure from one of Hugin's four kernel-managed SPD5118
+temperature endpoints. Eligibility is derived from the raw protected latch,
+never from `LGT-CTL-002`. New evidence must identify
+`spd5118-temperature`, the exact `10-0050` through `10-0053` endpoint, the
+normalized sensor path, an `OSError`, and the approved `kernel-read-error`
+state together with the exact Git revision, source path, and source checksum.
+Empty, malformed, wrong-driver, missing-path, invalid-value, ownership,
+unknown, and persistent failures remain ineligible.
+
+The current legacy v0.4.27 latch can enter the same category only when its
+four-field schema and exact `temperature is unreadable` reason match and the
+repository still contains the reviewed v0.4.27 `ram-tetris` source blob at
+`d7c2214fae1cbd17ff2044923ecf1a8fff53c49d`. That source combined kernel
+read and integer parsing exceptions, so retained evidence records the honest
+`legacy-read-or-parse-error` classification rather than inventing an errno.
+This is a release-and-source provenance rule, not an incident-reference
+allowlist.
+
+`observe-transient-spd` takes the existing recovery singleton, requires
+Tetris OFF, zero writers, free write/writer locks, the authenticated lifecycle,
+SDK, listener, inhibitor, monitor and cgroup, seven controllers, four DIMMs,
+four readable sensors, and the current preset/Effects contract. It captures a
+current-boot journal cursor, then reads each sensor once per second for 60
+samples without retry or catch-up. Any missed cadence, failed read, ownership
+change, relevant kernel error, suspend/resume, boot change, or incomplete
+240-reading result refuses the observation. The completed evidence directory
+is private, atomically published, checksum indexed, and bound to the unchanged
+latch and exact lifecycle/SDK identities. It performs no RGB write or service
+operation and creates no monitor, timer, or daemon.
+
+After separate review, `clear-reviewed-transient-spd` accepts only the exact
+observation directory and manifest checksum reported by that command. It
+requires the same boot, suspend count, lifecycle and SDK identities, a clean
+post-observation kernel window, Tetris OFF, zero writers, and the complete
+hardware and Effects gates. It preserves byte-identical latch, lifecycle,
+configuration, observation metadata, and full observation evidence; repeats
+every preflight; removes only the unchanged latch with inode verification and
+parent-directory fsync; and repeats continuity checks afterward. It leaves
+Tetris OFF and never starts or restarts a service, selects a preset, or writes
+an RGB frame.
+
+The administrative sequence is intentionally two-step:
+
+```bash
+lighting-recovery observe-transient-spd \
+  --acknowledge-read-only-observation
+
+lighting-recovery clear-reviewed-transient-spd \
+  --observation-directory LR-...-transient-spd-... \
+  --stability-manifest-sha256 <sha256-from-observation> \
+  --acknowledge-reviewed-transient-spd
+```
+
+This source-only release does not change `Panel.qml`. A later UI release can
+safely make Recover serialize the same two commands: show the bounded
+observation as working, pass only the returned directory and manifest to
+clearance, return to the normal OFF toggle only after the verified clearance
+result, and otherwise display the backend's actual blocker. The UI must not
+derive eligibility itself, retry automatically, or treat a display code as
+authorization.
+
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
 The experimental orange, blue, and red Sunrise gradients are therefore stored

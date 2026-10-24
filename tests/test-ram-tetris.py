@@ -792,6 +792,39 @@ class CheckpointTests(unittest.TestCase):
                 control.fail("later failure", {"writer_progress_count": 99})
                 self.assertEqual(control.failure_path.read_bytes(), first)
 
+    def test_failure_latch_records_bounded_source_provenance(self):
+        provenance = {
+            "component": "ram-tetris",
+            "version": "0.4.30",
+            "revision": "a" * 40,
+            "path": "ram-tetris",
+            "sha256": "b" * 64,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {
+                "XDG_STATE_HOME": str(Path(directory, "state")),
+                "OPENRGB_RUNTIME_DIR": str(Path(directory, "runtime")),
+            }
+            with (
+                mock.patch.dict(os.environ, environment, clear=False),
+                mock.patch.object(
+                    runtime, "_source_provenance", return_value=provenance
+                ),
+            ):
+                control = runtime.RuntimeControl()
+                control.fail(
+                    "10-0053 temperature is unreadable",
+                    {
+                        "failure_kind": "spd5118-temperature",
+                        "endpoint": "10-0053",
+                        "sensor": "10-0053/hwmon/temp1_input",
+                        "read_state": "kernel-read-error",
+                        "exception_type": "OSError",
+                    },
+                )
+                failure = json.loads(control.failure_path.read_text())
+        self.assertEqual(failure["source"], provenance)
+
     def test_runtime_lock_identity_and_failure_latch_are_immediate_gates(self):
         with tempfile.TemporaryDirectory() as directory:
             environment = {

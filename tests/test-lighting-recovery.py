@@ -330,6 +330,142 @@ class LightingRecoveryTests(unittest.TestCase):
             stability = recovery._verify_stability_evidence(reviewed)
         return reviewed, failure_raw, current_raw, stability
 
+    def write_transient_spd_records(self):
+        failure_time = time.time() - 120
+        failure_raw = (
+            json.dumps(
+                {
+                    "message": "10-0053 temperature is unreadable",
+                    "pid": 77,
+                    "state": "failed",
+                    "time": failure_time,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            + b"\n"
+        )
+        incident = recovery.TransientSpdIncident(
+            failure_raw=failure_raw,
+            incident_reference=recovery._incident_reference(failure_raw),
+            latch_sha256=hashlib.sha256(failure_raw).hexdigest(),
+            original_reason="10-0053 temperature is unreadable",
+            endpoint="10-0053",
+            failure_time=failure_time,
+            classification="legacy-read-or-parse-error",
+            source_revision=recovery.LEGACY_TRANSIENT_SPD_REVISION,
+            source_path=recovery.LEGACY_TRANSIENT_SPD_SOURCE_PATH,
+            source_sha256=recovery.LEGACY_TRANSIENT_SPD_SOURCE_SHA256,
+        )
+        boot_id = "a" * 32
+        cursor_start = f"s=start;i=1;b={boot_id};m=1;t=1;x=1"
+        cursor_end = f"s=end;i=2;b={boot_id};m=2;t=2;x=2"
+        started = time.time() - 70
+        ended = started + 59
+        current_raw = (
+            json.dumps(
+                {
+                    "boot_id": boot_id,
+                    "lifecycle_pid": 51,
+                    "lifecycle_start": "5100",
+                    "reason": recovery.HISTORICAL_READY_REASON,
+                    "server_pid": 52,
+                    "server_start": "5200",
+                    "state": "ready",
+                    "time": failure_time + 1,
+                },
+                sort_keys=True,
+            ).encode()
+            + b"\n"
+        )
+        sample_lines = [
+            "sample\twall_time\tmonotonic_s\tendpoint\tstatus\ttemp_mc\tdetail"
+        ]
+        for sample in range(1, 61):
+            wall = recovery.datetime.fromtimestamp(
+                started + sample - 1, recovery.UTC
+            ).isoformat(timespec="microseconds")
+            for offset, endpoint in enumerate(recovery.TRANSIENT_SPD_ENDPOINTS):
+                sample_lines.append(
+                    f"{sample}\t{wall}\t{1000 + sample - 1:.6f}\t{endpoint}"
+                    f"\tok\t{36000 + offset * 1000}\t-"
+                )
+        metadata = {
+            "schema_version": 1,
+            "category": "reviewed-transient-spd",
+            "plugin_version": "0.4.30",
+            "incident": {
+                "reference": incident.incident_reference,
+                "latch_sha256": incident.latch_sha256,
+                "reason": incident.original_reason,
+                "endpoint": incident.endpoint,
+                "classification": incident.classification,
+                "source_revision": incident.source_revision,
+                "source_path": incident.source_path,
+                "source_sha256": incident.source_sha256,
+            },
+            "environment": {
+                "boot_id": boot_id,
+                "suspend_count": 11,
+                "lifecycle_pid": 51,
+                "lifecycle_start": "5100",
+                "server_pid": 52,
+                "server_start": "5200",
+                "kernel_cursor_start": cursor_start,
+                "kernel_cursor_end": cursor_end,
+            },
+            "observation": {
+                "started": recovery.datetime.fromtimestamp(
+                    started, recovery.UTC
+                ).isoformat(timespec="microseconds"),
+                "ended": recovery.datetime.fromtimestamp(ended, recovery.UTC).isoformat(
+                    timespec="microseconds"
+                ),
+                "samples_completed": 60,
+                "readings_completed": 240,
+                "status": "complete",
+            },
+        }
+        payloads = {
+            "failure-latch.json": failure_raw,
+            "kernel-relevant.log": b"",
+            "metadata.json": (json.dumps(metadata, sort_keys=True) + "\n").encode(),
+            "samples.tsv": ("\n".join(sample_lines) + "\n").encode(),
+        }
+        manifest = b"".join(
+            f"{hashlib.sha256(payloads[name]).hexdigest()}  {name}\n".encode()
+            for name in sorted(payloads)
+        )
+        manifest_sha256 = hashlib.sha256(manifest).hexdigest()
+        directory_name = (
+            f"{incident.incident_reference}-transient-spd-20261024T100000+0200"
+        )
+        directory = self.failure.parent / "recovery-evidence" / directory_name
+        directory.mkdir(parents=True)
+        self.failure.parent.chmod(0o700)
+        directory.parent.chmod(0o700)
+        directory.chmod(0o700)
+        for name, raw in (payloads | {"manifest.sha256": manifest}).items():
+            path = directory / name
+            path.write_bytes(raw)
+            path.chmod(0o600)
+        for path, raw in (
+            (self.failure, failure_raw),
+            (self.lifecycle_state, current_raw),
+            (self.failure.parent / "ram-tetris-enabled", b"off\n"),
+        ):
+            path.write_bytes(raw)
+            path.chmod(0o600)
+        with (
+            self.patched_environment(),
+            mock.patch.object(recovery, "_current_boot_id", return_value=boot_id),
+            mock.patch.object(recovery, "_current_suspend_count", return_value=11),
+        ):
+            observation = recovery._verify_transient_spd_observation(
+                incident, directory_name, manifest_sha256
+            )
+        return incident, current_raw, observation
+
     def test_stable_code_mapping_and_subsystems(self):
         cases = {
             "writer termination was not preceded by an authenticated lifecycle stop request": (
@@ -2118,6 +2254,485 @@ class LightingRecoveryTests(unittest.TestCase):
         finally:
             os.close(descriptor)
         self.assertEqual(self.failure.read_bytes(), failure_raw)
+
+    def test_transient_spd_classifies_legacy_and_structured_evidence(self):
+        incident, _, _ = self.write_transient_spd_records()
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery,
+                "_verify_corrected_source_revision",
+                return_value="f" * 40,
+            ),
+            mock.patch.object(
+                recovery,
+                "_source_blob_sha256",
+                return_value=recovery.LEGACY_TRANSIENT_SPD_SOURCE_SHA256,
+            ),
+        ):
+            actual = recovery._classify_transient_spd_incident()
+        self.assertEqual(actual, incident)
+        self.assertEqual(actual.classification, "legacy-read-or-parse-error")
+
+        structured = json.loads(incident.failure_raw)
+        structured["evidence_version"] = 1
+        structured["details"] = {
+            "failure_kind": "spd5118-temperature",
+            "endpoint": "10-0053",
+            "sensor": "10-0053/hwmon/temp1_input",
+            "read_state": "kernel-read-error",
+            "exception_type": "OSError",
+            "errno": 5,
+        }
+        structured["source"] = {
+            "component": "ram-tetris",
+            "version": "0.4.30",
+            "revision": "a" * 40,
+            "path": "ram-tetris",
+            "sha256": "b" * 64,
+        }
+        self.failure.write_bytes(
+            (json.dumps(structured, sort_keys=True) + "\n").encode()
+        )
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery,
+                "_verify_corrected_source_revision",
+                return_value="a" * 40,
+            ),
+            mock.patch.object(recovery, "_source_blob_sha256", return_value="b" * 64),
+        ):
+            actual = recovery._classify_transient_spd_incident()
+        self.assertEqual(actual.classification, "structured-kernel-read-error")
+        self.assertEqual(actual.endpoint, "10-0053")
+
+    def test_transient_spd_rejects_wrong_classification_and_provenance(self):
+        incident, _, _ = self.write_transient_spd_records()
+        wrong_endpoint = json.loads(incident.failure_raw)
+        wrong_endpoint["message"] = "10-0054 temperature is unreadable"
+        self.failure.write_bytes(
+            (json.dumps(wrong_endpoint, sort_keys=True) + "\n").encode()
+        )
+        with (
+            self.patched_environment(),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "not an eligible"),
+        ):
+            recovery._classify_transient_spd_incident()
+
+        value = json.loads(incident.failure_raw)
+        value["evidence_version"] = 1
+        value["details"] = {
+            "failure_kind": "spd5118-temperature",
+            "endpoint": "10-0053",
+            "sensor": "10-0053/hwmon/temp1_input",
+            "read_state": "malformed",
+            "exception_type": "ValueError",
+        }
+        value["source"] = {
+            "component": "ram-tetris",
+            "version": "0.4.30",
+            "revision": "a" * 40,
+            "path": "ram-tetris",
+            "sha256": "b" * 64,
+        }
+        self.failure.write_bytes((json.dumps(value, sort_keys=True) + "\n").encode())
+        with (
+            self.patched_environment(),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "not an approved"),
+        ):
+            recovery._classify_transient_spd_incident()
+
+        self.failure.write_bytes(incident.failure_raw)
+        with (
+            self.patched_environment(),
+            mock.patch.object(recovery, "_verify_corrected_source_revision"),
+            mock.patch.object(recovery, "_source_blob_sha256", return_value="0" * 64),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "provenance changed"),
+        ):
+            recovery._classify_transient_spd_incident()
+
+    def test_transient_spd_preflight_rejects_writer_and_incomplete_inventory(self):
+        incident, current_raw, _ = self.write_transient_spd_records()
+        cases = (
+            ("runtime", "a RAM Tetris writer owns its lock"),
+            ("runtime", "RAM Tetris preference is not OFF"),
+            ("health", "accepted controller inventory is incomplete"),
+            ("health", "DIMM state changed outside the Tetris writer"),
+        )
+        for boundary, message in cases:
+            with (
+                self.subTest(boundary=boundary),
+                self.patched_environment(),
+                mock.patch.object(
+                    recovery, "_read_protected_bytes", return_value=current_raw
+                ),
+                mock.patch.object(recovery, "_current_boot_id", return_value="a" * 32),
+                mock.patch.object(
+                    recovery,
+                    "_detector_policy_is_reviewed",
+                    return_value=self.config_raw,
+                ),
+                mock.patch.object(
+                    recovery,
+                    "_verify_historical_running_environment",
+                    side_effect=(
+                        recovery.RecoveryBlocked(message)
+                        if boundary == "runtime"
+                        else None
+                    ),
+                ),
+                mock.patch.object(
+                    recovery,
+                    "_verify_service_and_hardware",
+                    side_effect=(
+                        recovery.RecoveryBlocked(message)
+                        if boundary == "health"
+                        else None
+                    ),
+                ),
+                self.assertRaisesRegex(recovery.RecoveryBlocked, message),
+            ):
+                recovery._transient_spd_environment_preflight(incident)
+
+    def test_transient_spd_clearance_rejects_changed_lifecycle_identity(self):
+        incident, current_raw, observation = self.write_transient_spd_records()
+        changed = recovery.TransientSpdObservation(
+            directory_name=observation.directory_name,
+            manifest_sha256=observation.manifest_sha256,
+            files=observation.files,
+            metadata_raw=observation.metadata_raw,
+            journal_cursor=observation.journal_cursor,
+            observation_start=observation.observation_start,
+            observation_end=observation.observation_end,
+            boot_id=observation.boot_id,
+            suspend_count=observation.suspend_count,
+            lifecycle_pid=999,
+            lifecycle_start=observation.lifecycle_start,
+            server_pid=observation.server_pid,
+            server_start=observation.server_start,
+        )
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery, "_classify_transient_spd_incident", return_value=incident
+            ),
+            mock.patch.object(
+                recovery, "_verify_transient_spd_observation", return_value=changed
+            ),
+            mock.patch.object(
+                recovery,
+                "_transient_spd_environment_preflight",
+                return_value=(current_raw, self.config_raw, {}),
+            ),
+            mock.patch.object(recovery, "_current_boot_id", return_value="a" * 32),
+            mock.patch.object(recovery, "_current_suspend_count", return_value=11),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "identity changed"),
+        ):
+            recovery._transient_spd_clearance_preflight(
+                observation.directory_name, observation.manifest_sha256
+            )
+
+    def test_transient_spd_observation_must_follow_incident(self):
+        incident, _, observation = self.write_transient_spd_records()
+        stale = recovery.TransientSpdObservation(
+            directory_name=observation.directory_name,
+            manifest_sha256=observation.manifest_sha256,
+            files=observation.files,
+            metadata_raw=observation.metadata_raw,
+            journal_cursor=observation.journal_cursor,
+            observation_start=incident.failure_time - 1,
+            observation_end=incident.failure_time + 58,
+            boot_id=observation.boot_id,
+            suspend_count=observation.suspend_count,
+            lifecycle_pid=observation.lifecycle_pid,
+            lifecycle_start=observation.lifecycle_start,
+            server_pid=observation.server_pid,
+            server_start=observation.server_start,
+        )
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery, "_classify_transient_spd_incident", return_value=incident
+            ),
+            mock.patch.object(
+                recovery, "_verify_transient_spd_observation", return_value=stale
+            ),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "predates the incident"),
+        ):
+            recovery._transient_spd_clearance_preflight(
+                observation.directory_name, observation.manifest_sha256
+            )
+
+    def test_transient_spd_observation_verifies_integrity_boot_and_suspend(self):
+        incident, _, observation = self.write_transient_spd_records()
+        with (
+            self.patched_environment(),
+            mock.patch.object(recovery, "_current_boot_id", return_value="a" * 32),
+            mock.patch.object(recovery, "_current_suspend_count", return_value=11),
+        ):
+            actual = recovery._verify_transient_spd_observation(
+                incident,
+                observation.directory_name,
+                observation.manifest_sha256,
+            )
+        self.assertEqual(actual, observation)
+
+        for name, patcher, message in (
+            (
+                "boot",
+                mock.patch.object(recovery, "_current_boot_id", return_value="b" * 32),
+                "environment no longer matches",
+            ),
+            (
+                "suspend",
+                mock.patch.object(recovery, "_current_suspend_count", return_value=12),
+                "environment no longer matches",
+            ),
+        ):
+            with (
+                self.subTest(name=name),
+                self.patched_environment(),
+                patcher,
+                mock.patch.object(
+                    recovery,
+                    "_current_boot_id",
+                    return_value="b" * 32 if name == "boot" else "a" * 32,
+                )
+                if name == "suspend"
+                else mock.patch.object(
+                    recovery, "_current_suspend_count", return_value=11
+                ),
+                self.assertRaisesRegex(recovery.RecoveryBlocked, message),
+            ):
+                recovery._verify_transient_spd_observation(
+                    incident,
+                    observation.directory_name,
+                    observation.manifest_sha256,
+                )
+
+    def test_transient_spd_rejects_changed_evidence_or_kernel_event(self):
+        incident, _, observation = self.write_transient_spd_records()
+        evidence = (
+            self.failure.parent / "recovery-evidence" / observation.directory_name
+        )
+        (evidence / "samples.tsv").write_bytes(b"changed\n")
+        with (
+            self.patched_environment(),
+            mock.patch.object(recovery, "_current_boot_id", return_value="a" * 32),
+            mock.patch.object(recovery, "_current_suspend_count", return_value=11),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "checksum failed"),
+        ):
+            recovery._verify_transient_spd_observation(
+                incident,
+                observation.directory_name,
+                observation.manifest_sha256,
+            )
+
+        event = subprocess.CompletedProcess(
+            [], 0, "kernel: i801 SMBus timeout\n-- cursor: current\n", ""
+        )
+        with (
+            mock.patch.object(recovery.subprocess, "run", return_value=event),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "communication error"),
+        ):
+            recovery._kernel_history_after_observation("cursor")
+
+    def test_transient_spd_rejects_mismatched_incomplete_or_unprotected_evidence(self):
+        for case in ("mismatched-latch", "incomplete", "unprotected"):
+            with self.subTest(case=case):
+                incident, _, observation = self.write_transient_spd_records()
+                evidence = (
+                    self.failure.parent
+                    / "recovery-evidence"
+                    / observation.directory_name
+                )
+                manifest_sha256 = observation.manifest_sha256
+                if case == "mismatched-latch":
+                    (evidence / "failure-latch.json").write_bytes(b"{}\n")
+                    payloads = {
+                        name: (evidence / name).read_bytes()
+                        for name in recovery.TRANSIENT_SPD_EVIDENCE_FILES
+                    }
+                    manifest = b"".join(
+                        f"{hashlib.sha256(payloads[name]).hexdigest()}  {name}\n".encode()
+                        for name in sorted(payloads)
+                    )
+                    (evidence / "manifest.sha256").write_bytes(manifest)
+                    manifest_sha256 = hashlib.sha256(manifest).hexdigest()
+                elif case == "incomplete":
+                    (evidence / "kernel-relevant.log").unlink()
+                else:
+                    (evidence / "samples.tsv").chmod(0o644)
+                with (
+                    self.patched_environment(),
+                    mock.patch.object(
+                        recovery, "_current_boot_id", return_value="a" * 32
+                    ),
+                    mock.patch.object(
+                        recovery, "_current_suspend_count", return_value=11
+                    ),
+                    self.assertRaises(recovery.RecoveryBlocked),
+                ):
+                    recovery._verify_transient_spd_observation(
+                        incident,
+                        observation.directory_name,
+                        manifest_sha256,
+                    )
+                self.tearDown()
+                self.setUp()
+
+    def test_transient_spd_rejects_wrong_sensor_driver_or_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            device = root / "10-0053"
+            wrong_driver = root / "other-driver"
+            wrong_driver.mkdir()
+            device.mkdir()
+            device.joinpath("driver").symlink_to(wrong_driver, target_is_directory=True)
+            with (
+                mock.patch.object(recovery, "SPD_SYSFS_ROOT", root),
+                self.assertRaisesRegex(recovery.RecoveryBlocked, "not bound"),
+            ):
+                recovery._spd_temperature_path("10-0053")
+
+            device.joinpath("driver").unlink()
+            spd_driver = root / "spd5118"
+            spd_driver.mkdir()
+            device.joinpath("driver").symlink_to(spd_driver, target_is_directory=True)
+            with (
+                mock.patch.object(recovery, "SPD_SYSFS_ROOT", root),
+                self.assertRaisesRegex(recovery.RecoveryBlocked, "invalid temperature"),
+            ):
+                recovery._spd_temperature_path("10-0053")
+
+    def test_transient_spd_incomplete_observation_never_publishes_evidence(self):
+        incident, current_raw, _ = self.write_transient_spd_records()
+        evidence_root = self.failure.parent / "recovery-evidence"
+        before = {path.name for path in evidence_root.iterdir()}
+        cursor = f"s=start;i=1;b={'a' * 32};m=1;t=1;x=1"
+        for interruption in (
+            recovery.RecoveryBlocked("10-0053 read failed"),
+            KeyboardInterrupt(),
+        ):
+            with (
+                self.subTest(interruption=type(interruption).__name__),
+                self.patched_environment(),
+                mock.patch.object(
+                    recovery, "_classify_transient_spd_incident", return_value=incident
+                ),
+                mock.patch.object(
+                    recovery,
+                    "_transient_spd_environment_preflight",
+                    return_value=(current_raw, self.config_raw, {}),
+                ),
+                mock.patch.object(recovery, "_current_boot_id", return_value="a" * 32),
+                mock.patch.object(recovery, "_current_suspend_count", return_value=11),
+                mock.patch.object(
+                    recovery, "_spd_temperature_path", return_value=self.root
+                ),
+                mock.patch.object(
+                    recovery, "_capture_kernel_cursor", return_value=cursor
+                ),
+                mock.patch.object(
+                    recovery,
+                    "_process_start",
+                    side_effect=lambda pid: "5100" if pid == 51 else "5200",
+                ),
+                mock.patch.object(
+                    recovery, "_read_spd_temperature", side_effect=interruption
+                ),
+                self.assertRaises(type(interruption)),
+            ):
+                recovery.observe_transient_spd()
+        self.assertEqual({path.name for path in evidence_root.iterdir()}, before)
+
+    def test_transient_spd_clearance_preserves_evidence_without_operations(self):
+        incident, current_raw, observation = self.write_transient_spd_records()
+        binding = recovery.TransientSpdClearanceBinding(
+            incident,
+            current_raw,
+            self.config_raw,
+            observation,
+            "c" * 40,
+        )
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery,
+                "_transient_spd_clearance_preflight",
+                return_value=binding,
+            ) as preflight,
+            mock.patch.object(
+                recovery, "_verify_transient_spd_continuity"
+            ) as continuity,
+            mock.patch.object(
+                recovery.subprocess,
+                "run",
+                side_effect=AssertionError("no service or RGB operation is permitted"),
+            ),
+        ):
+            result = recovery.clear_reviewed_transient_spd(
+                observation.directory_name, observation.manifest_sha256
+            )
+        self.assertEqual(preflight.call_count, 2)
+        continuity.assert_called_once_with(binding)
+        self.assertEqual(result["state"], "off")
+        self.assertFalse(self.failure.exists())
+        retained = (
+            self.failure.parent
+            / "recovery-evidence"
+            / f"{incident.incident_reference}.transient-spd-observation"
+        )
+        self.assertEqual(
+            {path.name for path in retained.iterdir()},
+            {name for name, _ in observation.files},
+        )
+        self.assertEqual(
+            {path.name: path.read_bytes() for path in retained.iterdir()},
+            dict(observation.files),
+        )
+
+    def test_concurrent_transient_spd_clearance_is_blocked(self):
+        incident, _, observation = self.write_transient_spd_records()
+        self.runtime.mkdir(parents=True)
+        self.runtime.chmod(0o700)
+        descriptor = os.open(
+            self.runtime / "lighting-recovery.lock", os.O_WRONLY | os.O_CREAT, 0o600
+        )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with (
+                self.patched_environment(),
+                self.assertRaisesRegex(recovery.RecoveryBlocked, "another recovery"),
+            ):
+                recovery.clear_reviewed_transient_spd(
+                    observation.directory_name, observation.manifest_sha256
+                )
+        finally:
+            os.close(descriptor)
+        self.assertEqual(self.failure.read_bytes(), incident.failure_raw)
+
+    def test_transient_spd_cli_requires_explicit_acknowledgements(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            recovery.build_parser().parse_args(["observe-transient-spd"])
+        observed = recovery.build_parser().parse_args(
+            ["observe-transient-spd", "--acknowledge-read-only-observation"]
+        )
+        self.assertEqual(observed.action, "observe-transient-spd")
+        arguments = [
+            "clear-reviewed-transient-spd",
+            "--observation-directory",
+            "LR-0123456789ABCDEF-transient-spd-20261024T100000+0200",
+            "--stability-manifest-sha256",
+            "a" * 64,
+        ]
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            recovery.build_parser().parse_args(arguments)
+        cleared = recovery.build_parser().parse_args(
+            arguments + ["--acknowledge-reviewed-transient-spd"]
+        )
+        self.assertEqual(cleared.action, "clear-reviewed-transient-spd")
 
     def test_copy_diagnostics_is_sanitized_and_truncates_long_reason(self):
         long_reason = "/home/private/secret/config token=actual-secret " + "x" * 700

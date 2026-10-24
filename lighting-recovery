@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -28,6 +29,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import pairwise
 from pathlib import Path
 from typing import Final
 
@@ -48,6 +50,10 @@ PROC_ROOT: Final = Path(os.environ.get("PROC_ROOT", "/proc"))
 BOOT_ID_PATH: Final = Path(
     os.environ.get("BOOT_ID_PATH", "/proc/sys/kernel/random/boot_id")
 )
+SUSPEND_COUNT_PATH: Final = Path(
+    os.environ.get("SUSPEND_COUNT_PATH", "/sys/power/suspend_stats/success")
+)
+SPD_SYSFS_ROOT: Final = Path(os.environ.get("SPD_SYSFS_ROOT", "/sys/bus/i2c/devices"))
 MAX_COPY_REASON: Final = 360
 SENSITIVE_VALUE: Final = re.compile(
     r"(?i)\b(password|passwd|token|secret|api[_-]?key|authorization)"
@@ -71,6 +77,33 @@ DISABLED_DETECTOR: Final = "ASUS Aura SMBus Motherboard"
 REQUIRED_DETECTOR: Final = "ASUS Aura Motherboard"
 SERVICE_START_TIMEOUT: Final = 125.0
 LIFECYCLE_READY_POLL_SECONDS: Final = 0.1
+TRANSIENT_SPD_OBSERVATION_SAMPLES: Final = 60
+TRANSIENT_SPD_SAMPLE_INTERVAL_SECONDS: Final = 1.0
+TRANSIENT_SPD_MAX_LATE_SECONDS: Final = 0.25
+TRANSIENT_SPD_ENDPOINTS: Final = (
+    "10-0050",
+    "10-0051",
+    "10-0052",
+    "10-0053",
+)
+TRANSIENT_SPD_REASON: Final = re.compile(r"^(10-005[0-3]) temperature is unreadable$")
+TRANSIENT_SPD_STRUCTURED_READ_STATES: Final = frozenset({"kernel-read-error"})
+LEGACY_TRANSIENT_SPD_REVISION: Final = "d7c2214fae1cbd17ff2044923ecf1a8fff53c49d"
+LEGACY_TRANSIENT_SPD_SOURCE_PATH: Final = "ram-tetris"
+LEGACY_TRANSIENT_SPD_SOURCE_SHA256: Final = (
+    "411853d87488f79a0710d5f5533889417f090e37b168def9742cfbc01c22464f"
+)
+TRANSIENT_SPD_EVIDENCE_FILES: Final = frozenset(
+    {
+        "failure-latch.json",
+        "kernel-relevant.log",
+        "metadata.json",
+        "samples.tsv",
+    }
+)
+TRANSIENT_SPD_DIRECTORY: Final = re.compile(
+    r"^LR-[0-9A-F]{16}-transient-spd-[0-9]{8}T[0-9]{6}[+-][0-9]{4}$"
+)
 
 LIFECYCLE_ARGV: Final = (
     "/usr/bin/bash",
@@ -221,6 +254,46 @@ class HardwareHealthClearanceBinding:
     historical_kernel_raw: bytes
     failure_time: float
     source_revision: str
+
+
+@dataclass(frozen=True)
+class TransientSpdIncident:
+    failure_raw: bytes
+    incident_reference: str
+    latch_sha256: str
+    original_reason: str
+    endpoint: str
+    failure_time: float
+    classification: str
+    source_revision: str
+    source_path: str
+    source_sha256: str
+
+
+@dataclass(frozen=True)
+class TransientSpdObservation:
+    directory_name: str
+    manifest_sha256: str
+    files: tuple[tuple[str, bytes], ...]
+    metadata_raw: bytes
+    journal_cursor: str
+    observation_start: float
+    observation_end: float
+    boot_id: str
+    suspend_count: int
+    lifecycle_pid: int
+    lifecycle_start: str
+    server_pid: int
+    server_start: str
+
+
+@dataclass(frozen=True)
+class TransientSpdClearanceBinding:
+    incident: TransientSpdIncident
+    current_state_raw: bytes
+    config_raw: bytes
+    observation: TransientSpdObservation
+    installed_source_revision: str
 
 
 # Every entry requires a source change and review. The command-line arguments
@@ -626,6 +699,109 @@ def _verify_corrected_source_revision(minimum_revision: str) -> str:
             "contain the reviewed minimum revision."
         )
     return current
+
+
+def _source_blob_sha256(revision: str, source_path: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{40}", revision) or source_path != "ram-tetris":
+        raise RecoveryBlocked(
+            "Recovery blocked: SPD failure source provenance is invalid."
+        )
+    source = subprocess.run(
+        [GIT, "-C", str(ROOT), "show", f"{revision}:{source_path}"],
+        check=False,
+        capture_output=True,
+        timeout=5,
+    )
+    if source.returncode != 0:
+        raise RecoveryBlocked(
+            "Recovery blocked: SPD failure source provenance is unavailable."
+        )
+    return hashlib.sha256(source.stdout).hexdigest()
+
+
+def _classify_transient_spd_incident() -> TransientSpdIncident:
+    """Classify an exact raw latch without using its display-code mapping."""
+
+    failure_raw, failure = _failure_record()
+    message = _failure_message(failure)
+    reason = TRANSIENT_SPD_REASON.fullmatch(message)
+    failure_time, _ = _timestamp(failure)
+    if reason is None or failure.get("state") != "failed" or failure_time is None:
+        raise RecoveryBlocked(
+            "Recovery blocked: the latch is not an eligible transient SPD failure."
+        )
+    endpoint = reason.group(1)
+    if endpoint not in TRANSIENT_SPD_ENDPOINTS:
+        raise RecoveryBlocked(
+            "Recovery blocked: the SPD failure endpoint is not approved."
+        )
+
+    details = failure.get("details")
+    source = failure.get("source")
+    if failure.get("evidence_version") == 1 and isinstance(details, dict):
+        if (
+            details.get("failure_kind") != "spd5118-temperature"
+            or details.get("endpoint") != endpoint
+            or details.get("sensor") != f"{endpoint}/hwmon/temp1_input"
+            or details.get("read_state") not in TRANSIENT_SPD_STRUCTURED_READ_STATES
+            or details.get("exception_type") != "OSError"
+            or not isinstance(source, dict)
+            or source.get("component") != "ram-tetris"
+            or source.get("path") != "ram-tetris"
+            or not isinstance(source.get("version"), str)
+            or not source.get("version")
+            or not isinstance(source.get("revision"), str)
+            or not isinstance(source.get("sha256"), str)
+        ):
+            raise RecoveryBlocked(
+                "Recovery blocked: structured SPD evidence is not an approved "
+                "transient read failure."
+            )
+        source_revision = source["revision"]
+        source_path = source["path"]
+        source_sha256 = source["sha256"]
+        _verify_corrected_source_revision(source_revision)
+        if (
+            not re.fullmatch(r"[0-9a-f]{64}", source_sha256)
+            or _source_blob_sha256(source_revision, source_path) != source_sha256
+        ):
+            raise RecoveryBlocked(
+                "Recovery blocked: structured SPD source provenance changed."
+            )
+        classification = "structured-kernel-read-error"
+    else:
+        if set(failure) != {"message", "pid", "state", "time"}:
+            raise RecoveryBlocked(
+                "Recovery blocked: legacy SPD evidence has an unknown schema."
+            )
+        _verify_corrected_source_revision(LEGACY_TRANSIENT_SPD_REVISION)
+        if (
+            _source_blob_sha256(
+                LEGACY_TRANSIENT_SPD_REVISION,
+                LEGACY_TRANSIENT_SPD_SOURCE_PATH,
+            )
+            != LEGACY_TRANSIENT_SPD_SOURCE_SHA256
+        ):
+            raise RecoveryBlocked(
+                "Recovery blocked: legacy v0.4.27 source provenance changed."
+            )
+        source_revision = LEGACY_TRANSIENT_SPD_REVISION
+        source_path = LEGACY_TRANSIENT_SPD_SOURCE_PATH
+        source_sha256 = LEGACY_TRANSIENT_SPD_SOURCE_SHA256
+        classification = "legacy-read-or-parse-error"
+
+    return TransientSpdIncident(
+        failure_raw=failure_raw,
+        incident_reference=_incident_reference(failure_raw),
+        latch_sha256=hashlib.sha256(failure_raw).hexdigest(),
+        original_reason=message,
+        endpoint=endpoint,
+        failure_time=failure_time,
+        classification=classification,
+        source_revision=source_revision,
+        source_path=source_path,
+        source_sha256=source_sha256,
+    )
 
 
 def _timestamp(value: dict[str, object]) -> tuple[float | None, str]:
@@ -1081,6 +1257,746 @@ def _kernel_history_after_observation(cursor: str) -> None:
         )
 
 
+def _journal_cursor(output: str, label: str) -> str:
+    for line in reversed(output.splitlines()):
+        if line.startswith("-- cursor: "):
+            cursor = line.removeprefix("-- cursor: ").strip()
+            if cursor:
+                return cursor
+    raise RecoveryBlocked(f"Recovery blocked: {label} journal cursor is unavailable.")
+
+
+def _capture_kernel_cursor() -> str:
+    journal = subprocess.run(
+        [JOURNALCTL, "-b", "-k", "-n", "0", "--show-cursor", "--no-pager"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if journal.returncode != 0 or journal.stderr.strip():
+        raise RecoveryBlocked(
+            "Recovery blocked: the kernel observation baseline is unreadable."
+        )
+    cursor = _journal_cursor(journal.stdout, "kernel observation baseline")
+    cursor_boot = JOURNAL_CURSOR_BOOT_ID.search(cursor)
+    if (
+        cursor_boot is None
+        or cursor_boot.group(1).lower() != _current_boot_id().replace("-", "").lower()
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: the kernel observation baseline is from another boot."
+        )
+    return cursor
+
+
+def _read_kernel_window(cursor: str) -> tuple[str, tuple[str, ...]]:
+    journal = subprocess.run(
+        [
+            JOURNALCTL,
+            "-b",
+            "-k",
+            "--after-cursor",
+            cursor,
+            "--show-cursor",
+            "--no-pager",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if journal.returncode != 0 or journal.stderr.strip():
+        raise RecoveryBlocked(
+            "Recovery blocked: the kernel observation window is unreadable."
+        )
+    next_cursor = _journal_cursor(journal.stdout, "kernel observation")
+    relevant = tuple(
+        line
+        for line in journal.stdout.splitlines()
+        if RELEVANT_KERNEL_ERROR.search(line) or SUSPEND_RESUME_EVENT.search(line)
+    )
+    if relevant:
+        raise RecoveryBlocked(
+            "Recovery blocked: the SPD observation encountered a kernel or sleep event."
+        )
+    return next_cursor, relevant
+
+
+def _spd_temperature_path(endpoint: str) -> Path:
+    if endpoint not in TRANSIENT_SPD_ENDPOINTS:
+        raise RecoveryBlocked("Recovery blocked: the SPD endpoint is invalid.")
+    device = SPD_SYSFS_ROOT / endpoint
+    try:
+        if device.joinpath("driver").resolve(strict=True).name != "spd5118":
+            raise RecoveryBlocked(
+                f"Recovery blocked: {endpoint} is not bound to spd5118."
+            )
+        paths = tuple(device.glob("hwmon/hwmon*/temp1_input"))
+    except OSError as error:
+        raise RecoveryBlocked(
+            f"Recovery blocked: {endpoint} telemetry is unreadable."
+        ) from error
+    if len(paths) != 1 or paths[0].is_symlink():
+        raise RecoveryBlocked(
+            f"Recovery blocked: {endpoint} has an invalid temperature endpoint."
+        )
+    return paths[0]
+
+
+def _read_spd_temperature(endpoint: str, path: Path) -> int:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise RecoveryBlocked(
+            f"Recovery blocked: {endpoint} temperature read failed "
+            f"({type(error).__name__}, errno={error.errno})."
+        ) from error
+    stripped = raw.strip()
+    if not stripped:
+        raise RecoveryBlocked(f"Recovery blocked: {endpoint} temperature was empty.")
+    try:
+        value = int(stripped)
+    except ValueError as error:
+        raise RecoveryBlocked(
+            f"Recovery blocked: {endpoint} temperature was malformed."
+        ) from error
+    if value <= 0:
+        raise RecoveryBlocked(f"Recovery blocked: {endpoint} temperature was invalid.")
+    return value
+
+
+def _transient_spd_environment_preflight(
+    incident: TransientSpdIncident,
+) -> tuple[bytes, bytes, dict[str, object]]:
+    current_state_path = state_root() / "lifecycle-service-state.json"
+    current_state_raw = _read_protected_bytes(
+        current_state_path, "current lifecycle state"
+    )
+    current = _json_record(current_state_raw, "current lifecycle state")
+    current_time = current.get("time")
+    if (
+        current.get("state") != "ready"
+        or current.get("reason") != HISTORICAL_READY_REASON
+        or current.get("boot_id") != _current_boot_id()
+        or not isinstance(current_time, (int, float))
+        or isinstance(current_time, bool)
+        or float(current_time) <= incident.failure_time
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: the incident has no authoritative healthy lifecycle."
+        )
+    config_raw = _detector_policy_is_reviewed()
+    _verify_historical_running_environment(current, config_raw)
+    health = _verify_service_and_hardware(None)
+    if _failure_record()[0] != incident.failure_raw:
+        raise RecoveryBlocked(
+            "Recovery blocked: the transient SPD latch changed during review."
+        )
+    if (
+        _read_protected_bytes(current_state_path, "current lifecycle state")
+        != current_state_raw
+        or _detector_policy_is_reviewed() != config_raw
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: service or configuration identity changed during review."
+        )
+    return current_state_raw, config_raw, health
+
+
+def _write_transient_spd_observation(
+    directory_name: str,
+    payloads: dict[str, bytes],
+) -> tuple[Path, str]:
+    if not TRANSIENT_SPD_DIRECTORY.fullmatch(directory_name):
+        raise RecoveryBlocked(
+            "Recovery blocked: observation directory name is invalid."
+        )
+    if set(payloads) != TRANSIENT_SPD_EVIDENCE_FILES:
+        raise RecoveryBlocked("Recovery blocked: observation evidence is incomplete.")
+    evidence_root = state_root() / "recovery-evidence"
+    _private_directory(state_root())
+    _private_directory(evidence_root)
+    temporary = Path(tempfile.mkdtemp(prefix=".transient-spd-", dir=evidence_root))
+    temporary.chmod(0o700)
+    destination = evidence_root / directory_name
+    try:
+        for name, raw in sorted(payloads.items()):
+            path = temporary / name
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+        manifest_raw = b"".join(
+            f"{hashlib.sha256(payloads[name]).hexdigest()}  {name}\n".encode()
+            for name in sorted(payloads)
+        )
+        manifest_path = temporary / "manifest.sha256"
+        descriptor = os.open(manifest_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(manifest_raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _fsync_directory(temporary)
+        os.rename(temporary, destination)
+        _fsync_directory(evidence_root)
+    except BaseException:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        raise
+    manifest_sha256 = hashlib.sha256(manifest_raw).hexdigest()
+    return destination, manifest_sha256
+
+
+def observe_transient_spd() -> dict[str, object]:
+    """Create one bounded, no-write observation for the current eligible latch."""
+
+    root = runtime_root()
+    _private_directory(root)
+    lock_fd = os.open(root / "lighting-recovery.lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RecoveryBlocked(
+                "Recovery blocked: another recovery is active."
+            ) from error
+
+        incident = _classify_transient_spd_incident()
+        current_state_raw, config_raw, _ = _transient_spd_environment_preflight(
+            incident
+        )
+        current = _json_record(current_state_raw, "current lifecycle state")
+        lifecycle_pid, lifecycle_start = _identity(current, "lifecycle")
+        server_pid, server_start = _identity(current, "server")
+        boot_id = _current_boot_id()
+        suspend_count = _current_suspend_count()
+        paths = {
+            endpoint: _spd_temperature_path(endpoint)
+            for endpoint in TRANSIENT_SPD_ENDPOINTS
+        }
+        cursor_start = _capture_kernel_cursor()
+        cursor = cursor_start
+        started_wall = time.time()
+        started_monotonic = time.monotonic()
+        lines = ["sample\twall_time\tmonotonic_s\tendpoint\tstatus\ttemp_mc\tdetail"]
+        for sample in range(1, TRANSIENT_SPD_OBSERVATION_SAMPLES + 1):
+            target = started_monotonic + (
+                (sample - 1) * TRANSIENT_SPD_SAMPLE_INTERVAL_SECONDS
+            )
+            delay = target - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            sample_monotonic = time.monotonic()
+            if sample_monotonic - target > TRANSIENT_SPD_MAX_LATE_SECONDS:
+                raise RecoveryBlocked(
+                    "Recovery blocked: the SPD observation schedule overran."
+                )
+            if (
+                _current_boot_id() != boot_id
+                or _current_suspend_count() != suspend_count
+                or _process_start(lifecycle_pid) != lifecycle_start
+                or _process_start(server_pid) != server_start
+                or _failure_record()[0] != incident.failure_raw
+            ):
+                raise RecoveryBlocked(
+                    "Recovery blocked: observation ownership or continuity changed."
+                )
+            wall = datetime.fromtimestamp(time.time(), UTC).isoformat(
+                timespec="microseconds"
+            )
+            for endpoint in TRANSIENT_SPD_ENDPOINTS:
+                value = _read_spd_temperature(endpoint, paths[endpoint])
+                lines.append(
+                    f"{sample}\t{wall}\t{sample_monotonic:.6f}\t{endpoint}"
+                    f"\tok\t{value}\t-"
+                )
+            cursor, _ = _read_kernel_window(cursor)
+
+        ended_wall = time.time()
+        ended_monotonic = time.monotonic()
+        if ended_monotonic - started_monotonic > 60.0:
+            raise RecoveryBlocked(
+                "Recovery blocked: the SPD observation exceeded 60 seconds."
+            )
+        second_state_raw, second_config_raw, _ = _transient_spd_environment_preflight(
+            incident
+        )
+        if second_state_raw != current_state_raw or second_config_raw != config_raw:
+            raise RecoveryBlocked(
+                "Recovery blocked: service identity changed during the observation."
+            )
+        if _current_suspend_count() != suspend_count or _current_boot_id() != boot_id:
+            raise RecoveryBlocked(
+                "Recovery blocked: boot or suspend changed during the observation."
+            )
+
+        timestamp = (
+            datetime.fromtimestamp(started_wall)
+            .astimezone()
+            .strftime("%Y%m%dT%H%M%S%z")
+        )
+        directory_name = f"{incident.incident_reference}-transient-spd-{timestamp}"
+        metadata = {
+            "schema_version": 1,
+            "category": "reviewed-transient-spd",
+            "plugin_version": "0.4.30",
+            "incident": {
+                "reference": incident.incident_reference,
+                "latch_sha256": incident.latch_sha256,
+                "reason": incident.original_reason,
+                "endpoint": incident.endpoint,
+                "classification": incident.classification,
+                "source_revision": incident.source_revision,
+                "source_path": incident.source_path,
+                "source_sha256": incident.source_sha256,
+            },
+            "environment": {
+                "boot_id": boot_id,
+                "suspend_count": suspend_count,
+                "lifecycle_pid": lifecycle_pid,
+                "lifecycle_start": lifecycle_start,
+                "server_pid": server_pid,
+                "server_start": server_start,
+                "kernel_cursor_start": cursor_start,
+                "kernel_cursor_end": cursor,
+            },
+            "observation": {
+                "started": datetime.fromtimestamp(started_wall, UTC).isoformat(
+                    timespec="microseconds"
+                ),
+                "ended": datetime.fromtimestamp(ended_wall, UTC).isoformat(
+                    timespec="microseconds"
+                ),
+                "samples_completed": 60,
+                "readings_completed": 240,
+                "status": "complete",
+            },
+        }
+        payloads = {
+            "failure-latch.json": incident.failure_raw,
+            "kernel-relevant.log": b"",
+            "metadata.json": (json.dumps(metadata, sort_keys=True) + "\n").encode(),
+            "samples.tsv": ("\n".join(lines) + "\n").encode(),
+        }
+        destination, manifest_sha256 = _write_transient_spd_observation(
+            directory_name, payloads
+        )
+        observation = _verify_transient_spd_observation(
+            incident, directory_name, manifest_sha256
+        )
+        if dict(observation.files) != payloads | {
+            "manifest.sha256": (destination / "manifest.sha256").read_bytes()
+        }:
+            raise RecoveryBlocked(
+                "Recovery blocked: observation readback did not match."
+            )
+        return {
+            "state": "observed",
+            "incident_reference": incident.incident_reference,
+            "observation_directory": directory_name,
+            "stability_manifest_sha256": manifest_sha256,
+            "samples": 60,
+            "readings": 240,
+            "message": "Transient SPD observation complete; latch unchanged.",
+        }
+    finally:
+        os.close(lock_fd)
+
+
+def _verify_transient_spd_samples(raw: bytes) -> None:
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise RecoveryBlocked(
+            "Recovery blocked: transient SPD samples are unreadable."
+        ) from error
+    header = "sample\twall_time\tmonotonic_s\tendpoint\tstatus\ttemp_mc\tdetail"
+    if not lines or lines[0] != header or len(lines) != 241:
+        raise RecoveryBlocked("Recovery blocked: transient SPD samples are incomplete.")
+    sample_times: dict[int, float] = {}
+    sample_walls: dict[int, str] = {}
+    endpoints: dict[int, set[str]] = {}
+    for line in lines[1:]:
+        fields = line.split("\t")
+        if len(fields) != 7:
+            raise RecoveryBlocked(
+                "Recovery blocked: transient SPD samples are invalid."
+            )
+        sample_text, wall, monotonic, endpoint, status, temperature, detail = fields
+        try:
+            sample = int(sample_text)
+            monotonic_value = float(monotonic)
+            temperature_value = int(temperature)
+        except ValueError as error:
+            raise RecoveryBlocked(
+                "Recovery blocked: transient SPD samples are invalid."
+            ) from error
+        if (
+            sample not in range(1, 61)
+            or endpoint not in TRANSIENT_SPD_ENDPOINTS
+            or status != "ok"
+            or temperature_value <= 0
+            or detail != "-"
+        ):
+            raise RecoveryBlocked(
+                "Recovery blocked: transient SPD samples contain a failed read."
+            )
+        _parse_observation_time(wall, "sample timestamp")
+        if sample in sample_times and (
+            sample_times[sample] != monotonic_value or sample_walls[sample] != wall
+        ):
+            raise RecoveryBlocked(
+                "Recovery blocked: transient SPD sample timing is inconsistent."
+            )
+        sample_times.setdefault(sample, monotonic_value)
+        sample_walls.setdefault(sample, wall)
+        seen = endpoints.setdefault(sample, set())
+        if endpoint in seen:
+            raise RecoveryBlocked(
+                "Recovery blocked: transient SPD samples contain a duplicate endpoint."
+            )
+        seen.add(endpoint)
+    if set(sample_times) != set(range(1, 61)) or any(
+        seen != set(TRANSIENT_SPD_ENDPOINTS) for seen in endpoints.values()
+    ):
+        raise RecoveryBlocked("Recovery blocked: transient SPD samples are incomplete.")
+    ordered = [sample_times[sample] for sample in range(1, 61)]
+    intervals = [later - earlier for earlier, later in pairwise(ordered)]
+    if (
+        any(interval < 0.75 or interval > 1.25 for interval in intervals)
+        or not 58.5 <= ordered[-1] - ordered[0] <= 59.5
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: transient SPD sampling cadence is invalid."
+        )
+
+
+def _verify_transient_spd_observation(
+    incident: TransientSpdIncident,
+    directory_name: str,
+    manifest_sha256: str,
+) -> TransientSpdObservation:
+    if not TRANSIENT_SPD_DIRECTORY.fullmatch(directory_name) or not re.fullmatch(
+        r"[0-9a-f]{64}", manifest_sha256
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: transient SPD observation binding is invalid."
+        )
+    root = state_root() / "recovery-evidence" / directory_name
+    _require_private_directory(root, "transient SPD observation directory")
+    try:
+        names = {entry.name for entry in root.iterdir()}
+    except OSError as error:
+        raise RecoveryBlocked(
+            "Recovery blocked: transient SPD observation is unreadable."
+        ) from error
+    expected_names = TRANSIENT_SPD_EVIDENCE_FILES | {"manifest.sha256"}
+    if names != expected_names:
+        raise RecoveryBlocked(
+            "Recovery blocked: transient SPD observation inventory changed."
+        )
+    files = {
+        name: _read_protected_bytes(root / name, f"transient SPD evidence {name}")
+        for name in sorted(names)
+    }
+    manifest_raw = files["manifest.sha256"]
+    if hashlib.sha256(manifest_raw).hexdigest() != manifest_sha256:
+        raise RecoveryBlocked("Recovery blocked: transient SPD manifest changed.")
+    try:
+        manifest_lines = manifest_raw.decode("ascii").splitlines()
+    except UnicodeDecodeError as error:
+        raise RecoveryBlocked(
+            "Recovery blocked: transient SPD manifest is unreadable."
+        ) from error
+    manifest: dict[str, str] = {}
+    for line in manifest_lines:
+        match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9._-]*)", line)
+        if match is None or match.group(2) in manifest:
+            raise RecoveryBlocked(
+                "Recovery blocked: transient SPD manifest is invalid."
+            )
+        manifest[match.group(2)] = match.group(1)
+    if set(manifest) != TRANSIENT_SPD_EVIDENCE_FILES:
+        raise RecoveryBlocked("Recovery blocked: transient SPD manifest is incomplete.")
+    for name, expected in manifest.items():
+        if hashlib.sha256(files[name]).hexdigest() != expected:
+            raise RecoveryBlocked(
+                f"Recovery blocked: transient SPD checksum failed: {name}."
+            )
+    if files["failure-latch.json"] != incident.failure_raw:
+        raise RecoveryBlocked(
+            "Recovery blocked: observation latch does not match the current incident."
+        )
+    if files["kernel-relevant.log"]:
+        raise RecoveryBlocked(
+            "Recovery blocked: observation contains a kernel or sleep event."
+        )
+    _verify_transient_spd_samples(files["samples.tsv"])
+    metadata = _json_record(files["metadata.json"], "transient SPD metadata")
+    if set(metadata) != {
+        "schema_version",
+        "category",
+        "plugin_version",
+        "incident",
+        "environment",
+        "observation",
+    }:
+        raise RecoveryBlocked(
+            "Recovery blocked: transient SPD metadata schema is invalid."
+        )
+    incident_data = metadata.get("incident")
+    environment = metadata.get("environment")
+    observation = metadata.get("observation")
+    if (
+        metadata.get("schema_version") != 1
+        or metadata.get("category") != "reviewed-transient-spd"
+        or metadata.get("plugin_version") != "0.4.30"
+        or not isinstance(incident_data, dict)
+        or not isinstance(environment, dict)
+        or not isinstance(observation, dict)
+        or incident_data
+        != {
+            "reference": incident.incident_reference,
+            "latch_sha256": incident.latch_sha256,
+            "reason": incident.original_reason,
+            "endpoint": incident.endpoint,
+            "classification": incident.classification,
+            "source_revision": incident.source_revision,
+            "source_path": incident.source_path,
+            "source_sha256": incident.source_sha256,
+        }
+        or set(environment)
+        != {
+            "boot_id",
+            "suspend_count",
+            "lifecycle_pid",
+            "lifecycle_start",
+            "server_pid",
+            "server_start",
+            "kernel_cursor_start",
+            "kernel_cursor_end",
+        }
+        or set(observation)
+        != {
+            "started",
+            "ended",
+            "samples_completed",
+            "readings_completed",
+            "status",
+        }
+    ):
+        raise RecoveryBlocked("Recovery blocked: transient SPD metadata is invalid.")
+    boot_id = environment.get("boot_id")
+    suspend_count = environment.get("suspend_count")
+    lifecycle_pid = environment.get("lifecycle_pid")
+    lifecycle_start = environment.get("lifecycle_start")
+    server_pid = environment.get("server_pid")
+    server_start = environment.get("server_start")
+    cursor_start = environment.get("kernel_cursor_start")
+    cursor_end = environment.get("kernel_cursor_end")
+    if (
+        not isinstance(boot_id, str)
+        or boot_id != _current_boot_id()
+        or not isinstance(suspend_count, int)
+        or isinstance(suspend_count, bool)
+        or suspend_count != _current_suspend_count()
+        or not isinstance(lifecycle_pid, int)
+        or isinstance(lifecycle_pid, bool)
+        or lifecycle_pid <= 0
+        or not isinstance(lifecycle_start, str)
+        or not lifecycle_start
+        or not isinstance(server_pid, int)
+        or isinstance(server_pid, bool)
+        or server_pid <= 0
+        or not isinstance(server_start, str)
+        or not server_start
+        or not isinstance(cursor_start, str)
+        or not isinstance(cursor_end, str)
+        or not cursor_start
+        or not cursor_end
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: observation environment no longer matches."
+        )
+    for cursor in (cursor_start, cursor_end):
+        cursor_boot = JOURNAL_CURSOR_BOOT_ID.search(cursor)
+        if (
+            cursor_boot is None
+            or cursor_boot.group(1).lower() != boot_id.replace("-", "").lower()
+        ):
+            raise RecoveryBlocked(
+                "Recovery blocked: observation cursor belongs to another boot."
+            )
+    started_value = observation.get("started")
+    ended_value = observation.get("ended")
+    if not isinstance(started_value, str) or not isinstance(ended_value, str):
+        raise RecoveryBlocked("Recovery blocked: observation timestamps are invalid.")
+    started = _parse_observation_time(started_value, "start time")
+    ended = _parse_observation_time(ended_value, "end time")
+    if (
+        not 58.0 <= ended - started <= 60.0
+        or ended > time.time()
+        or observation.get("samples_completed") != 60
+        or observation.get("readings_completed") != 240
+        or observation.get("status") != "complete"
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: observation completion record is invalid."
+        )
+    return TransientSpdObservation(
+        directory_name=directory_name,
+        manifest_sha256=manifest_sha256,
+        files=tuple(sorted(files.items())),
+        metadata_raw=files["metadata.json"],
+        journal_cursor=cursor_end,
+        observation_start=started,
+        observation_end=ended,
+        boot_id=boot_id,
+        suspend_count=suspend_count,
+        lifecycle_pid=lifecycle_pid,
+        lifecycle_start=lifecycle_start,
+        server_pid=server_pid,
+        server_start=server_start,
+    )
+
+
+def _transient_spd_clearance_preflight(
+    observation_directory: str,
+    stability_manifest_sha256: str,
+) -> TransientSpdClearanceBinding:
+    incident = _classify_transient_spd_incident()
+    observation = _verify_transient_spd_observation(
+        incident, observation_directory, stability_manifest_sha256
+    )
+    if observation.observation_start <= incident.failure_time:
+        raise RecoveryBlocked(
+            "Recovery blocked: the SPD observation predates the incident."
+        )
+    current_state_raw, config_raw, _ = _transient_spd_environment_preflight(incident)
+    current = _json_record(current_state_raw, "current lifecycle state")
+    lifecycle_pid, lifecycle_start = _identity(current, "lifecycle")
+    server_pid, server_start = _identity(current, "server")
+    if (
+        (lifecycle_pid, lifecycle_start)
+        != (observation.lifecycle_pid, observation.lifecycle_start)
+        or (server_pid, server_start)
+        != (observation.server_pid, observation.server_start)
+        or _current_boot_id() != observation.boot_id
+        or _current_suspend_count() != observation.suspend_count
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: lifecycle, SDK, boot, or suspend identity changed "
+            "after observation."
+        )
+    _kernel_history_after_observation(observation.journal_cursor)
+    installed_source_revision = _verify_corrected_source_revision(
+        incident.source_revision
+    )
+    if _failure_record()[0] != incident.failure_raw:
+        raise RecoveryBlocked(
+            "Recovery blocked: the transient SPD latch changed during review."
+        )
+    return TransientSpdClearanceBinding(
+        incident=incident,
+        current_state_raw=current_state_raw,
+        config_raw=config_raw,
+        observation=observation,
+        installed_source_revision=installed_source_revision,
+    )
+
+
+def _preserve_transient_spd_observation(
+    incident: TransientSpdIncident,
+    observation: TransientSpdObservation,
+) -> Path:
+    evidence_root = state_root() / "recovery-evidence"
+    _private_directory(state_root())
+    _private_directory(evidence_root)
+    destination = evidence_root / (
+        f"{incident.incident_reference}.transient-spd-observation"
+    )
+    try:
+        destination.mkdir(mode=0o700)
+    except FileExistsError:
+        _require_private_directory(
+            destination, "retained transient SPD observation directory"
+        )
+    expected = dict(observation.files)
+    try:
+        existing = {entry.name for entry in destination.iterdir()}
+    except OSError as error:
+        raise RecoveryBlocked(
+            "Recovery blocked: retained transient SPD observation is unreadable."
+        ) from error
+    if not existing.issubset(expected):
+        raise RecoveryBlocked(
+            "Recovery blocked: retained transient SPD observation has extra files."
+        )
+    for name, raw in observation.files:
+        path = destination / name
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            if _read_protected_bytes(path, f"retained transient SPD {name}") != raw:
+                raise RecoveryBlocked(
+                    "Recovery blocked: retained transient SPD observation changed."
+                )
+            continue
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+    if {entry.name for entry in destination.iterdir()} != set(expected):
+        raise RecoveryBlocked(
+            "Recovery blocked: retained transient SPD observation is incomplete."
+        )
+    _fsync_directory(destination)
+    _fsync_directory(evidence_root)
+    return destination
+
+
+def _verify_transient_spd_continuity(
+    binding: TransientSpdClearanceBinding,
+) -> None:
+    incident = binding.incident
+    if (
+        _verify_corrected_source_revision(incident.source_revision)
+        != binding.installed_source_revision
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: installed source changed during clearance."
+        )
+    observation = _verify_transient_spd_observation(
+        incident,
+        binding.observation.directory_name,
+        binding.observation.manifest_sha256,
+    )
+    if observation != binding.observation:
+        raise RecoveryBlocked(
+            "Recovery blocked: transient SPD observation changed during clearance."
+        )
+    current_state_path = state_root() / "lifecycle-service-state.json"
+    current_state_raw = _read_protected_bytes(
+        current_state_path, "current lifecycle state"
+    )
+    current = _json_record(current_state_raw, "current lifecycle state")
+    config_raw = _detector_policy_is_reviewed()
+    _verify_historical_running_environment(current, config_raw)
+    _verify_service_and_hardware(None)
+    if (
+        current_state_raw != binding.current_state_raw
+        or config_raw != binding.config_raw
+        or _current_boot_id() != observation.boot_id
+        or _current_suspend_count() != observation.suspend_count
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: lifecycle or configuration changed during clearance."
+        )
+    _kernel_history_after_observation(observation.journal_cursor)
+
+
 def _historical_kernel_evidence(
     failure_time: float, observation_start: float
 ) -> bytes:
@@ -1346,6 +2262,18 @@ def _current_boot_id() -> str:
         raise RecoveryBlocked("The current boot identity is unreadable.") from error
     if not value:
         raise RecoveryBlocked("The current boot identity is empty.")
+    return value
+
+
+def _current_suspend_count() -> int:
+    try:
+        value = int(SUSPEND_COUNT_PATH.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError) as error:
+        raise RecoveryBlocked(
+            "Recovery blocked: the suspend boundary is unreadable."
+        ) from error
+    if value < 0:
+        raise RecoveryBlocked("Recovery blocked: the suspend boundary is invalid.")
     return value
 
 
@@ -2731,6 +3659,79 @@ def clear_reviewed_hardware_health(
         os.close(lock_fd)
 
 
+def clear_reviewed_transient_spd(
+    observation_directory: str,
+    stability_manifest_sha256: str,
+) -> dict[str, object]:
+    """Clear an evidence-qualified transient SPD latch without service or RGB work."""
+
+    root = runtime_root()
+    _private_directory(root)
+    lock_fd = os.open(root / "lighting-recovery.lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RecoveryBlocked(
+                "Recovery blocked: another recovery is active."
+            ) from error
+
+        first = _transient_spd_clearance_preflight(
+            observation_directory, stability_manifest_sha256
+        )
+        reference = first.incident.incident_reference
+        for raw, kind in (
+            (first.incident.failure_raw, "failure"),
+            (first.current_state_raw, "lifecycle-state"),
+            (first.config_raw, "openrgb-config"),
+            (first.observation.metadata_raw, "transient-spd-metadata"),
+        ):
+            _preserve_evidence(raw, reference, kind)
+        retained = _preserve_transient_spd_observation(
+            first.incident, first.observation
+        )
+        if {
+            path.name: _read_protected_bytes(
+                path, f"retained transient SPD evidence {path.name}"
+            )
+            for path in retained.iterdir()
+        } != dict(first.observation.files):
+            raise RecoveryBlocked(
+                "Recovery blocked: retained transient SPD evidence readback changed."
+            )
+
+        second = _transient_spd_clearance_preflight(
+            observation_directory, stability_manifest_sha256
+        )
+        if second != first:
+            raise RecoveryBlocked(
+                "Recovery blocked: incident or health bindings changed before clearance."
+            )
+        for raw, kind in (
+            (second.incident.failure_raw, "failure"),
+            (second.current_state_raw, "lifecycle-state"),
+            (second.config_raw, "openrgb-config"),
+            (second.observation.metadata_raw, "transient-spd-metadata"),
+        ):
+            _preserve_evidence(raw, reference, kind)
+        _preserve_transient_spd_observation(second.incident, second.observation)
+        _unlink_unchanged_latch(first.incident.failure_raw)
+        _verify_transient_spd_continuity(first)
+        if (state_root() / "ram-tetris-failure.json").exists():
+            raise RecoveryBlocked(
+                "Recovery blocked: the transient SPD latch remains present."
+            )
+        return {
+            "failure": False,
+            "incident_reference": reference,
+            "message": "Reviewed transient SPD latch cleared. RAM Tetris remains OFF.",
+            "preference": False,
+            "state": "off",
+        }
+    finally:
+        os.close(lock_fd)
+
+
 def _truncate(value: str, limit: int) -> str:
     normalized = " ".join(value.split())
     if len(normalized) <= limit:
@@ -2812,6 +3813,18 @@ def build_parser() -> argparse.ArgumentParser:
     hardware_health.add_argument(
         "--acknowledge-reviewed-hardware-health", action="store_true", required=True
     )
+    observe_spd = actions.add_parser("observe-transient-spd")
+    observe_spd.add_argument(
+        "--acknowledge-read-only-observation", action="store_true", required=True
+    )
+    transient_spd = actions.add_parser("clear-reviewed-transient-spd")
+    transient_spd.add_argument("--observation-directory", required=True)
+    transient_spd.add_argument("--stability-manifest-sha256", required=True)
+    transient_spd.add_argument(
+        "--acknowledge-reviewed-transient-spd",
+        action="store_true",
+        required=True,
+    )
     copy_parser = actions.add_parser("copy-diagnostics")
     copy_parser.add_argument("--print", action="store_true")
     return parser
@@ -2862,6 +3875,20 @@ def main() -> int:
                         args.latch_sha256,
                         args.error_code,
                         args.original_reason,
+                        args.stability_manifest_sha256,
+                    ),
+                    sort_keys=True,
+                )
+            )
+            return 0
+        if args.action == "observe-transient-spd":
+            print(json.dumps(observe_transient_spd(), sort_keys=True))
+            return 0
+        if args.action == "clear-reviewed-transient-spd":
+            print(
+                json.dumps(
+                    clear_reviewed_transient_spd(
+                        args.observation_directory,
                         args.stability_manifest_sha256,
                     ),
                     sort_keys=True,
