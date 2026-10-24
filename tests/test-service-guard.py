@@ -46,12 +46,17 @@ class ServiceGuardTests(unittest.TestCase):
     def failure(self) -> Path:
         return self.state_home / "omarchy-plus/openrgb-presets/ram-tetris-failure.json"
 
-    def run_guard(self, *arguments: str, check: bool = True):
+    def run_guard(
+        self,
+        *arguments: str,
+        check: bool = True,
+        environment: dict[str, str] | None = None,
+    ):
         return subprocess.run(
             [GUARD, *arguments],
             check=check,
             capture_output=True,
-            env=self.environment,
+            env=self.environment | (environment or {}),
             text=True,
         )
 
@@ -101,21 +106,124 @@ class ServiceGuardTests(unittest.TestCase):
         self.run_guard("finalize-stop")
         self.assertFalse(self.failure.exists())
 
-    def test_finalize_incomplete_stop_creates_latch(self):
+    def test_finalize_manager_timeout_creates_specific_latch(self):
         self.mark("stopping")
-        result = self.run_guard("finalize-stop", check=False)
+        result = self.run_guard(
+            "finalize-stop",
+            check=False,
+            environment={
+                "SERVICE_RESULT": "timeout",
+                "EXIT_CODE": "killed",
+                "EXIT_STATUS": "9",
+            },
+        )
         self.assertEqual(result.returncode, 1)
         failure = json.loads(self.failure.read_text())
         self.assertIn("manager escalation", failure["message"])
+        state = json.loads(self.service_state.read_text())
+        self.assertEqual(state["stop_result"]["classification"], "manager-timeout")
+
+    def test_finalize_manager_signal_is_distinct_from_explicit_refusal(self):
+        self.mark("stopping")
+        result = self.run_guard(
+            "finalize-stop",
+            check=False,
+            environment={
+                "SERVICE_RESULT": "signal",
+                "EXIT_CODE": "killed",
+                "EXIT_STATUS": "9",
+            },
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("manager-signal-termination", result.stdout)
+        failure = json.loads(self.failure.read_text())
+        self.assertIn("manager escalation", failure["message"])
+        state = json.loads(self.service_state.read_text())
+        self.assertEqual(
+            state["stop_result"]["classification"], "manager-signal-termination"
+        )
+
+    def test_explicit_identity_refusal_is_distinct_and_durable(self):
+        self.run_guard(
+            "mark",
+            "stopping",
+            "--lifecycle-pid",
+            "41",
+            "--lifecycle-start",
+            "9001",
+            "--server-pid",
+            "52",
+            "--server-start",
+            "9012",
+            "--reason",
+            "deliberate",
+            "--cleanup-stage",
+            "sdk-term-authentication",
+            "--identity-failure-stage",
+            "listener-absent",
+            "--listener-query-state",
+            "absent",
+            "--observed-server-pid",
+            "52",
+            "--observed-server-start",
+            "9012",
+        )
+        result = self.run_guard(
+            "finalize-stop",
+            check=False,
+            environment={
+                "SERVICE_RESULT": "exit-code",
+                "EXIT_CODE": "exited",
+                "EXIT_STATUS": "1",
+            },
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("explicit-cleanup-refusal", result.stdout)
+        failure = json.loads(self.failure.read_text())
+        self.assertIn("explicitly refused SDK shutdown", failure["message"])
+        state = json.loads(self.service_state.read_text())
+        self.assertEqual(state["cleanup_failure"]["failure_stage"], "listener-absent")
+        self.assertEqual(
+            state["stop_result"]["classification"], "explicit-cleanup-refusal"
+        )
 
     def test_existing_historical_latch_is_byte_preserved(self):
-        self.mark("stopping")
+        self.run_guard(
+            "mark",
+            "stopping",
+            "--lifecycle-pid",
+            "41",
+            "--lifecycle-start",
+            "9001",
+            "--server-pid",
+            "52",
+            "--server-start",
+            "9012",
+            "--cleanup-stage",
+            "sdk-term-authentication",
+            "--identity-failure-stage",
+            "listener-query-unreadable",
+            "--listener-query-state",
+            "unreadable",
+        )
         self.failure.parent.mkdir(parents=True, exist_ok=True)
         original = b'{"message":"historical","state":"failed"}\n'
         self.failure.write_bytes(original)
-        result = self.run_guard("finalize-stop", check=False)
+        result = self.run_guard(
+            "finalize-stop",
+            check=False,
+            environment={
+                "SERVICE_RESULT": "exit-code",
+                "EXIT_CODE": "exited",
+                "EXIT_STATUS": "1",
+            },
+        )
         self.assertEqual(result.returncode, 1)
         self.assertEqual(self.failure.read_bytes(), original)
+        state = json.loads(self.service_state.read_text())
+        self.assertEqual(
+            state["stop_result"]["classification"], "explicit-cleanup-refusal"
+        )
 
     def test_reviewed_recovery_requires_off_and_preserves_latch(self):
         self.mark("stopping")

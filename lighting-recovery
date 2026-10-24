@@ -291,6 +291,12 @@ EXACT_FAILURES: Final = {
         "lighting",
         "The lighting lifecycle did not finish its previous shutdown.",
     ),
+    "OpenRGB lifecycle explicitly refused SDK shutdown authentication before clean shutdown": FailureClass(
+        "LGT-LIF-001",
+        "lifecycle",
+        "lighting",
+        "The lighting lifecycle refused an unverified SDK shutdown.",
+    ),
     "writer termination was not preceded by an authenticated lifecycle stop request": FailureClass(
         "LGT-LIF-002",
         "lifecycle",

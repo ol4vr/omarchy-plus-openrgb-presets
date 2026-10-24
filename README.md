@@ -377,6 +377,24 @@ available, plus that endpoint's last successful temperature and timestamp.
 The first-write-wins latch and all existing recovery eligibility remain
 unchanged; a later detailed failure cannot replace earlier incident evidence.
 
+Version 0.4.29 retains the complete v0.4.28 periodic health
+checkpoint and adds diagnostic-only classification for SDK shutdown identity
+refusals. The exact process start token, fixed OpenRGB command, listener owner,
+and repeated process/listener verification remain mandatory before TERM or
+KILL. A refusal now distinguishes a missing or changed process, command
+mismatch, unreadable or absent listener, unexpected owner, and identity change
+between checks. It records only expected and observed PID/start tokens plus a
+sanitized listener state; full command lines and unrelated process data are not
+persisted. The private service-boundary record survives removal of systemd's
+runtime directory, while the same concise classification is written to the
+journal. Existing failure-latch bytes remain first-write-wins.
+
+`ExecStopPost` now records whether an incomplete boundary came from an explicit
+identity refusal, manager timeout, manager signal termination, or another
+lifecycle exit. These labels change diagnostics only: no retry, fallback
+signal, relaxed identity match, automatic recovery, or recovery eligibility is
+introduced.
+
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
 The experimental orange, blue, and red Sunrise gradients are therefore stored
@@ -910,6 +928,16 @@ it does not alter existing latch bytes, recovery evidence, palettes, Effects
 profiles, lifecycle ownership, selected preset, or Tetris preference. Perform
 any live rollback only through the separately reviewed stopped-service
 deployment procedure and preserve the current incident unchanged.
+
+## Roll back the 0.4.29 shutdown identity diagnostics
+
+Redeploy exact published v0.4.28 commit
+`8273c585c3cfa20c63d5d90021b453b364fa4ec3`. This removes only the
+stage-specific SDK authentication diagnostics and restores the earlier
+compound shutdown-refusal report. It does not change signal eligibility,
+service ownership, the periodic health checkpoint, existing latch bytes,
+recovery eligibility, RGB state, or the Tetris preference. A live rollback
+still requires the separately reviewed stopped-service procedure.
 
 ## Remove
 

@@ -158,6 +158,22 @@ def mark(args: argparse.Namespace) -> int:
         value["server_start"] = args.server_start
     if args.reason is not None:
         value["reason"] = args.reason
+    if args.identity_failure_stage is not None:
+        diagnostic: dict[str, object] = {
+            "kind": "sdk-shutdown-identity-refusal",
+            "cleanup_stage": args.cleanup_stage,
+            "failure_stage": args.identity_failure_stage,
+            "expected_server_pid": args.server_pid,
+            "expected_server_start": args.server_start,
+            "listener_query_state": args.listener_query_state,
+        }
+        if args.observed_server_pid is not None:
+            diagnostic["observed_server_pid"] = args.observed_server_pid
+        if args.observed_server_start is not None:
+            diagnostic["observed_server_start"] = args.observed_server_start
+        if args.observed_listener_owner is not None:
+            diagnostic["observed_listener_owner"] = args.observed_listener_owner
+        value["cleanup_failure"] = diagnostic
     atomic_json(service_state_path(), value)
     return 0
 
@@ -171,9 +187,47 @@ def finalize_stop() -> int:
         # authenticated incumbent remains the owner and must not be blamed for
         # the rejected second start.
         return 0
-    latch_failure(
-        "OpenRGB lifecycle service required manager escalation before clean shutdown"
-    )
+    service_result = os.environ.get("SERVICE_RESULT", "unknown")
+    exit_code = os.environ.get("EXIT_CODE", "unknown")
+    exit_status = os.environ.get("EXIT_STATUS", "unknown")
+    cleanup_failure = value.get("cleanup_failure") if value is not None else None
+    if isinstance(cleanup_failure, dict) and cleanup_failure.get("kind") == (
+        "sdk-shutdown-identity-refusal"
+    ):
+        classification = "explicit-cleanup-refusal"
+        message = (
+            "OpenRGB lifecycle explicitly refused SDK shutdown authentication "
+            "before clean shutdown"
+        )
+    elif service_result == "timeout":
+        classification = "manager-timeout"
+        message = "OpenRGB lifecycle service required manager escalation before clean shutdown"
+    elif exit_code in {"killed", "dumped"} or service_result in {
+        "watchdog",
+        "oom-kill",
+        "signal",
+    }:
+        classification = "manager-signal-termination"
+        message = "OpenRGB lifecycle service required manager escalation before clean shutdown"
+    else:
+        classification = "incomplete-lifecycle-exit"
+        message = (
+            "OpenRGB lifecycle service did not complete its previous bounded shutdown"
+        )
+
+    stop_result: dict[str, object] = {
+        "classification": classification,
+        "exit_code": exit_code,
+        "exit_status": exit_status,
+        "service_result": service_result,
+        "time": time.time(),
+    }
+    if value is not None:
+        updated = dict(value)
+        updated["stop_result"] = stop_result
+        atomic_json(service_state_path(), updated)
+    print(f"OpenRGB lifecycle stop incomplete: {classification}")
+    latch_failure(message)
     return 1
 
 
@@ -239,6 +293,28 @@ def build_parser() -> argparse.ArgumentParser:
     mark_parser.add_argument("--server-pid", type=int)
     mark_parser.add_argument("--server-start")
     mark_parser.add_argument("--reason")
+    mark_parser.add_argument(
+        "--cleanup-stage",
+        choices=("sdk-term-authentication", "sdk-kill-authentication"),
+    )
+    mark_parser.add_argument(
+        "--identity-failure-stage",
+        choices=(
+            "process-missing-or-start-mismatch",
+            "command-line-mismatch",
+            "listener-query-unreadable",
+            "listener-absent",
+            "listener-owner-unexpected",
+            "identity-changed-during-verification",
+        ),
+    )
+    mark_parser.add_argument(
+        "--listener-query-state",
+        choices=("not-queried", "unreadable", "absent", "present"),
+    )
+    mark_parser.add_argument("--observed-server-pid", type=int)
+    mark_parser.add_argument("--observed-server-start")
+    mark_parser.add_argument("--observed-listener-owner", type=int)
     return parser
 
 
@@ -252,6 +328,21 @@ def main() -> int:
         return acknowledge_reviewed_recovery()
     if (args.server_pid is None) != (args.server_start is None):
         raise SystemExit("server PID and start token must be supplied together")
+    diagnostic_values = (
+        args.cleanup_stage,
+        args.identity_failure_stage,
+        args.listener_query_state,
+    )
+    if any(value is not None for value in diagnostic_values) and not all(
+        value is not None for value in diagnostic_values
+    ):
+        raise SystemExit("cleanup diagnostics must be supplied together")
+    if args.identity_failure_stage is not None and args.server_pid is None:
+        raise SystemExit("cleanup diagnostics require the expected server identity")
+    if (args.observed_server_pid is None) != (args.observed_server_start is None):
+        raise SystemExit(
+            "observed server PID and start token must be supplied together"
+        )
     return mark(args)
 
 

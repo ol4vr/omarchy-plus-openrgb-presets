@@ -9,8 +9,11 @@ readonly TEST_ROOT="$(/usr/bin/mktemp -d)"
 readonly PROC_FIXTURE="${TEST_ROOT}/proc"
 readonly BIN_DIR="${TEST_ROOT}/bin"
 readonly LISTENER_STATE="${TEST_ROOT}/listener"
+readonly LISTENER_SEQUENCE="${TEST_ROOT}/listener-sequence"
 readonly SIGNAL_LOG="${TEST_ROOT}/signals"
 readonly UNSAFE_WAIT_LOG="${TEST_ROOT}/unsafe-waits"
+readonly STATE_HOME="${TEST_ROOT}/state"
+readonly BOOT_ID_FILE="${TEST_ROOT}/boot-id"
 
 test_cleanup() {
   /usr/bin/rm -rf -- "${TEST_ROOT}"
@@ -19,8 +22,10 @@ trap test_cleanup EXIT
 
 /usr/bin/mkdir -p "${PROC_FIXTURE}" "${BIN_DIR}" "${TEST_ROOT}/runtime"
 : >"${LISTENER_STATE}"
+: >"${LISTENER_SEQUENCE}"
 : >"${SIGNAL_LOG}"
 : >"${UNSAFE_WAIT_LOG}"
+/usr/bin/printf '%s\n' test-boot >"${BOOT_ID_FILE}"
 
 for command in openrgb apply-preset timeout; do
   /usr/bin/install -m 0755 /dev/null "${BIN_DIR}/${command}"
@@ -28,7 +33,14 @@ done
 
 /usr/bin/printf '%s\n' \
   '#!/usr/bin/bash' \
-  'pid="$(<"${LISTENER_STATE}")"' \
+  'if [[ -s "${LISTENER_SEQUENCE}" ]]; then' \
+  '  value="$(<"${LISTENER_SEQUENCE}")"' \
+  '  pid="${value%%,*}"' \
+  '  if [[ "${value}" == *,* ]]; then /usr/bin/printf "%s" "${value#*,}" >"${LISTENER_SEQUENCE}"; else : >"${LISTENER_SEQUENCE}"; fi' \
+  'else' \
+  '  pid="$(<"${LISTENER_STATE}")"' \
+  'fi' \
+  '[[ "${pid}" != unreadable ]] || exit 2' \
   'if [[ "${pid}" =~ ^[1-9][0-9]*$ ]]; then' \
   '  /usr/bin/printf '\''LISTEN 0 10 127.0.0.1:6742 0.0.0.0:* users:(("openrgb",pid=%s,fd=5))\n'\'' "${pid}"' \
   'fi' >"${BIN_DIR}/ss"
@@ -41,7 +53,9 @@ export APPLY_PRESET="${BIN_DIR}/apply-preset"
 export PROC_ROOT="${PROC_FIXTURE}"
 export OPENRGB_RUNTIME_DIR="${TEST_ROOT}/runtime"
 export OPENRGB_SERVER_LOG="${TEST_ROOT}/openrgb-server.log"
-export LISTENER_STATE
+export XDG_STATE_HOME="${STATE_HOME}"
+export BOOT_ID_PATH="${BOOT_ID_FILE}"
+export LISTENER_STATE LISTENER_SEQUENCE
 
 # shellcheck source=../openrgb-lifecycle
 source "${REPOSITORY_ROOT}/openrgb-lifecycle"
@@ -187,7 +201,9 @@ reset_lifecycle_state() {
 
 reset_fixture() {
   /usr/bin/rm -rf -- "${PROC_FIXTURE:?}/"*
+  /usr/bin/rm -rf -- "${STATE_HOME}"
   set_listener ''
+  : >"${LISTENER_SEQUENCE}"
   : >"${SIGNAL_LOG}"
   : >"${UNSAFE_WAIT_LOG}"
   reset_lifecycle_state
@@ -195,6 +211,7 @@ reset_fixture() {
   restore_count=0
   signal_behavior=immediate
   shutdown_deadline=0
+  service_mode=false
 }
 
 adopt_fixture_server() {
@@ -206,6 +223,25 @@ adopt_fixture_server() {
   [[ "${server_pid}" == "${pid}" ]]
   [[ "${server_start_time}" == "${start_time}" ]]
   [[ "${server_origin}" == adopted ]]
+}
+
+enable_durable_diagnostics() {
+  write_server_process "$$" 7000
+  service_mode=true
+}
+
+assert_persisted_identity_failure() {
+  local expected_stage="${1}"
+  local expected_listener_state="${2}"
+  local state_file="${STATE_HOME}/omarchy-plus/openrgb-presets/lifecycle-service-state.json"
+
+  [[ -s "${state_file}" ]]
+  [[ "$(jq -r '.state' "${state_file}")" == stopping ]]
+  [[ "$(jq -r '.reason' "${state_file}")" == deliberate ]]
+  [[ "$(jq -r '.cleanup_failure.kind' "${state_file}")" == sdk-shutdown-identity-refusal ]]
+  [[ "$(jq -r '.cleanup_failure.cleanup_stage' "${state_file}")" == sdk-term-authentication ]]
+  [[ "$(jq -r '.cleanup_failure.failure_stage' "${state_file}")" == "${expected_stage}" ]]
+  [[ "$(jq -r '.cleanup_failure.listener_query_state' "${state_file}")" == "${expected_listener_state}" ]]
 }
 
 pass_count=0
@@ -283,28 +319,102 @@ test_pid_reuse_prevents_signaling() {
 
 test_listener_mismatch_prevents_signaling() {
   adopt_fixture_server 4105 8105
+  enable_durable_diagnostics
   write_server_process 4106 8106
   set_listener 4106
-  if stop_server suspend >/dev/null; then
+  if stop_server 'deliberate lifecycle shutdown' >/dev/null; then
     return 1
   fi
   [[ ! -s "${SIGNAL_LOG}" ]]
   [[ -d "${PROC_FIXTURE}/4105" ]]
   [[ "${server_pid}" == 4105 ]]
   [[ "${server_start_time}" == 8105 ]]
+  assert_persisted_identity_failure listener-owner-unexpected present
 }
 
 test_command_mismatch_prevents_signaling() {
   adopt_fixture_server 4108 8108
+  enable_durable_diagnostics
   /usr/bin/printf '%s' '/usr/bin/unrelated --server' \
     | /usr/bin/tr ' ' '\0' >"${PROC_FIXTURE}/4108/cmdline"
-  if stop_server suspend >/dev/null; then
+  if stop_server 'deliberate lifecycle shutdown' >/dev/null; then
     return 1
   fi
   [[ ! -s "${SIGNAL_LOG}" ]]
   [[ -d "${PROC_FIXTURE}/4108" ]]
   [[ "${server_pid}" == 4108 ]]
   [[ "${server_start_time}" == 8108 ]]
+  assert_persisted_identity_failure command-line-mismatch not-queried
+}
+
+test_missing_process_is_classified_without_signaling() {
+  if classify_server_listener_identity 4110 8110; then
+    return 1
+  fi
+  [[ "${server_identity_failure_stage}" == process-missing-or-start-mismatch ]]
+  [[ ! -s "${SIGNAL_LOG}" ]]
+  server_pid=4110
+  server_start_time=8110
+  enable_durable_diagnostics
+  record_shutdown_identity_refusal sdk-term-authentication 'deliberate lifecycle shutdown'
+  assert_persisted_identity_failure process-missing-or-start-mismatch not-queried
+  local state_file="${STATE_HOME}/omarchy-plus/openrgb-presets/lifecycle-service-state.json"
+  [[ "$(jq -r '.cleanup_failure | has("observed_server_pid")' "${state_file}")" == false ]]
+}
+
+test_start_token_mismatch_is_classified_without_signaling() {
+  write_server_process 4111 8111
+  set_listener 4111
+  if classify_server_listener_identity 4111 9999; then
+    return 1
+  fi
+  [[ "${server_identity_failure_stage}" == process-missing-or-start-mismatch ]]
+  [[ "${server_identity_observed_start}" == 8111 ]]
+  [[ ! -s "${SIGNAL_LOG}" ]]
+  server_pid=4111
+  server_start_time=9999
+  enable_durable_diagnostics
+  record_shutdown_identity_refusal sdk-term-authentication 'deliberate lifecycle shutdown'
+  assert_persisted_identity_failure process-missing-or-start-mismatch not-queried
+  local state_file="${STATE_HOME}/omarchy-plus/openrgb-presets/lifecycle-service-state.json"
+  [[ "$(jq -r '.cleanup_failure.observed_server_pid' "${state_file}")" == 4111 ]]
+  [[ "$(jq -r '.cleanup_failure.observed_server_start' "${state_file}")" == 8111 ]]
+}
+
+test_unreadable_listener_query_is_persisted_without_signaling() {
+  adopt_fixture_server 4112 8112
+  enable_durable_diagnostics
+  set_listener unreadable
+  if stop_server 'deliberate lifecycle shutdown' >/dev/null; then
+    return 1
+  fi
+  [[ ! -s "${SIGNAL_LOG}" ]]
+  assert_persisted_identity_failure listener-query-unreadable unreadable
+}
+
+test_missing_listener_is_persisted_without_signaling() {
+  adopt_fixture_server 4113 8113
+  enable_durable_diagnostics
+  set_listener ''
+  if stop_server 'deliberate lifecycle shutdown' >/dev/null; then
+    return 1
+  fi
+  [[ ! -s "${SIGNAL_LOG}" ]]
+  assert_persisted_identity_failure listener-absent absent
+}
+
+test_listener_change_between_checks_is_persisted_without_signaling() {
+  adopt_fixture_server 4114 8114
+  enable_durable_diagnostics
+  write_server_process 4115 8115
+  /usr/bin/printf '%s' '4114,4115' >"${LISTENER_SEQUENCE}"
+  if stop_server 'deliberate lifecycle shutdown' >/dev/null; then
+    return 1
+  fi
+  [[ ! -s "${SIGNAL_LOG}" ]]
+  assert_persisted_identity_failure identity-changed-during-verification present
+  local state_file="${STATE_HOME}/omarchy-plus/openrgb-presets/lifecycle-service-state.json"
+  [[ "$(jq -r '.cleanup_failure.observed_listener_owner' "${state_file}")" == 4115 ]]
 }
 
 test_repeated_handoffs_do_not_duplicate() {
@@ -396,6 +506,11 @@ run_test 'suspend stops adopted SDK and resume restores exactly one' test_suspen
 run_test 'PID reuse prevents signaling' test_pid_reuse_prevents_signaling
 run_test 'listener ownership mismatch prevents signaling' test_listener_mismatch_prevents_signaling
 run_test 'command identity mismatch prevents signaling' test_command_mismatch_prevents_signaling
+run_test 'missing process is classified without signaling' test_missing_process_is_classified_without_signaling
+run_test 'start-token mismatch is classified without signaling' test_start_token_mismatch_is_classified_without_signaling
+run_test 'unreadable listener query is persisted without signaling' test_unreadable_listener_query_is_persisted_without_signaling
+run_test 'missing listener is persisted without signaling' test_missing_listener_is_persisted_without_signaling
+run_test 'identity change between checks is persisted without signaling' test_listener_change_between_checks_is_persisted_without_signaling
 run_test 'repeated shell reloads do not launch duplicates' test_repeated_handoffs_do_not_duplicate
 run_test 'existing duplicate-server prevention remains active' test_duplicate_start_reuses_listener
 run_test 'deliberate cleanup stops only the verified SDK' test_deliberate_cleanup_stops_verified_server
@@ -404,5 +519,5 @@ run_test 'SDK ignoring TERM receives bounded SIGKILL escalation' test_sdk_ignori
 run_test 'overall shutdown deadline fails closed without an unbounded wait' test_overall_deadline_fails_closed
 run_test 'an SDK child retaining the listener prevents clean shutdown' test_lingering_sdk_listener_fails_closed
 
-[[ "${pass_count}" -eq 14 ]]
+[[ "${pass_count}" -eq 19 ]]
 /usr/bin/printf 'SDK ownership lifecycle: PASS (%s signal-free cases)\n' "${pass_count}"

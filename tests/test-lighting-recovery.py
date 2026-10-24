@@ -356,6 +356,10 @@ class LightingRecoveryTests(unittest.TestCase):
                 "LGT-LIF-003",
                 "lifecycle",
             ),
+            "OpenRGB lifecycle explicitly refused SDK shutdown authentication before clean shutdown": (
+                "LGT-LIF-001",
+                "lifecycle",
+            ),
             "expected seven controllers, found 6": ("LGT-CTL-001", "controller"),
             "DIMM state changed outside the Tetris writer: address 0x18": (
                 "LGT-CTL-001",

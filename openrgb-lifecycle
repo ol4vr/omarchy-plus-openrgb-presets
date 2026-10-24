@@ -72,6 +72,11 @@ service_mode=false
 service_ready=false
 shutdown_deadline=0
 wait_exit_status=''
+listener_query_state='unreadable'
+listener_query_owner=''
+server_identity_failure_stage=''
+server_identity_observed_pid=''
+server_identity_observed_start=''
 
 log() {
   /usr/bin/printf '%s\n' "$*"
@@ -682,12 +687,26 @@ expected_server_command() {
 }
 
 listener_owner_pid() {
+  query_listener_owner || return 1
+  /usr/bin/printf '%s' "${listener_query_owner}"
+}
+
+query_listener_owner() {
   local listener=''
   local pid=''
 
-  listener="$("${SS_BIN}" -H -ltnp 'sport = :6742' 2>/dev/null \
+  listener_query_state='unreadable'
+  listener_query_owner=''
+  if ! listener="$("${SS_BIN}" -H -ltnp 'sport = :6742' 2>/dev/null)"; then
+    return 1
+  fi
+  listener="$(/usr/bin/printf '%s\n' "${listener}" \
     | /usr/bin/awk '$4 == "127.0.0.1:6742" && index($0, "users:((\"openrgb\",pid=") {print}')"
-  if [[ -z "${listener}" || "${listener}" == *$'\n'* ]]; then
+  if [[ -z "${listener}" ]]; then
+    listener_query_state='absent'
+    return 1
+  fi
+  if [[ "${listener}" == *$'\n'* ]]; then
     return 1
   fi
 
@@ -697,7 +716,8 @@ listener_owner_pid() {
     return 1
   fi
 
-  /usr/bin/printf '%s' "${pid}"
+  listener_query_state='present'
+  listener_query_owner="${pid}"
 }
 
 is_server_process() {
@@ -709,15 +729,99 @@ is_server_process() {
 }
 
 is_server_listener() {
+  classify_server_listener_identity "$@"
+}
+
+classify_server_listener_identity() {
   local pid="${1:-}"
   local start_time="${2:-}"
-  local owner=''
+  local command=''
+  local first_owner=''
 
-  is_server_process "${pid}" "${start_time}" || return 1
-  owner="$(listener_owner_pid 2>/dev/null || true)"
-  [[ "${owner}" == "${pid}" ]] || return 1
-  is_server_process "${pid}" "${start_time}" || return 1
-  [[ "$(listener_owner_pid 2>/dev/null || true)" == "${pid}" ]]
+  server_identity_failure_stage=''
+  server_identity_observed_pid=''
+  server_identity_observed_start="$(process_start_time "${pid}" 2>/dev/null || true)"
+  listener_query_state='not-queried'
+  listener_query_owner=''
+  if [[ -n "${server_identity_observed_start}" ]]; then
+    server_identity_observed_pid="${pid}"
+  fi
+
+  if [[ -z "${server_identity_observed_start}" \
+    || "${server_identity_observed_start}" != "${start_time}" ]]; then
+    server_identity_failure_stage='process-missing-or-start-mismatch'
+    return 1
+  fi
+
+  command="$(process_command "${pid}" 2>/dev/null || true)"
+  if [[ "${command}" != "$(expected_server_command)" ]]; then
+    server_identity_failure_stage='command-line-mismatch'
+    return 1
+  fi
+
+  if ! query_listener_owner; then
+    if [[ "${listener_query_state}" == absent ]]; then
+      server_identity_failure_stage='listener-absent'
+    else
+      server_identity_failure_stage='listener-query-unreadable'
+    fi
+    return 1
+  fi
+  first_owner="${listener_query_owner}"
+  if [[ "${first_owner}" != "${pid}" ]]; then
+    server_identity_failure_stage='listener-owner-unexpected'
+    return 1
+  fi
+
+  server_identity_observed_start="$(process_start_time "${pid}" 2>/dev/null || true)"
+  command="$(process_command "${pid}" 2>/dev/null || true)"
+  if [[ "${server_identity_observed_start}" != "${start_time}" \
+    || "${command}" != "$(expected_server_command)" ]]; then
+    server_identity_failure_stage='identity-changed-during-verification'
+    return 1
+  fi
+
+  if ! query_listener_owner \
+    || [[ "${listener_query_state}" != present ]] \
+    || [[ "${listener_query_owner}" != "${first_owner}" ]] \
+    || [[ "${listener_query_owner}" != "${pid}" ]]; then
+    server_identity_failure_stage='identity-changed-during-verification'
+    return 1
+  fi
+}
+
+record_shutdown_identity_refusal() {
+  local cleanup_stage="${1}"
+  local reason="${2}"
+  local boundary_reason="${reason}"
+  local -a command
+
+  if [[ "${reason}" == 'deliberate lifecycle shutdown' ]]; then
+    boundary_reason=deliberate
+  fi
+  command=(
+    "${SERVICE_GUARD}" mark stopping
+    --lifecycle-pid "$$"
+    --lifecycle-start "$(process_start_time $$)"
+    --server-pid "${server_pid}"
+    --server-start "${server_start_time}"
+    --reason "${boundary_reason}"
+    --cleanup-stage "${cleanup_stage}"
+    --identity-failure-stage "${server_identity_failure_stage}"
+    --listener-query-state "${listener_query_state}"
+  )
+
+  if [[ -n "${server_identity_observed_pid}" ]]; then
+    command+=(--observed-server-pid "${server_identity_observed_pid}")
+  fi
+  if [[ -n "${server_identity_observed_start}" ]]; then
+    command+=(--observed-server-start "${server_identity_observed_start}")
+  fi
+  if [[ -n "${listener_query_owner}" ]]; then
+    command+=(--observed-listener-owner "${listener_query_owner}")
+  fi
+  "${command[@]}" || true
+  log "OpenRGB SDK shutdown authentication refused: cleanup_stage=${cleanup_stage} failure_stage=${server_identity_failure_stage} expected_pid=${server_pid} expected_start=${server_start_time} observed_pid=${server_identity_observed_pid:-none} observed_start=${server_identity_observed_start:-none} listener_state=${listener_query_state} listener_owner=${listener_query_owner:-none} reason=${reason}"
 }
 
 find_existing_server() {
@@ -834,12 +938,13 @@ stop_server() {
   fi
 
   if ! is_same_process "${server_pid}" "${server_start_time}"; then
-    log "Tracked OpenRGB PID ${server_pid} no longer has start identity ${server_start_time}; not signaling"
+    server_identity_observed_start="$(process_start_time "${server_pid}" 2>/dev/null || true)"
+    log "Tracked OpenRGB PID ${server_pid} no longer has start identity ${server_start_time}; failure_stage=process-missing-or-start-mismatch observed_start=${server_identity_observed_start:-none}; not signaling"
     clear_server_identity
     return 0
   fi
   if ! is_server_listener "${server_pid}" "${server_start_time}"; then
-    log "Refusing to signal OpenRGB PID ${server_pid} for ${reason}: process or listener identity changed"
+    record_shutdown_identity_refusal sdk-term-authentication "${reason}"
     return 1
   fi
 
@@ -856,7 +961,7 @@ stop_server() {
   fi
 
   if ! is_server_listener "${server_pid}" "${server_start_time}"; then
-    log "Refusing to escalate OpenRGB PID ${server_pid} for ${reason}: listener ownership changed"
+    record_shutdown_identity_refusal sdk-kill-authentication "${reason}"
     return 1
   fi
   kill -KILL "${server_pid}" 2>/dev/null || true
