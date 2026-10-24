@@ -37,6 +37,9 @@ PORT = 6742
 EXPECTED_CONTROLLER_COUNT = 7
 HARDWARE_GATE_ATTEMPTS = 15
 HARDWARE_GATE_RETRY_SECONDS = 1.0
+HEALTH_CHECKPOINT_INTERVAL_SECONDS = 0.25
+HEALTH_CHECKPOINT_TIMEOUT_SECONDS = 2.0
+FAILURE_KERNEL_CAPTURE_TIMEOUT_SECONDS = 0.5
 PROTOCOL_VERSION = 4
 MAGIC = b"ORGB"
 HEADER = struct.Struct("<4sIII")
@@ -96,6 +99,12 @@ STOP_REASONS = LIFECYCLE_STOP_REASONS | LOCAL_STOP_REASONS
 class SafetyStop(RuntimeError):
     """A mandatory health gate failed; no further hardware write is allowed."""
 
+    def __init__(
+        self, message: str, *, evidence: Mapping[str, object] | None = None
+    ) -> None:
+        super().__init__(message)
+        self.evidence = dict(evidence or {})
+
 
 class HardwareWriteFailure(SafetyStop):
     """The SDK write itself failed, so restoration is forbidden."""
@@ -132,6 +141,47 @@ class ControllerSnapshot:
     mode: str
     led_count: int
     colors: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class HealthCheckpoint:
+    controllers: Mapping[core.ControllerIdentity, ControllerSnapshot]
+    temperatures: Mapping[str, int]
+    completed_monotonic: float
+    completed_unix: float
+    duration_seconds: float
+
+
+@contextmanager
+def _bounded_operation(seconds: float, operation: str):
+    """Bound a main-thread hardware operation without creating another worker."""
+
+    if seconds <= 0:
+        raise ValueError("operation deadline must be positive")
+    if threading.current_thread() is not threading.main_thread():
+        raise SafetyStop(f"{operation} cannot establish its deadline")
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    if previous_timer[0] > 0 or previous_timer[1] > 0:
+        raise SafetyStop(f"{operation} found an active process deadline")
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def deadline_expired(_signum: int, _frame: object) -> None:
+        raise SafetyStop(
+            f"{operation} exceeded its {seconds:.3f} second deadline",
+            evidence={
+                "failure_kind": "operation-timeout",
+                "operation": operation,
+                "deadline_ms": round(seconds * 1000),
+            },
+        )
+
+    signal.signal(signal.SIGALRM, deadline_expired)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def _state_root() -> Path:
@@ -497,11 +547,18 @@ class OpenRGBSDK:
 
 
 class LinuxHealth:
-    def __init__(self, server: ServerIdentity, lifecycle: LifecycleIdentity) -> None:
+    def __init__(
+        self,
+        server: ServerIdentity,
+        lifecycle: LifecycleIdentity,
+        sysfs_root: Path = Path("/sys/bus/i2c/devices"),
+    ) -> None:
         self.server = server
         self.lifecycle = lifecycle
+        self.sysfs_root = sysfs_root
         self.kernel_baseline = ""
         self.kernel_cursor = ""
+        self.last_temperatures: dict[str, tuple[int, float]] = {}
 
     def begin(self) -> None:
         output = self._journal(["-n", "0", "--show-cursor"])
@@ -529,7 +586,7 @@ class LinuxHealth:
                 return line.removeprefix("-- cursor: ")
         raise SafetyStop("journalctl did not return a cursor")
 
-    def verify_processes(self) -> None:
+    def verify_immediate_identity(self) -> None:
         if (
             _process_start_token(self.server.pid) != self.server.start_token
             or _process_argv(self.server.pid) != SERVER_ARGV
@@ -540,6 +597,9 @@ class LinuxHealth:
             or _process_argv(self.lifecycle.pid) != LIFECYCLE_ARGV
         ):
             raise SafetyStop("OpenRGB lifecycle process identity changed")
+
+    def verify_processes(self) -> None:
+        self.verify_immediate_identity()
         lifecycle_matches = _independent_lifecycle_pids(self.lifecycle.pid)
         if lifecycle_matches != (self.lifecycle.pid,):
             raise SafetyStop(
@@ -575,25 +635,101 @@ class LinuxHealth:
         ):
             raise SafetyStop("boot or suspend continuity changed")
 
+    def _temperature_evidence(
+        self,
+        endpoint: str,
+        read_state: str,
+        *,
+        sensor: str = "temp1_input",
+        error: BaseException | None = None,
+        value_length: int | None = None,
+    ) -> dict[str, object]:
+        evidence: dict[str, object] = {
+            "failure_kind": "spd5118-temperature",
+            "endpoint": endpoint,
+            "sensor": f"{endpoint}/hwmon/{sensor}",
+            "read_state": read_state,
+        }
+        if error is not None:
+            evidence["exception_type"] = type(error).__name__
+            error_number = getattr(error, "errno", None)
+            if isinstance(error_number, int):
+                evidence["errno"] = error_number
+        if value_length is not None:
+            evidence["value_length"] = value_length
+        previous = self.last_temperatures.get(endpoint)
+        if previous is not None:
+            evidence["last_successful_temperature_mc"] = previous[0]
+            evidence["last_successful_unix"] = previous[1]
+        return evidence
+
     def temperatures(self) -> Mapping[str, int]:
         values: dict[str, int] = {}
         for endpoint in SPD_ENDPOINTS:
-            device = Path("/sys/bus/i2c/devices") / endpoint
+            device = self.sysfs_root / endpoint
             try:
                 if device.joinpath("driver").resolve().name != "spd5118":
-                    raise SafetyStop(f"{endpoint} is not bound to spd5118")
+                    raise SafetyStop(
+                        f"{endpoint} is not bound to spd5118",
+                        evidence=self._temperature_evidence(
+                            endpoint, "wrong-driver", sensor="driver"
+                        ),
+                    )
             except OSError as error:
-                raise SafetyStop(f"{endpoint} driver binding is unreadable") from error
+                raise SafetyStop(
+                    f"{endpoint} driver binding is unreadable",
+                    evidence=self._temperature_evidence(
+                        endpoint,
+                        "driver-read-error",
+                        sensor="driver",
+                        error=error,
+                    ),
+                ) from error
             paths = glob.glob(str(device / "hwmon/hwmon*/temp1_input"))
             if len(paths) != 1:
-                raise SafetyStop(f"{endpoint} has {len(paths)} temperature paths")
+                raise SafetyStop(
+                    f"{endpoint} has {len(paths)} temperature paths",
+                    evidence={
+                        **self._temperature_evidence(endpoint, "path-count"),
+                        "path_count": len(paths),
+                    },
+                )
             try:
-                value = int(Path(paths[0]).read_text().strip())
-            except (OSError, ValueError) as error:
-                raise SafetyStop(f"{endpoint} temperature is unreadable") from error
+                raw = Path(paths[0]).read_text(encoding="utf-8")
+            except OSError as error:
+                raise SafetyStop(
+                    f"{endpoint} temperature is unreadable",
+                    evidence=self._temperature_evidence(
+                        endpoint, "kernel-read-error", error=error
+                    ),
+                ) from error
+            stripped = raw.strip()
+            if not stripped:
+                raise SafetyStop(
+                    f"{endpoint} temperature is empty",
+                    evidence=self._temperature_evidence(
+                        endpoint, "empty", value_length=len(raw)
+                    ),
+                )
+            try:
+                value = int(stripped)
+            except ValueError as error:
+                raise SafetyStop(
+                    f"{endpoint} temperature is malformed",
+                    evidence=self._temperature_evidence(
+                        endpoint, "malformed", error=error, value_length=len(raw)
+                    ),
+                ) from error
             if value <= 0:
-                raise SafetyStop(f"{endpoint} returned invalid temperature {value}")
+                raise SafetyStop(
+                    f"{endpoint} returned invalid temperature {value}",
+                    evidence={
+                        **self._temperature_evidence(endpoint, "invalid-value"),
+                        "temperature_mc": value,
+                    },
+                )
             values[endpoint] = value
+            self.last_temperatures[endpoint] = (value, time.time())
         return values
 
     def _verify_kernel_errors_after(self, cursor: str) -> str:
@@ -605,8 +741,29 @@ class LinuxHealth:
             line for line in output.splitlines() if RELEVANT_KERNEL_ERROR.search(line)
         ]
         if errors:
-            raise SafetyStop("new relevant kernel error: " + " | ".join(errors))
+            retained = tuple(line[:500] for line in errors[-8:])
+            raise SafetyStop(
+                "new relevant kernel error: " + " | ".join(retained),
+                evidence={
+                    "failure_kind": "kernel-communication",
+                    "kernel_messages": retained,
+                },
+            )
         return next_cursor
+
+    def failure_kernel_evidence(self) -> dict[str, object]:
+        """Capture, but do not advance, relevant lines after the last clean cursor."""
+
+        output = self._journal(["--after-cursor", self.kernel_cursor, "--show-cursor"])
+        messages = tuple(
+            line[:500]
+            for line in output.splitlines()
+            if RELEVANT_KERNEL_ERROR.search(line)
+        )[-8:]
+        return {
+            "kernel_evidence_status": "captured",
+            "kernel_messages": messages,
+        }
 
     def no_new_kernel_errors(self) -> None:
         """Check and advance the writer's incremental journal cursor."""
@@ -700,6 +857,33 @@ class RuntimeControl:
         self.write_lock_path = self.root / "ram-tetris-write.lock"
         self.status_path = self.root / "ram-tetris-status.json"
         self.failure_path = _state_root() / "ram-tetris-failure.json"
+
+    @staticmethod
+    def _verify_open_lock(path: Path, descriptor: int | None, label: str) -> None:
+        if descriptor is None:
+            raise SafetyStop(f"{label} ownership is unavailable")
+        try:
+            opened = os.fstat(descriptor)
+            current = path.lstat()
+        except OSError as error:
+            raise SafetyStop(f"{label} ownership is unreadable") from error
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_uid != os.getuid()
+            or opened.st_dev != current.st_dev
+            or opened.st_ino != current.st_ino
+        ):
+            raise SafetyStop(f"{label} ownership changed")
+
+    def verify_runtime_ownership(
+        self, writer_lock_fd: int | None, write_lock_fd: int | None
+    ) -> None:
+        if self.failure_path.exists():
+            raise SafetyStop("a persistent RAM Tetris failure is active")
+        self._verify_open_lock(
+            self.root / "ram-tetris.lock", writer_lock_fd, "writer singleton"
+        )
+        self._verify_open_lock(self.write_lock_path, write_lock_fd, "RGB write gate")
 
     def stop_request(self) -> StopRequest | None:
         try:
@@ -809,13 +993,16 @@ class RuntimeControl:
             and value.get("state") in {"starting", "running"}
         )
 
-    def fail(self, message: str) -> None:
+    def fail(self, message: str, evidence: Mapping[str, object] | None = None) -> None:
         value = {
             "state": "failed",
             "message": message,
             "pid": os.getpid(),
             "time": time.time(),
         }
+        if evidence:
+            value["evidence_version"] = 1
+            value["details"] = dict(evidence)
         _write_json_if_absent(self.failure_path, value)
         _write_json(self.status_path, value)
 
@@ -829,13 +1016,21 @@ class TetrisWriter:
         control: RuntimeControl,
         preset: str,
         write_lock_fd: int | None = None,
+        writer_lock_fd: int | None = None,
+        checkpoint_interval: float = HEALTH_CHECKPOINT_INTERVAL_SECONDS,
+        checkpoint_timeout: float = HEALTH_CHECKPOINT_TIMEOUT_SECONDS,
     ) -> None:
+        if checkpoint_interval <= 0 or checkpoint_timeout <= 0:
+            raise ValueError("health checkpoint bounds must be positive")
         self.sdk = sdk
         self.health = health
         self.effects = effects
         self.control = control
         self.preset = preset
         self.write_lock_fd = write_lock_fd
+        self.writer_lock_fd = writer_lock_fd
+        self.checkpoint_interval = checkpoint_interval
+        self.checkpoint_timeout = checkpoint_timeout
         self.expected: dict[core.ControllerIdentity, tuple[str, ...]] = {}
         self.last_global_write: float | None = None
         self.last_dimm_write: dict[core.ControllerIdentity, float] = {}
@@ -843,6 +1038,11 @@ class TetrisWriter:
         self.termination_signal: int | None = None
         self.requested_stop: str | None = None
         self.animation_writes = 0
+        self.checkpoint: HealthCheckpoint | None = None
+        self.checkpoint_failed = False
+        self.checkpoint_started_monotonic: float | None = None
+        self.checkpoint_started_unix: float | None = None
+        self.checkpoint_phase = "idle"
 
     @contextmanager
     def _write_guard(self):
@@ -881,10 +1081,11 @@ class TetrisWriter:
         self.stopping = True
         return request
 
-    def _health_gate(
-        self,
-    ) -> tuple[dict[core.ControllerIdentity, ControllerSnapshot], Mapping[str, int]]:
-        self.health.verify_processes()
+    def _lightweight_gate(self, *, require_fresh_checkpoint: bool) -> None:
+        self.control.verify_runtime_ownership(self.writer_lock_fd, self.write_lock_fd)
+        self.health.verify_immediate_identity()
+        if self.checkpoint_failed:
+            raise SafetyStop("RAM Tetris health checkpoint previously failed")
         if not _preference():
             if self.requested_stop == "user-off":
                 self.stopping = True
@@ -892,17 +1093,132 @@ class TetrisWriter:
                 raise SafetyStop("RAM Tetris preference changed")
         if _selected_preset() != self.preset:
             raise SafetyStop("selected preset changed")
-        temperatures = self.health.temperatures()
-        self.health.no_new_kernel_errors()
-        controllers = _targets(self.sdk.inventory())
-        self.effects.verify(self.sdk.active_effects())
-        if self.expected:
-            for identity, colors in self.expected.items():
-                if controllers[identity].colors != colors:
+        if not require_fresh_checkpoint:
+            return
+        if self.checkpoint is None:
+            raise SafetyStop("RAM Tetris health checkpoint is unavailable")
+        age = time.monotonic() - self.checkpoint.completed_monotonic
+        if age < 0 or age > self.checkpoint_interval:
+            raise SafetyStop(
+                "RAM Tetris health checkpoint is expired",
+                evidence={
+                    "failure_kind": "checkpoint-expired",
+                    "checkpoint_age_ms": round(age * 1000, 3),
+                    "checkpoint_interval_ms": round(self.checkpoint_interval * 1000, 3),
+                },
+            )
+
+    def _full_health_checkpoint(self) -> HealthCheckpoint:
+        started_monotonic = time.monotonic()
+        started_unix = time.time()
+        self.checkpoint_started_monotonic = started_monotonic
+        self.checkpoint_started_unix = started_unix
+        try:
+            with _bounded_operation(
+                self.checkpoint_timeout, "RAM Tetris health checkpoint"
+            ):
+                self.checkpoint_phase = "process-and-listener-identity"
+                self.health.verify_processes()
+                self.checkpoint_phase = "spd5118-temperatures"
+                temperatures = dict(self.health.temperatures())
+                self.checkpoint_phase = "kernel-journal"
+                self.health.no_new_kernel_errors()
+                self.checkpoint_phase = "controller-inventory"
+                controllers = _targets(self.sdk.inventory())
+                self.checkpoint_phase = "effects-contract"
+                self.effects.verify(self.sdk.active_effects())
+                self.checkpoint_phase = "controller-state"
+                if self.expected:
+                    for identity, colors in self.expected.items():
+                        if controllers[identity].colors != colors:
+                            raise SafetyStop(
+                                "DIMM state changed outside the Tetris writer: "
+                                f"{identity.location}"
+                            )
+                completed_monotonic = time.monotonic()
+                duration = completed_monotonic - started_monotonic
+                if duration < 0 or duration > self.checkpoint_timeout:
                     raise SafetyStop(
-                        f"DIMM state changed outside the Tetris writer: {identity.location}"
+                        "RAM Tetris health checkpoint exceeded its deadline",
+                        evidence={
+                            "failure_kind": "checkpoint-timeout",
+                            "checkpoint_duration_ms": round(duration * 1000, 3),
+                            "checkpoint_deadline_ms": round(
+                                self.checkpoint_timeout * 1000, 3
+                            ),
+                        },
                     )
-        return controllers, temperatures
+                checkpoint = HealthCheckpoint(
+                    controllers=controllers,
+                    temperatures=temperatures,
+                    completed_monotonic=completed_monotonic,
+                    completed_unix=time.time(),
+                    duration_seconds=duration,
+                )
+        except SafetyStop as error:
+            self.checkpoint_failed = True
+            raise SafetyStop(
+                str(error),
+                evidence={
+                    **error.evidence,
+                    "checkpoint_phase": self.checkpoint_phase,
+                },
+            ) from error
+        self.checkpoint_phase = "idle"
+        self.checkpoint = checkpoint
+        return checkpoint
+
+    def _ensure_health_checkpoint(self) -> tuple[HealthCheckpoint, bool]:
+        now = time.monotonic()
+        if self.checkpoint is not None:
+            age = now - self.checkpoint.completed_monotonic
+            if age < 0:
+                self.checkpoint_failed = True
+                raise SafetyStop(
+                    "RAM Tetris monotonic checkpoint time moved backwards",
+                    evidence={
+                        "failure_kind": "checkpoint-clock",
+                        "checkpoint_age_ms": round(age * 1000, 3),
+                    },
+                )
+            if age <= self.checkpoint_interval:
+                return self.checkpoint, False
+        return self._full_health_checkpoint(), True
+
+    def failure_evidence(self, error: SafetyStop) -> dict[str, object]:
+        now = time.monotonic()
+        details: dict[str, object] = {
+            "failure_kind": "safety-stop",
+            "writer_progress_count": self.animation_writes,
+            "checkpoint_interval_ms": round(self.checkpoint_interval * 1000, 3),
+            "checkpoint_deadline_ms": round(self.checkpoint_timeout * 1000, 3),
+        }
+        details.update(error.evidence)
+        if self.checkpoint_started_monotonic is not None:
+            details["checkpoint_started_unix"] = self.checkpoint_started_unix
+            details["checkpoint_elapsed_ms"] = round(
+                max(0.0, now - self.checkpoint_started_monotonic) * 1000, 3
+            )
+        if self.checkpoint is not None:
+            details["last_checkpoint_completed_unix"] = self.checkpoint.completed_unix
+            details["last_checkpoint_duration_ms"] = round(
+                self.checkpoint.duration_seconds * 1000, 3
+            )
+            details["last_checkpoint_age_ms"] = round(
+                max(0.0, now - self.checkpoint.completed_monotonic) * 1000, 3
+            )
+            details["last_temperatures_mc"] = dict(self.checkpoint.temperatures)
+        if "kernel_messages" not in details:
+            try:
+                with _bounded_operation(
+                    FAILURE_KERNEL_CAPTURE_TIMEOUT_SECONDS,
+                    "RAM Tetris failure kernel capture",
+                ):
+                    details.update(self.health.failure_kernel_evidence())
+            except SafetyStop as capture_error:
+                details["kernel_evidence_status"] = "unavailable"
+                details["kernel_evidence_error"] = str(capture_error)
+        return details
 
     def _sleep_until(self, target: float) -> None:
         while True:
@@ -919,24 +1235,29 @@ class TetrisWriter:
         with self._write_guard():
             if self._validated_stop_request() is not None:
                 return False
-            controllers, temperatures = self._health_gate()
+            self._lightweight_gate(require_fresh_checkpoint=False)
+            checkpoint, refreshed = self._ensure_health_checkpoint()
             if self._validated_stop_request() is not None:
                 return False
+            self._lightweight_gate(require_fresh_checkpoint=True)
             if colors == self.expected[identity]:
                 raise SafetyStop("scheduler produced a redundant frame")
-            self.sdk.update_leds(controllers[identity].index, colors)
+            self.sdk.update_leds(checkpoint.controllers[identity].index, colors)
         now = time.monotonic()
         self.last_global_write = now
         self.last_dimm_write[identity] = now
         self.expected[identity] = colors
         self.animation_writes += 1
-        self.control.status(
-            "running",
-            "RAM Tetris active",
-            preset=self.preset,
-            writes=self.animation_writes,
-            temperatures_mc=dict(temperatures),
-        )
+        if refreshed:
+            self.control.status(
+                "running",
+                "RAM Tetris active",
+                preset=self.preset,
+                writes=self.animation_writes,
+                temperatures_mc=dict(checkpoint.temperatures),
+                checkpoint_completed_unix=checkpoint.completed_unix,
+                checkpoint_duration_ms=round(checkpoint.duration_seconds * 1000, 3),
+            )
         return True
 
     def _restore_static(self) -> bool:
@@ -946,16 +1267,24 @@ class TetrisWriter:
                 request = self._validated_stop_request()
                 if request is None or request.reason != "user-off":
                     return False
-                controllers, _ = self._health_gate_for_restoration()
+                self._lightweight_gate(require_fresh_checkpoint=False)
+                with _bounded_operation(
+                    self.checkpoint_timeout, "RAM Tetris restoration health gate"
+                ):
+                    controllers, _ = self._health_gate_for_restoration()
                 request = self._validated_stop_request()
                 if request is None or request.reason != "user-off":
                     return False
+                self._lightweight_gate(require_fresh_checkpoint=False)
                 if controllers[identity].colors == static:
                     self.expected[identity] = static
                     continue
                 self.sdk.update_leds(controllers[identity].index, static)
                 self.expected[identity] = static
-                self._health_gate_for_restoration()
+                with _bounded_operation(
+                    self.checkpoint_timeout, "RAM Tetris restoration verification"
+                ):
+                    self._health_gate_for_restoration()
         return True
 
     def _health_gate_for_restoration(
@@ -976,7 +1305,10 @@ class TetrisWriter:
         return controllers, temperatures
 
     def run(self) -> None:
-        self.health.begin()
+        with _bounded_operation(
+            self.checkpoint_timeout, "RAM Tetris kernel journal baseline"
+        ):
+            self.health.begin()
         with self._write_guard():
             initial_request = self._validated_stop_request()
             if initial_request is not None and initial_request.reason != "user-off":
@@ -987,9 +1319,12 @@ class TetrisWriter:
                     writes=0,
                 )
                 return
-            controllers, temperatures = self._health_gate()
+            self._lightweight_gate(require_fresh_checkpoint=False)
+            checkpoint, _ = self._ensure_health_checkpoint()
+            self._lightweight_gate(require_fresh_checkpoint=True)
         self.expected = {
-            identity: target.colors for identity, target in controllers.items()
+            identity: target.colors
+            for identity, target in checkpoint.controllers.items()
         }
         streams = list(core.default_streams(self.preset))
         origin = time.monotonic()
@@ -998,7 +1333,9 @@ class TetrisWriter:
             "RAM Tetris active",
             preset=self.preset,
             writes=0,
-            temperatures_mc=dict(temperatures),
+            temperatures_mc=dict(checkpoint.temperatures),
+            checkpoint_completed_unix=checkpoint.completed_unix,
+            checkpoint_duration_ms=round(checkpoint.duration_seconds * 1000, 3),
         )
         while not self.stopping:
             if self._validated_stop_request() is not None:
@@ -1165,10 +1502,12 @@ def _run(args: argparse.Namespace) -> int:
                 control,
                 preset,
                 write_lock_fd,
+                lock_fd,
             )
             writer.run()
         except SafetyStop as error:
-            control.fail(str(error))
+            evidence = writer.failure_evidence(error) if writer is not None else None
+            control.fail(str(error), evidence)
             print(f"RAM Tetris stopped without restoration: {error}", file=sys.stderr)
             return 1
         except Exception as error:  # noqa: BLE001 - fail-closed hardware boundary

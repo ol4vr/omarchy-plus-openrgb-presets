@@ -1,8 +1,9 @@
 #!/usr/bin/python3
-"""Focused offline validation for the v0.4.25 RAM Tetris integration."""
+"""Focused offline validation for the v0.4.28 RAM Tetris integration."""
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import importlib.machinery
 import importlib.util
@@ -52,6 +53,8 @@ class FakeSDK:
     ) -> None:
         initial = colors if colors is not None else (color,) * core.LED_COUNT
         self.writes: list[tuple[int, tuple[str, ...]]] = []
+        self.inventory_calls = 0
+        self.effects_calls = 0
         self.controllers = [
             runtime.ControllerSnapshot(
                 index,
@@ -77,9 +80,11 @@ class FakeSDK:
         return None
 
     def inventory(self):
+        self.inventory_calls += 1
         return tuple(self.controllers)
 
     def active_effects(self):
+        self.effects_calls += 1
         return ("Sunrise",)
 
     def update_leds(self, index, colors):
@@ -98,6 +103,10 @@ class FakeHealth:
         self.fail_spd = fail_spd
         self.process_failure = process_failure
         self.begun = False
+        self.immediate_checks = 0
+        self.process_checks = 0
+        self.temperature_checks = 0
+        self.kernel_checks = 0
         self.window_checks = 0
         self.server = runtime.ServerIdentity(200, "server-start")
         self.lifecycle = runtime.LifecycleIdentity(300, "lifecycle-start", "boot", 0)
@@ -106,19 +115,39 @@ class FakeHealth:
         self.begun = True
 
     def verify_processes(self):
+        self.process_checks += 1
+        if self.process_failure is not None:
+            raise runtime.SafetyStop(self.process_failure)
+
+    def verify_immediate_identity(self):
+        self.immediate_checks += 1
         if self.process_failure is not None:
             raise runtime.SafetyStop(self.process_failure)
 
     def temperatures(self):
+        self.temperature_checks += 1
         if self.fail_spd:
-            raise runtime.SafetyStop("10-0050 temperature is unreadable")
+            raise runtime.SafetyStop(
+                "10-0050 temperature is unreadable",
+                evidence={
+                    "failure_kind": "spd5118-temperature",
+                    "endpoint": "10-0050",
+                    "sensor": "10-0050/hwmon/temp1_input",
+                    "read_state": "kernel-read-error",
+                    "exception_type": "OSError",
+                    "errno": errno.EIO,
+                },
+            )
         return {endpoint: 40_000 for endpoint in runtime.SPD_ENDPOINTS}
 
     def no_new_kernel_errors(self):
-        return None
+        self.kernel_checks += 1
 
     def no_kernel_errors_since_baseline(self):
         self.window_checks += 1
+
+    def failure_kernel_evidence(self):
+        return {"kernel_evidence_status": "captured", "kernel_messages": ()}
 
 
 class WindowHealth(FakeHealth):
@@ -159,6 +188,7 @@ class FakeControl:
         if request is None and reason is not None:
             self.request = runtime.StopRequest(reason)
         self.states: list[str] = []
+        self.ownership_checks = 0
 
     def stop_reason(self):
         return self.request.reason if self.request is not None else None
@@ -168,6 +198,9 @@ class FakeControl:
 
     def status(self, state, _message, **_extra):
         self.states.append(state)
+
+    def verify_runtime_ownership(self, _writer_lock_fd, _write_lock_fd):
+        self.ownership_checks += 1
 
 
 class PaletteAndFrames(unittest.TestCase):
@@ -404,6 +437,398 @@ class SchedulerTests(unittest.TestCase):
         stream = core.default_streams("horde-red", 24)[0]
         stream.advance(Fraction(10))
         self.assertGreaterEqual(stream.due, Fraction(51, 5))
+
+
+class CheckpointTests(unittest.TestCase):
+    @staticmethod
+    def writer(
+        *,
+        sdk=None,
+        health=None,
+        effects=None,
+        control=None,
+        checkpoint_interval=0.25,
+        checkpoint_timeout=0.2,
+    ):
+        sdk = sdk or FakeSDK("#180000")
+        health = health or FakeHealth()
+        effects = effects or FakeEffects()
+        control = control or FakeControl(None)
+        writer = runtime.TetrisWriter(
+            sdk,
+            health,
+            effects,
+            control,
+            "horde-red",
+            checkpoint_interval=checkpoint_interval,
+            checkpoint_timeout=checkpoint_timeout,
+        )
+        writer.expected = {
+            identity: sdk.controllers[index].colors
+            for index, identity in enumerate(core.VERIFIED_DIMMS)
+        }
+        return writer, sdk, health, control
+
+    @staticmethod
+    def color(sequence: int) -> tuple[str, ...]:
+        return (f"#{sequence + 1:06X}",) * core.LED_COUNT
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_sustained_animation_reuses_bounded_health_checkpoints(
+        self, _preset, _preference
+    ):
+        writer, sdk, health, control = self.writer()
+        clock = [0.0]
+        with mock.patch.object(runtime.time, "monotonic", side_effect=lambda: clock[0]):
+            for sequence in range(20):
+                clock[0] = sequence * 0.05
+                identity = core.VERIFIED_DIMMS[sequence % len(core.VERIFIED_DIMMS)]
+                self.assertTrue(writer._write(identity, self.color(sequence)))
+
+        self.assertEqual(len(sdk.writes), 20)
+        self.assertEqual(health.temperature_checks, 4)
+        self.assertEqual(health.kernel_checks, 4)
+        self.assertEqual(sdk.inventory_calls, 4)
+        self.assertEqual(sdk.effects_calls, 4)
+        self.assertEqual(control.states, ["running"] * 4)
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_checkpoint_failure_blocks_current_and_later_writes(
+        self, _preset, _preference
+    ):
+        writer, sdk, health, _control = self.writer(health=FakeHealth(fail_spd=True))
+        with self.assertRaisesRegex(runtime.SafetyStop, "temperature"):
+            writer._write(core.VERIFIED_DIMMS[0], self.color(0))
+        with self.assertRaisesRegex(runtime.SafetyStop, "previously failed"):
+            writer._write(core.VERIFIED_DIMMS[0], self.color(1))
+        self.assertEqual(health.temperature_checks, 1)
+        self.assertEqual(sdk.writes, [])
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_checkpoint_expiry_before_dispatch_blocks_the_write(
+        self, _preset, _preference
+    ):
+        writer, sdk, _health, _control = self.writer()
+        with (
+            mock.patch.object(
+                runtime.time, "monotonic", side_effect=(0.0, 0.0, 0.0, 0.30)
+            ),
+            self.assertRaisesRegex(runtime.SafetyStop, "checkpoint is expired"),
+        ):
+            writer._write(core.VERIFIED_DIMMS[0], self.color(0))
+        self.assertEqual(sdk.writes, [])
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_blocked_spd_read_hits_checkpoint_deadline_without_a_write(
+        self, _preset, _preference
+    ):
+        class BlockingHealth(FakeHealth):
+            def temperatures(inner_self):
+                inner_self.temperature_checks += 1
+                runtime.time.sleep(1)
+                return super().temperatures()
+
+        writer, sdk, _health, _control = self.writer(
+            health=BlockingHealth(), checkpoint_timeout=0.02
+        )
+        started = runtime.time.monotonic()
+        with self.assertRaisesRegex(runtime.SafetyStop, "exceeded"):
+            writer._write(core.VERIFIED_DIMMS[0], self.color(0))
+        self.assertLess(runtime.time.monotonic() - started, 0.5)
+        self.assertEqual(sdk.writes, [])
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_checkpoint_timeout_releases_write_lock_and_restores_alarm_state(
+        self, _preset, _preference
+    ):
+        class BlockingHealth(FakeHealth):
+            def temperatures(inner_self):
+                inner_self.temperature_checks += 1
+                runtime.time.sleep(1)
+                return super().temperatures()
+
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {
+                "XDG_STATE_HOME": str(Path(directory, "state")),
+                "OPENRGB_RUNTIME_DIR": str(Path(directory, "runtime")),
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                control = runtime.RuntimeControl()
+                writer_path = control.root / "ram-tetris.lock"
+                writer_fd = os.open(writer_path, os.O_WRONLY | os.O_CREAT, 0o600)
+                write_fd = os.open(
+                    control.write_lock_path, os.O_WRONLY | os.O_CREAT, 0o600
+                )
+                previous_handler = signal.getsignal(signal.SIGALRM)
+                try:
+                    writer, sdk, _health, _control = self.writer(
+                        health=BlockingHealth(),
+                        control=control,
+                        checkpoint_timeout=0.02,
+                    )
+                    writer.writer_lock_fd = writer_fd
+                    writer.write_lock_fd = write_fd
+                    with self.assertRaisesRegex(runtime.SafetyStop, "exceeded"):
+                        writer._write(core.VERIFIED_DIMMS[0], self.color(0))
+                    with self.assertRaisesRegex(
+                        runtime.SafetyStop, "previously failed"
+                    ):
+                        writer._write(core.VERIFIED_DIMMS[0], self.color(1))
+                    self.assertEqual(sdk.writes, [])
+                    probe_fd = os.open(control.write_lock_path, os.O_WRONLY)
+                    try:
+                        fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    finally:
+                        fcntl.flock(probe_fd, fcntl.LOCK_UN)
+                        os.close(probe_fd)
+                    self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+                    self.assertIs(signal.getsignal(signal.SIGALRM), previous_handler)
+                finally:
+                    os.close(write_fd)
+                    os.close(writer_fd)
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_sdk_identity_change_is_caught_between_checkpoints(
+        self, _preset, _preference
+    ):
+        writer, sdk, health, _control = self.writer()
+        with mock.patch.object(runtime.time, "monotonic", return_value=0.0):
+            writer._write(core.VERIFIED_DIMMS[0], self.color(0))
+            health.process_failure = "OpenRGB SDK process identity changed"
+            with self.assertRaisesRegex(runtime.SafetyStop, "identity changed"):
+                writer._write(core.VERIFIED_DIMMS[1], self.color(1))
+        self.assertEqual(len(sdk.writes), 1)
+        self.assertEqual(health.temperature_checks, 1)
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_kernel_error_on_next_checkpoint_blocks_the_write(
+        self, _preset, _preference
+    ):
+        class KernelFailureHealth(FakeHealth):
+            def no_new_kernel_errors(inner_self):
+                super().no_new_kernel_errors()
+                if inner_self.kernel_checks == 2:
+                    raise runtime.SafetyStop(
+                        "new relevant kernel error: i801 transaction failed",
+                        evidence={
+                            "failure_kind": "kernel-communication",
+                            "kernel_messages": ("i801 transaction failed",),
+                        },
+                    )
+
+        writer, sdk, _health, _control = self.writer(health=KernelFailureHealth())
+        clock = [0.0]
+        with mock.patch.object(runtime.time, "monotonic", side_effect=lambda: clock[0]):
+            writer._write(core.VERIFIED_DIMMS[0], self.color(0))
+            clock[0] = 0.30
+            with self.assertRaisesRegex(runtime.SafetyStop, "i801"):
+                writer._write(core.VERIFIED_DIMMS[1], self.color(1))
+        self.assertEqual(len(sdk.writes), 1)
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_preset_transition_during_checkpoint_prevents_dispatch(
+        self, _preset, _preference
+    ):
+        control = FakeControl(None)
+
+        class TransitionHealth(FakeHealth):
+            def temperatures(inner_self):
+                values = super().temperatures()
+                control.request = runtime.StopRequest("preset-change")
+                return values
+
+        writer, sdk, _health, _control = self.writer(
+            health=TransitionHealth(), control=control
+        )
+        self.assertFalse(writer._write(core.VERIFIED_DIMMS[0], self.color(0)))
+        self.assertEqual(sdk.writes, [])
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_suspend_change_on_periodic_checkpoint_blocks_dispatch(
+        self, _preset, _preference
+    ):
+        class SuspendHealth(FakeHealth):
+            def verify_processes(inner_self):
+                inner_self.process_checks += 1
+                if inner_self.process_checks == 2:
+                    raise runtime.SafetyStop("boot or suspend continuity changed")
+
+        writer, sdk, _health, _control = self.writer(health=SuspendHealth())
+        clock = [0.0]
+        with mock.patch.object(runtime.time, "monotonic", side_effect=lambda: clock[0]):
+            writer._write(core.VERIFIED_DIMMS[0], self.color(0))
+            clock[0] = 0.30
+            with self.assertRaisesRegex(runtime.SafetyStop, "suspend"):
+                writer._write(core.VERIFIED_DIMMS[1], self.color(1))
+        self.assertEqual(len(sdk.writes), 1)
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_health_checkpoint_and_rgb_write_do_not_overlap(self, _preset, _preference):
+        operation = {"checkpoint": False}
+
+        class SerializedHealth(FakeHealth):
+            def verify_processes(inner_self):
+                operation["checkpoint"] = True
+                super().verify_processes()
+
+        class SerializedEffects(FakeEffects):
+            def verify(inner_self, active):
+                super().verify(active)
+                operation["checkpoint"] = False
+
+        class SerializedSDK(FakeSDK):
+            def update_leds(inner_self, index, colors):
+                if operation["checkpoint"]:
+                    raise AssertionError("RGB write overlapped health checkpoint")
+                super().update_leds(index, colors)
+
+        writer, sdk, _health, _control = self.writer(
+            sdk=SerializedSDK(),
+            health=SerializedHealth(),
+            effects=SerializedEffects(),
+        )
+        writer._write(core.VERIFIED_DIMMS[0], self.color(0))
+        self.assertEqual(len(sdk.writes), 1)
+
+    def test_spd_failure_evidence_distinguishes_empty_and_last_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            driver = root / "spd5118"
+            driver.mkdir()
+            for endpoint in runtime.SPD_ENDPOINTS:
+                device = root / endpoint
+                device.mkdir()
+                device.joinpath("driver").symlink_to(driver, target_is_directory=True)
+                sensor = device / "hwmon/hwmon0/temp1_input"
+                sensor.parent.mkdir(parents=True)
+                sensor.write_text("40000\n", encoding="utf-8")
+            health = runtime.LinuxHealth(
+                runtime.ServerIdentity(200, "server"),
+                runtime.LifecycleIdentity(300, "lifecycle", "boot", 0),
+                root,
+            )
+            self.assertEqual(health.temperatures()["10-0053"], 40_000)
+            (root / "10-0053/hwmon/hwmon0/temp1_input").write_text("", encoding="utf-8")
+
+            with self.assertRaises(runtime.SafetyStop) as raised:
+                health.temperatures()
+
+            self.assertEqual(raised.exception.evidence["endpoint"], "10-0053")
+            self.assertEqual(raised.exception.evidence["read_state"], "empty")
+            self.assertEqual(
+                raised.exception.evidence["sensor"],
+                "10-0053/hwmon/temp1_input",
+            )
+            self.assertEqual(
+                raised.exception.evidence["last_successful_temperature_mc"], 40_000
+            )
+            self.assertIn("last_successful_unix", raised.exception.evidence)
+
+    def test_spd_failure_evidence_retains_errno_and_exception_type(self):
+        health = runtime.LinuxHealth(
+            runtime.ServerIdentity(200, "server"),
+            runtime.LifecycleIdentity(300, "lifecycle", "boot", 0),
+        )
+        with (
+            mock.patch.object(runtime.glob, "glob", return_value=["/sensor"]),
+            mock.patch.object(
+                runtime.Path,
+                "resolve",
+                return_value=Path("/drivers/spd5118"),
+            ),
+            mock.patch.object(
+                runtime.Path,
+                "read_text",
+                side_effect=OSError(errno.EIO, "input/output error"),
+            ),
+            self.assertRaises(runtime.SafetyStop) as raised,
+        ):
+            health.temperatures()
+
+        self.assertEqual(raised.exception.evidence["endpoint"], "10-0050")
+        self.assertEqual(raised.exception.evidence["read_state"], "kernel-read-error")
+        self.assertEqual(raised.exception.evidence["exception_type"], "OSError")
+        self.assertEqual(raised.exception.evidence["errno"], errno.EIO)
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_detailed_failure_is_persisted_without_replacing_prior_evidence(
+        self, _preset, _preference
+    ):
+        writer, _sdk, _health, _control = self.writer(health=FakeHealth(fail_spd=True))
+        with self.assertRaises(runtime.SafetyStop) as raised:
+            writer._write(core.VERIFIED_DIMMS[0], self.color(0))
+        evidence = writer.failure_evidence(raised.exception)
+        self.assertEqual(evidence["writer_progress_count"], 0)
+        self.assertEqual(evidence["checkpoint_phase"], "spd5118-temperatures")
+        self.assertEqual(evidence["errno"], errno.EIO)
+        self.assertEqual(evidence["exception_type"], "OSError")
+        self.assertIn("checkpoint_elapsed_ms", evidence)
+        self.assertEqual(evidence["kernel_evidence_status"], "captured")
+
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {
+                "XDG_STATE_HOME": str(Path(directory, "state")),
+                "OPENRGB_RUNTIME_DIR": str(Path(directory, "runtime")),
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                control = runtime.RuntimeControl()
+                control.fail(str(raised.exception), evidence)
+                first = control.failure_path.read_bytes()
+                failure = json.loads(first)
+                self.assertEqual(failure["evidence_version"], 1)
+                self.assertEqual(failure["details"]["writer_progress_count"], 0)
+                self.assertEqual(failure["details"]["errno"], errno.EIO)
+                control.fail("later failure", {"writer_progress_count": 99})
+                self.assertEqual(control.failure_path.read_bytes(), first)
+
+    def test_runtime_lock_identity_and_failure_latch_are_immediate_gates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {
+                "XDG_STATE_HOME": str(Path(directory, "state")),
+                "OPENRGB_RUNTIME_DIR": str(Path(directory, "runtime")),
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                control = runtime.RuntimeControl()
+                writer_path = control.root / "ram-tetris.lock"
+                writer_fd = os.open(writer_path, os.O_WRONLY | os.O_CREAT, 0o600)
+                write_fd = os.open(
+                    control.write_lock_path, os.O_WRONLY | os.O_CREAT, 0o600
+                )
+                try:
+                    control.verify_runtime_ownership(writer_fd, write_fd)
+                    writer_path.unlink()
+                    writer_path.touch(mode=0o600)
+                    with self.assertRaisesRegex(
+                        runtime.SafetyStop, "ownership changed"
+                    ):
+                        control.verify_runtime_ownership(writer_fd, write_fd)
+                finally:
+                    os.close(write_fd)
+                    os.close(writer_fd)
+
+                control.failure_path.parent.mkdir(parents=True, exist_ok=True)
+                control.failure_path.write_text("{}\n", encoding="utf-8")
+                writer_fd = os.open(writer_path, os.O_WRONLY)
+                write_fd = os.open(control.write_lock_path, os.O_WRONLY)
+                try:
+                    with self.assertRaisesRegex(
+                        runtime.SafetyStop, "failure is active"
+                    ):
+                        control.verify_runtime_ownership(writer_fd, write_fd)
+                finally:
+                    os.close(write_fd)
+                    os.close(writer_fd)
 
 
 class ProcessIdentityTests(unittest.TestCase):

@@ -345,6 +345,38 @@ This command is source preparation only until the reviewed version is
 published, deployed, Tetris is explicitly left OFF, and the owner separately
 authorizes the live clearance.
 
+Version 0.4.28 separates the RAM Tetris write gate from its complete hardware
+health checkpoint. Every RGB update still holds the shared write gate, rejects
+stop markers and active failure latches, verifies the writer and write-lock
+file identities, checks the exact lifecycle and SDK PID/start-token/argv, and
+requires the selected preset, preference, and cached checkpoint to remain
+valid. The full listener, boot/suspend, seven-controller, four-SPD5118,
+kernel-journal, Effects, and DIMM-state contract runs serially at most once per
+250 ms and never overlaps an RGB write. A two-second process deadline bounds a
+blocked SDK, journal, or sysfs operation. No RGB write accepts a checkpoint
+older than 250 ms. Detection is demand-driven at the first attempted frame
+after expiry rather than performed by another monitor: the scheduler's 400 ms
+maximum per-DIMM interval gives a conservative 650 ms fast-failure bound while
+animation is active, or 2.65 seconds if that checkpoint stalls for its complete
+deadline. No RGB write occurs during the checkpoint itself.
+
+At the accepted average 12.875 animation writes per second, this reduces the
+four SPD reads from about 51.5 to at most 16 per second, listener and journal
+queries from about 12.875 to at most four per second, and complete SDK health
+snapshots from about 12.875 to at most four per second. Runtime status is also
+published only after a refreshed checkpoint rather than after every frame.
+These are software request bounds: OpenRGB may serve controller data from its
+own state, so they are not claims about the exact number of physical I2C
+transactions.
+
+New failure evidence records the checkpoint phase, duration, age, writer
+progress, last complete temperature snapshot, and relevant kernel messages.
+SPD failures additionally retain the endpoint, a normalized sensor identifier,
+empty/malformed/read-error classification, exception type and errno when
+available, plus that endpoint's last successful temperature and timestamp.
+The first-write-wins latch and all existing recovery eligibility remain
+unchanged; a later detailed failure cannot replace earlier incident evidence.
+
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
 The experimental orange, blue, and red Sunrise gradients are therefore stored
@@ -454,14 +486,18 @@ frames. Seeded 200, 300, or 400 ms intervals enforce at most five updates per
 second per DIMM, 20 globally, 200 ms per DIMM, and 50 ms globally. Delayed
 frames are rescheduled instead of replayed as bursts.
 
-Before each write it rechecks the SDK PID/start token/argv/listener, lifecycle,
-boot and suspend identity, seven-controller inventory, all four SPD5118
-readings, Direct mode and twelve LEDs, the active six-zone Effects contract,
-selected preset, and new kernel errors. A failed gate latches a visible panel
-failure in persistent private state and stops without a recovery write or
-automatic restart. The latch survives lifecycle, Quickshell, suspend/resume,
-and application restarts; later failures cannot overwrite its retained
-evidence, and ordinary OFF and ON actions never clear it. Turning
+Before each write it rechecks the writer and write-lock identities, stop
+marker, failure latch, SDK and lifecycle PID/start-token/argv, selected preset,
+preference, and freshness of the last complete health checkpoint. At most once
+per 250 ms, while the same write gate excludes concurrent RGB updates, it
+rechecks listener ownership, boot and suspend identity, seven-controller
+inventory, all four SPD5118 readings, Direct mode and twelve LEDs, the active
+six-zone Effects contract, DIMM state, and new kernel errors. A failed,
+incomplete, timed-out, or expired gate latches a visible panel failure and
+stops without a recovery write or automatic restart. The latch survives
+lifecycle, Quickshell, suspend/resume, and application restarts; later failures
+cannot overwrite its retained evidence, and ordinary OFF and ON actions never
+clear it. Turning
 the toggle OFF restores the static DDR5 array only after fresh health gates pass.
 Preset changes quiesce the writer under its lock before applying the existing
 preset. Suspend and an explicitly initiated lifecycle replacement stop it
@@ -863,6 +899,17 @@ Preserve the latch, stability observation, retained kernel history, and every
 other recovery artifact. Rollback does not authorize changing the Tetris
 preference, operating the service, writing RGB state, or clearing any hardware
 failure.
+
+## Roll back the 0.4.28 periodic health checkpoint
+
+Redeploy exact published v0.4.27 commit
+`d7c2214fae1cbd17ff2044923ecf1a8fff53c49d`. This restores complete health
+validation and runtime-status publication before every animation frame. It
+removes only the periodic checkpoint cache and detailed future-failure fields;
+it does not alter existing latch bytes, recovery evidence, palettes, Effects
+profiles, lifecycle ownership, selected preset, or Tetris preference. Perform
+any live rollback only through the separately reviewed stopped-service
+deployment procedure and preserve the current incident unchanged.
 
 ## Remove
 
