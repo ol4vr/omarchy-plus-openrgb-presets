@@ -9,6 +9,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import multiprocessing
 import os
 import shutil
 import signal
@@ -201,6 +202,56 @@ class FakeControl:
 
     def verify_runtime_ownership(self, _writer_lock_fd, _write_lock_fd):
         self.ownership_checks += 1
+
+
+def _seed_checkpoint(writer, sdk) -> None:
+    writer.checkpoint = runtime.HealthCheckpoint(
+        controllers={
+            identity: sdk.controllers[index]
+            for index, identity in enumerate(core.VERIFIED_DIMMS)
+        },
+        temperatures={endpoint: 40_000 for endpoint in runtime.SPD_ENDPOINTS},
+        completed_monotonic=0.0,
+        completed_unix=0.0,
+        duration_seconds=0.054741,
+    )
+
+
+def _run_checkpoint_boundary_process(result_queue) -> None:
+    sdk = FakeSDK("#180000")
+    health = FakeHealth()
+    control = FakeControl(None)
+    writer = runtime.TetrisWriter(
+        sdk,
+        health,
+        FakeEffects(),
+        control,
+        "horde-red",
+        checkpoint_interval=0.25,
+        checkpoint_timeout=2.0,
+    )
+    writer.expected = {
+        identity: sdk.controllers[index].colors
+        for index, identity in enumerate(core.VERIFIED_DIMMS)
+    }
+    _seed_checkpoint(writer, sdk)
+    monotonic_samples = iter(
+        (0.249999, 0.250016, 0.250020, 0.304761, 0.304778, 0.304800)
+    )
+    with (
+        mock.patch.object(runtime, "_preference", return_value=True),
+        mock.patch.object(runtime, "_selected_preset", return_value="horde-red"),
+        mock.patch.object(runtime.time, "monotonic", side_effect=monotonic_samples),
+    ):
+        dispatched = writer._write(core.VERIFIED_DIMMS[0], ("#000001",) * 12)
+    result_queue.put(
+        {
+            "dispatched": dispatched,
+            "writes": len(sdk.writes),
+            "health_checks": health.temperature_checks,
+            "status_updates": tuple(control.states),
+        }
+    )
 
 
 class PaletteAndFrames(unittest.TestCase):
@@ -523,6 +574,246 @@ class CheckpointTests(unittest.TestCase):
 
     @mock.patch.object(runtime, "_preference", return_value=True)
     @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_cached_checkpoint_crossing_expiry_refreshes_once_before_dispatch(
+        self, _preset, _preference
+    ):
+        writer, sdk, health, control = self.writer(checkpoint_timeout=2.0)
+        _seed_checkpoint(writer, sdk)
+        monotonic_samples = iter(
+            (0.249999, 0.250016, 0.250020, 0.304761, 0.304778, 0.304800)
+        )
+
+        with mock.patch.object(
+            runtime.time, "monotonic", side_effect=monotonic_samples
+        ):
+            self.assertTrue(writer._write(core.VERIFIED_DIMMS[0], self.color(0)))
+
+        self.assertEqual(len(sdk.writes), 1)
+        self.assertEqual(health.temperature_checks, 1)
+        self.assertEqual(health.kernel_checks, 1)
+        self.assertEqual(sdk.inventory_calls, 1)
+        self.assertEqual(sdk.effects_calls, 1)
+        self.assertEqual(control.states, ["running"])
+        self.assertFalse(writer.checkpoint_failed)
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_refreshed_checkpoint_expiring_again_fails_closed(
+        self, _preset, _preference
+    ):
+        writer, sdk, health, _control = self.writer(checkpoint_timeout=2.0)
+        _seed_checkpoint(writer, sdk)
+        monotonic_samples = iter((0.249999, 0.250016, 0.250020, 0.304761, 0.554778))
+
+        with (
+            mock.patch.object(runtime.time, "monotonic", side_effect=monotonic_samples),
+            self.assertRaisesRegex(
+                runtime.SafetyStop, "checkpoint is expired"
+            ) as raised,
+        ):
+            writer._write(core.VERIFIED_DIMMS[0], self.color(0))
+
+        self.assertEqual(sdk.writes, [])
+        self.assertEqual(health.temperature_checks, 1)
+        self.assertTrue(writer.checkpoint_failed)
+        self.assertEqual(raised.exception.evidence["checkpoint_refresh_attempts"], 1)
+        self.assertEqual(
+            raised.exception.evidence["checkpoint_refresh_result"],
+            "refreshed-checkpoint-expired",
+        )
+        self.assertEqual(
+            raised.exception.evidence["checkpoint_refresh_trigger_age_ms"], 250.016
+        )
+        self.assertEqual(
+            raised.exception.evidence["refreshed_checkpoint_age_ms"], 250.017
+        )
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_boundary_refresh_failure_is_sticky_and_never_writes(
+        self, _preset, _preference
+    ):
+        writer, sdk, health, _control = self.writer(
+            health=FakeHealth(fail_spd=True), checkpoint_timeout=2.0
+        )
+        _seed_checkpoint(writer, sdk)
+        monotonic_samples = iter((0.249999, 0.250016, 0.250020))
+
+        with (
+            mock.patch.object(runtime.time, "monotonic", side_effect=monotonic_samples),
+            self.assertRaisesRegex(runtime.SafetyStop, "temperature") as raised,
+        ):
+            writer._write(core.VERIFIED_DIMMS[0], self.color(0))
+
+        self.assertEqual(sdk.writes, [])
+        self.assertEqual(health.temperature_checks, 1)
+        self.assertTrue(writer.checkpoint_failed)
+        self.assertEqual(raised.exception.evidence["checkpoint_refresh_attempts"], 1)
+        self.assertEqual(
+            raised.exception.evidence["checkpoint_refresh_result"],
+            "health-check-failed",
+        )
+        self.assertEqual(
+            raised.exception.evidence["checkpoint_phase"], "spd5118-temperatures"
+        )
+        with self.assertRaisesRegex(runtime.SafetyStop, "previously failed"):
+            writer._write(core.VERIFIED_DIMMS[0], self.color(1))
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_boundary_refresh_timeout_is_sticky_and_never_writes(
+        self, _preset, _preference
+    ):
+        class BlockingRefreshHealth(FakeHealth):
+            def temperatures(inner_self):
+                inner_self.temperature_checks += 1
+                runtime.time.sleep(1)
+                return {endpoint: 40_000 for endpoint in runtime.SPD_ENDPOINTS}
+
+        writer, sdk, _health, _control = self.writer(
+            health=BlockingRefreshHealth(), checkpoint_timeout=0.02
+        )
+        _seed_checkpoint(writer, sdk)
+        monotonic_samples = iter((0.249999, 0.250016, 0.250020))
+
+        with (
+            mock.patch.object(runtime.time, "monotonic", side_effect=monotonic_samples),
+            self.assertRaisesRegex(runtime.SafetyStop, "exceeded") as raised,
+        ):
+            writer._write(core.VERIFIED_DIMMS[0], self.color(0))
+
+        self.assertEqual(sdk.writes, [])
+        self.assertTrue(writer.checkpoint_failed)
+        self.assertEqual(
+            raised.exception.evidence["checkpoint_refresh_result"],
+            "health-check-failed",
+        )
+        self.assertEqual(raised.exception.evidence["failure_kind"], "operation-timeout")
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_identity_change_during_boundary_refresh_never_writes(
+        self, _preset, _preference
+    ):
+        class RefreshIdentityFailure(FakeHealth):
+            def verify_processes(inner_self):
+                inner_self.process_checks += 1
+                raise runtime.SafetyStop("OpenRGB SDK process identity changed")
+
+        writer, sdk, _health, _control = self.writer(
+            health=RefreshIdentityFailure(), checkpoint_timeout=2.0
+        )
+        _seed_checkpoint(writer, sdk)
+        monotonic_samples = iter((0.249999, 0.250016, 0.250020))
+
+        with (
+            mock.patch.object(runtime.time, "monotonic", side_effect=monotonic_samples),
+            self.assertRaisesRegex(runtime.SafetyStop, "identity changed") as raised,
+        ):
+            writer._write(core.VERIFIED_DIMMS[0], self.color(0))
+
+        self.assertEqual(sdk.writes, [])
+        self.assertTrue(writer.checkpoint_failed)
+        self.assertEqual(
+            raised.exception.evidence["checkpoint_refresh_result"],
+            "health-check-failed",
+        )
+        self.assertEqual(
+            raised.exception.evidence["checkpoint_phase"],
+            "process-and-listener-identity",
+        )
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_stop_marker_appearing_during_boundary_refresh_prevents_dispatch(
+        self, _preset, _preference
+    ):
+        control = FakeControl(None)
+
+        class RefreshStopHealth(FakeHealth):
+            def temperatures(inner_self):
+                temperatures = super().temperatures()
+                control.request = runtime.StopRequest("preset-change")
+                return temperatures
+
+        writer, sdk, health, _control = self.writer(
+            health=RefreshStopHealth(), control=control, checkpoint_timeout=2.0
+        )
+        _seed_checkpoint(writer, sdk)
+        monotonic_samples = iter((0.249999, 0.250016, 0.250020, 0.304761))
+
+        with mock.patch.object(
+            runtime.time, "monotonic", side_effect=monotonic_samples
+        ):
+            self.assertFalse(writer._write(core.VERIFIED_DIMMS[0], self.color(0)))
+
+        self.assertEqual(sdk.writes, [])
+        self.assertEqual(health.temperature_checks, 1)
+        self.assertEqual(writer.requested_stop, "preset-change")
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_kernel_failure_during_boundary_refresh_never_writes(
+        self, _preset, _preference
+    ):
+        class RefreshKernelFailure(FakeHealth):
+            def no_new_kernel_errors(inner_self):
+                super().no_new_kernel_errors()
+                raise runtime.SafetyStop(
+                    "new relevant kernel error: i801 transaction failed",
+                    evidence={
+                        "failure_kind": "kernel-communication",
+                        "kernel_messages": ("i801 transaction failed",),
+                    },
+                )
+
+        writer, sdk, _health, _control = self.writer(
+            health=RefreshKernelFailure(), checkpoint_timeout=2.0
+        )
+        _seed_checkpoint(writer, sdk)
+        monotonic_samples = iter((0.249999, 0.250016, 0.250020))
+
+        with (
+            mock.patch.object(runtime.time, "monotonic", side_effect=monotonic_samples),
+            self.assertRaisesRegex(runtime.SafetyStop, "i801") as raised,
+        ):
+            writer._write(core.VERIFIED_DIMMS[0], self.color(0))
+
+        self.assertEqual(sdk.writes, [])
+        self.assertTrue(writer.checkpoint_failed)
+        self.assertEqual(
+            raised.exception.evidence["checkpoint_refresh_result"],
+            "health-check-failed",
+        )
+
+    def test_process_reproduces_seventeen_microsecond_boundary_crossing(self):
+        context = multiprocessing.get_context("fork")
+        result_queue = context.Queue()
+        process = context.Process(
+            target=_run_checkpoint_boundary_process, args=(result_queue,)
+        )
+        process.start()
+        process.join(timeout=5)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=1)
+            self.fail("boundary timing child did not terminate")
+
+        self.assertEqual(process.exitcode, 0)
+        result = result_queue.get(timeout=1)
+        self.assertNotIn("error", result)
+        self.assertEqual(
+            result,
+            {
+                "dispatched": True,
+                "writes": 1,
+                "health_checks": 1,
+                "status_updates": ("running",),
+            },
+        )
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
     def test_blocked_spd_read_hits_checkpoint_deadline_without_a_write(
         self, _preset, _preference
     ):
@@ -795,7 +1086,7 @@ class CheckpointTests(unittest.TestCase):
     def test_failure_latch_records_bounded_source_provenance(self):
         provenance = {
             "component": "ram-tetris",
-            "version": "0.4.30",
+            "version": "0.4.31",
             "revision": "a" * 40,
             "path": "ram-tetris",
             "sha256": "b" * 64,

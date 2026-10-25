@@ -35,7 +35,7 @@ core = importlib.import_module("ram_tetris_core")
 
 HOST = "127.0.0.1"
 PORT = 6742
-SOURCE_VERSION = "0.4.30"
+SOURCE_VERSION = "0.4.31"
 SOURCE_PATH = "ram-tetris"
 EXPECTED_CONTROLLER_COUNT = 7
 HARDWARE_GATE_ATTEMPTS = 15
@@ -1278,7 +1278,52 @@ class TetrisWriter:
             checkpoint, refreshed = self._ensure_health_checkpoint()
             if self._validated_stop_request() is not None:
                 return False
-            self._lightweight_gate(require_fresh_checkpoint=True)
+            try:
+                self._lightweight_gate(require_fresh_checkpoint=True)
+            except SafetyStop as error:
+                if (
+                    refreshed
+                    or error.evidence.get("failure_kind") != "checkpoint-expired"
+                ):
+                    raise
+                trigger_age = error.evidence.get("checkpoint_age_ms")
+                try:
+                    checkpoint = self._full_health_checkpoint()
+                except SafetyStop as refresh_error:
+                    raise SafetyStop(
+                        str(refresh_error),
+                        evidence={
+                            **refresh_error.evidence,
+                            "checkpoint_refresh_attempts": 1,
+                            "checkpoint_refresh_result": "health-check-failed",
+                            "checkpoint_refresh_trigger_age_ms": trigger_age,
+                        },
+                    ) from refresh_error
+                refreshed = True
+                if self._validated_stop_request() is not None:
+                    return False
+                try:
+                    self._lightweight_gate(require_fresh_checkpoint=True)
+                except SafetyStop as refresh_error:
+                    result = "post-refresh-gate-failed"
+                    evidence = {
+                        **refresh_error.evidence,
+                        "checkpoint_refresh_attempts": 1,
+                        "checkpoint_refresh_trigger_age_ms": trigger_age,
+                    }
+                    if (
+                        refresh_error.evidence.get("failure_kind")
+                        == "checkpoint-expired"
+                    ):
+                        self.checkpoint_failed = True
+                        result = "refreshed-checkpoint-expired"
+                        evidence["refreshed_checkpoint_age_ms"] = (
+                            refresh_error.evidence.get("checkpoint_age_ms")
+                        )
+                    evidence["checkpoint_refresh_result"] = result
+                    raise SafetyStop(
+                        str(refresh_error), evidence=evidence
+                    ) from refresh_error
             if colors == self.expected[identity]:
                 raise SafetyStop("scheduler produced a redundant frame")
             self.sdk.update_leds(checkpoint.controllers[identity].index, colors)

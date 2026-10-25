@@ -414,6 +414,19 @@ read and integer parsing exceptions, so retained evidence records the honest
 This is a release-and-source provenance rule, not an incident-reference
 allowlist.
 
+Version 0.4.31 corrects the final pre-dispatch boundary race in
+the 250 ms RAM Tetris health-checkpoint cache. If a cached checkpoint is fresh
+at selection but expires at the final gate, the writer performs exactly one
+full checkpoint refresh while retaining the existing shared write gate, then
+repeats the immediate ownership, stop, preset, preference, SDK identity, latch,
+and freshness checks. A failed refresh remains sticky. If the replacement
+checkpoint also expires before dispatch, the write fails closed with the
+trigger and replacement ages recorded; it never loops or accepts stale health.
+The 250 ms freshness limit, two-second checkpoint deadline, animation schedule,
+write serialization, palettes, Effects contract, and recovery eligibility are
+unchanged. Publication does not deploy the release or alter the live latch;
+controlled deployment and live acceptance remain separate operations.
+
 `observe-transient-spd` takes the existing recovery singleton, requires
 Tetris OFF, zero writers, free write/writer locks, the authenticated lifecycle,
 SDK, listener, inhibitor, monitor and cgroup, seven controllers, four DIMMs,
