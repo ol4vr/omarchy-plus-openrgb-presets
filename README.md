@@ -427,6 +427,45 @@ write serialization, palettes, Effects contract, and recovery eligibility are
 unchanged. Publication does not deploy the release or alter the live latch;
 controlled deployment and live acceptance remain separate operations.
 
+Version 0.4.32 adds a reusable administrative clearance for the corrected
+v0.4.30 checkpoint-expiration defect. Eligibility is derived from the raw
+failure latch: the exact `checkpoint-expired` schema, 250 ms interval,
+two-second deadline, complete healthy-temperature evidence, and the reviewed
+v0.4.30 `ram-tetris` source revision and blob must all match. The installed
+checkout must be clean and contain the v0.4.31 repair. Incident references and
+checksums are recalculated from the latch bytes; no incident ID grants
+eligibility. Hardware, ownership, malformed, and unknown failures remain
+blocked, and the older incident-specific software-race allowlist is unchanged.
+
+Clearance requires an authoritative current lifecycle readiness record later
+than the incident. Kernel and service journals from the incident through that
+boundary are retained as historical evidence, including earlier resume or SDK
+failures. Since the readiness boundary there must be no relevant kernel error,
+suspend/resume, service failure, or lifecycle/SDK identity change. Under the
+existing recovery singleton, the complete ownership, listener, inhibitor,
+monitor, cgroup, seven-controller, four-SPD5118, preset, Effects, detector,
+Tetris-OFF, and zero-writer gates run twice. Private byte-identical latch,
+lifecycle, configuration, and journal evidence is verified before the
+inode-checked unlink and parent-directory fsync. Final continuity checks leave
+Tetris OFF and perform no service command, preset change, RGB write, or writer
+start.
+
+The reviewed administrative command requires bindings reported from the raw
+latch:
+
+```bash
+lighting-recovery clear-reviewed-software-interruption \
+  --incident-reference LR-... \
+  --latch-sha256 <sha256-of-raw-latch> \
+  --error-code LGT-TET-001 \
+  --original-reason 'RAM Tetris health checkpoint is expired' \
+  --acknowledge-reviewed-software-interruption
+```
+
+This source-only candidate does not clear a live latch or change normal Recover
+UI eligibility. Publication, deployment, and the single reviewed clearance
+remain separately authorized operations.
+
 `observe-transient-spd` takes the existing recovery singleton, requires
 Tetris OFF, zero writers, free write/writer locks, the authenticated lifecycle,
 SDK, listener, inhibitor, monitor and cgroup, seven controllers, four DIMMs,
@@ -1013,6 +1052,16 @@ compound shutdown-refusal report. It does not change signal eligibility,
 service ownership, the periodic health checkpoint, existing latch bytes,
 recovery eligibility, RGB state, or the Tetris preference. A live rollback
 still requires the separately reviewed stopped-service procedure.
+
+## Roll back the 0.4.32 corrected-software recovery category
+
+Redeploy exact published v0.4.31 commit
+`b20e8ac456c11e2d0389dbc1a596956b51aab6ae`. This removes only the reusable
+`clear-reviewed-software-interruption` administrative command and restores the
+previous incident-specific recovery inventory. Preserve the original latch and
+all retained lifecycle, configuration, journal, and source-provenance evidence.
+Rollback does not authorize a service operation, latch clearance, preference
+change, preset write, or Tetris activation.
 
 ## Remove
 

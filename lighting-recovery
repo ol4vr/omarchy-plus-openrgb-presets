@@ -104,6 +104,37 @@ TRANSIENT_SPD_EVIDENCE_FILES: Final = frozenset(
 TRANSIENT_SPD_DIRECTORY: Final = re.compile(
     r"^LR-[0-9A-F]{16}-transient-spd-[0-9]{8}T[0-9]{6}[+-][0-9]{4}$"
 )
+CORRECTED_CHECKPOINT_REASON: Final = "RAM Tetris health checkpoint is expired"
+CORRECTED_CHECKPOINT_SOURCE_REVISION: Final = "570b5b556539c4a1b8f3496381b2c06ac1562084"
+CORRECTED_CHECKPOINT_SOURCE_PATH: Final = "ram-tetris"
+CORRECTED_CHECKPOINT_SOURCE_SHA256: Final = (
+    "beedf87f9625a82cbab9b86ad9204b16cb5aba0ddfa05acc77c4d6b35887d57a"
+)
+CORRECTED_CHECKPOINT_MINIMUM_REVISION: Final = (
+    "b20e8ac456c11e2d0389dbc1a596956b51aab6ae"
+)
+CORRECTED_CHECKPOINT_DETAIL_FIELDS: Final = frozenset(
+    {
+        "checkpoint_age_ms",
+        "checkpoint_deadline_ms",
+        "checkpoint_elapsed_ms",
+        "checkpoint_interval_ms",
+        "checkpoint_started_unix",
+        "failure_kind",
+        "kernel_evidence_status",
+        "kernel_messages",
+        "last_checkpoint_age_ms",
+        "last_checkpoint_completed_unix",
+        "last_checkpoint_duration_ms",
+        "last_temperatures_mc",
+        "writer_progress_count",
+    }
+)
+POST_READY_SERVICE_FAILURE: Final = re.compile(
+    r"(?:failed|failure|main process exited|control process exited|stopping|stopped|"
+    r"identity changed|listener .*changed|sdk .*exited|prepareforsleep)",
+    re.IGNORECASE,
+)
 
 LIFECYCLE_ARGV: Final = (
     "/usr/bin/bash",
@@ -227,6 +258,28 @@ class SoftwareRaceClearanceBinding:
 
 
 @dataclass(frozen=True)
+class CorrectedSoftwareInterruption:
+    failure_raw: bytes
+    incident_reference: str
+    latch_sha256: str
+    original_reason: str
+    failure_time: float
+    source_revision: str
+    source_path: str
+    source_sha256: str
+
+
+@dataclass(frozen=True)
+class SoftwareInterruptionClearanceBinding:
+    incident: CorrectedSoftwareInterruption
+    current_state_raw: bytes
+    config_raw: bytes
+    journal_evidence_raw: bytes
+    readiness_time: float
+    installed_source_revision: str
+
+
+@dataclass(frozen=True)
 class ReviewedHardwareHealth:
     code: str
     incident_reference: str
@@ -302,10 +355,7 @@ REVIEWED_SOFTWARE_RACE_ALLOWLIST: Final = {
     "LR-3903E50F10DAA4FD": ReviewedSoftwareRace(
         code="LGT-TET-002",
         incident_reference="LR-3903E50F10DAA4FD",
-        latch_sha256=(
-            "3903e50f10daa4fd45eed42c4953a4767"
-            "08107874dc447fd69a30352812b6f24"
-        ),
+        latch_sha256="3903e50f10daa4fd45eed42c4953a476708107874dc447fd69a30352812b6f24",
         original_reason=(
             "RAM Tetris writer exited unexpectedly; static restoration was not "
             "attempted"
@@ -322,18 +372,12 @@ REVIEWED_HARDWARE_HEALTH_ALLOWLIST: Final = {
     "LR-E8FE394802531DE7": ReviewedHardwareHealth(
         code="LGT-CTL-002",
         incident_reference="LR-E8FE394802531DE7",
-        latch_sha256=(
-            "e8fe394802531de7e636be00d781a7c4"
-            "6b9c290041f994a1dce46ed4fe45469d"
-        ),
+        latch_sha256="e8fe394802531de7e636be00d781a7c46b9c290041f994a1dce46ed4fe45469d",
         original_reason="10-0053 temperature is unreadable",
         stability_directory=(
             "LR-E8FE394802531DE7-spd5118-stability-20261023T075800+0200"
         ),
-        stability_manifest_sha256=(
-            "3189b7c1846f8edc4327c22319eca739"
-            "d671803696cb15fe78245ccbcdbc0234"
-        ),
+        stability_manifest_sha256="3189b7c1846f8edc4327c22319eca739d671803696cb15fe78245ccbcdbc0234",
         observed_source_revision="e7d66ee00cd35a7aa95e873bd6c051bf41254763",
     )
 }
@@ -703,9 +747,7 @@ def _verify_corrected_source_revision(minimum_revision: str) -> str:
 
 def _source_blob_sha256(revision: str, source_path: str) -> str:
     if not re.fullmatch(r"[0-9a-f]{40}", revision) or source_path != "ram-tetris":
-        raise RecoveryBlocked(
-            "Recovery blocked: SPD failure source provenance is invalid."
-        )
+        raise RecoveryBlocked("Recovery blocked: failure source provenance is invalid.")
     source = subprocess.run(
         [GIT, "-C", str(ROOT), "show", f"{revision}:{source_path}"],
         check=False,
@@ -714,9 +756,127 @@ def _source_blob_sha256(revision: str, source_path: str) -> str:
     )
     if source.returncode != 0:
         raise RecoveryBlocked(
-            "Recovery blocked: SPD failure source provenance is unavailable."
+            "Recovery blocked: failure source provenance is unavailable."
         )
     return hashlib.sha256(source.stdout).hexdigest()
+
+
+def _number(value: object) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
+def _classify_corrected_software_interruption() -> CorrectedSoftwareInterruption:
+    """Classify a corrected checkpoint defect from its exact raw evidence."""
+
+    failure_raw, failure = _failure_record()
+    message = _failure_message(failure)
+    failure_time, _ = _timestamp(failure)
+    details = failure.get("details")
+    source = failure.get("source")
+    if (
+        set(failure)
+        != {
+            "details",
+            "evidence_version",
+            "message",
+            "pid",
+            "source",
+            "state",
+            "time",
+        }
+        or message != CORRECTED_CHECKPOINT_REASON
+        or failure.get("state") != "failed"
+        or failure.get("evidence_version") != 1
+        or failure_time is None
+        or not isinstance(failure.get("pid"), int)
+        or isinstance(failure.get("pid"), bool)
+        or failure.get("pid", 0) <= 0
+        or not isinstance(details, dict)
+        or set(details) != CORRECTED_CHECKPOINT_DETAIL_FIELDS
+        or not isinstance(source, dict)
+        or source
+        != {
+            "component": "ram-tetris",
+            "path": CORRECTED_CHECKPOINT_SOURCE_PATH,
+            "revision": CORRECTED_CHECKPOINT_SOURCE_REVISION,
+            "sha256": CORRECTED_CHECKPOINT_SOURCE_SHA256,
+            "version": "0.4.30",
+        }
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: the latch is not an eligible corrected software "
+            "interruption."
+        )
+
+    temperatures = details.get("last_temperatures_mc")
+    interval = _number(details.get("checkpoint_interval_ms"))
+    deadline = _number(details.get("checkpoint_deadline_ms"))
+    age = _number(details.get("checkpoint_age_ms"))
+    last_age = _number(details.get("last_checkpoint_age_ms"))
+    elapsed = _number(details.get("checkpoint_elapsed_ms"))
+    duration = _number(details.get("last_checkpoint_duration_ms"))
+    started = _number(details.get("checkpoint_started_unix"))
+    completed = _number(details.get("last_checkpoint_completed_unix"))
+    progress = details.get("writer_progress_count")
+    if (
+        details.get("failure_kind") != "checkpoint-expired"
+        or interval != 250.0
+        or deadline != 2000.0
+        or age is None
+        or age <= interval
+        or last_age is None
+        or last_age <= interval
+        or elapsed is None
+        or elapsed < 0
+        or elapsed > deadline
+        or duration is None
+        or duration < 0
+        or duration > deadline
+        or started is None
+        or completed is None
+        or started > completed
+        or completed > failure_time
+        or not isinstance(progress, int)
+        or isinstance(progress, bool)
+        or progress < 0
+        or details.get("kernel_evidence_status") != "captured"
+        or details.get("kernel_messages") != []
+        or not isinstance(temperatures, dict)
+        or set(temperatures) != set(TRANSIENT_SPD_ENDPOINTS)
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            for value in temperatures.values()
+        )
+        or classify_reason(message).code != "LGT-TET-001"
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: checkpoint evidence is not the reviewed corrected "
+            "software failure."
+        )
+
+    if (
+        _source_blob_sha256(
+            CORRECTED_CHECKPOINT_SOURCE_REVISION,
+            CORRECTED_CHECKPOINT_SOURCE_PATH,
+        )
+        != CORRECTED_CHECKPOINT_SOURCE_SHA256
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: corrected software source provenance changed."
+        )
+    _verify_corrected_source_revision(CORRECTED_CHECKPOINT_MINIMUM_REVISION)
+    return CorrectedSoftwareInterruption(
+        failure_raw=failure_raw,
+        incident_reference=_incident_reference(failure_raw),
+        latch_sha256=hashlib.sha256(failure_raw).hexdigest(),
+        original_reason=message,
+        failure_time=failure_time,
+        source_revision=CORRECTED_CHECKPOINT_SOURCE_REVISION,
+        source_path=CORRECTED_CHECKPOINT_SOURCE_PATH,
+        source_sha256=CORRECTED_CHECKPOINT_SOURCE_SHA256,
+    )
 
 
 def _classify_transient_spd_incident() -> TransientSpdIncident:
@@ -1137,9 +1297,7 @@ def _verify_stability_evidence(
     }
     manifest_raw = files["manifest.sha256"]
     if hashlib.sha256(manifest_raw).hexdigest() != reviewed.stability_manifest_sha256:
-        raise RecoveryBlocked(
-            "Recovery blocked: SPD5118 stability manifest changed."
-        )
+        raise RecoveryBlocked("Recovery blocked: SPD5118 stability manifest changed.")
     try:
         manifest_lines = manifest_raw.decode("ascii").splitlines()
     except UnicodeDecodeError as error:
@@ -1189,9 +1347,10 @@ def _verify_stability_evidence(
         raise RecoveryBlocked("Recovery blocked: stability metadata is invalid.")
     cursor = metadata["kernel_cursor"]
     cursor_boot = JOURNAL_CURSOR_BOOT_ID.search(cursor)
-    if cursor_boot is None or cursor_boot.group(1).lower() != _current_boot_id().replace(
-        "-", ""
-    ).lower():
+    if (
+        cursor_boot is None
+        or cursor_boot.group(1).lower() != _current_boot_id().replace("-", "").lower()
+    ):
         raise RecoveryBlocked(
             "Recovery blocked: stability evidence belongs to another boot."
         )
@@ -1997,9 +2156,7 @@ def _verify_transient_spd_continuity(
     _kernel_history_after_observation(observation.journal_cursor)
 
 
-def _historical_kernel_evidence(
-    failure_time: float, observation_start: float
-) -> bytes:
+def _historical_kernel_evidence(failure_time: float, observation_start: float) -> bytes:
     journal = subprocess.run(
         [
             JOURNALCTL,
@@ -2809,6 +2966,218 @@ def _historical_clearance_preflight(
     )
 
 
+def _software_interruption_journal_slice(
+    *,
+    kernel: bool,
+    since: float,
+    until: float | None,
+    label: str,
+) -> str:
+    command = [JOURNALCTL]
+    if kernel:
+        command.append("-k")
+    else:
+        command.extend(("--user", "--unit", SERVICE_NAME))
+    command.extend((f"--since=@{since}", "--output=short-unix", "--no-pager"))
+    if until is not None:
+        command.insert(-2, f"--until=@{until}")
+    result = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0 or result.stderr.strip():
+        raise RecoveryBlocked(f"Recovery blocked: {label} journal is unreadable.")
+    return result.stdout
+
+
+def _software_interruption_journal_evidence(
+    failure_time: float,
+    readiness_time: float,
+) -> bytes:
+    """Retain history, while requiring a clean authoritative-ready boundary."""
+
+    if readiness_time <= failure_time:
+        raise RecoveryBlocked(
+            "Recovery blocked: lifecycle readiness does not follow the incident."
+        )
+    historical_kernel = _software_interruption_journal_slice(
+        kernel=True,
+        since=failure_time,
+        until=readiness_time,
+        label="historical kernel",
+    )
+    historical_service = _software_interruption_journal_slice(
+        kernel=False,
+        since=failure_time,
+        until=readiness_time,
+        label="historical service",
+    )
+    current_kernel = _software_interruption_journal_slice(
+        kernel=True,
+        since=readiness_time,
+        until=None,
+        label="post-readiness kernel",
+    )
+    current_service = _software_interruption_journal_slice(
+        kernel=False,
+        since=readiness_time,
+        until=None,
+        label="post-readiness service",
+    )
+    if any(
+        RELEVANT_KERNEL_ERROR.search(line) or SUSPEND_RESUME_EVENT.search(line)
+        for line in current_kernel.splitlines()
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: kernel communication or suspend evidence exists "
+            "after authoritative lifecycle readiness."
+        )
+    if any(
+        POST_READY_SERVICE_FAILURE.search(line) for line in current_service.splitlines()
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: a service failure or transition exists after "
+            "authoritative lifecycle readiness."
+        )
+    document = {
+        "schema_version": 1,
+        "category": "corrected-software-interruption",
+        "failure_time": failure_time,
+        "readiness_time": readiness_time,
+        "historical_kernel": historical_kernel,
+        "historical_service": historical_service,
+        "post_readiness_kernel": current_kernel,
+        "post_readiness_service": current_service,
+    }
+    return (json.dumps(document, sort_keys=True) + "\n").encode()
+
+
+def _corrected_software_interruption_authorization(
+    incident_reference: str,
+    latch_sha256: str,
+    error_code: str,
+    original_reason: str,
+) -> CorrectedSoftwareInterruption:
+    incident = _classify_corrected_software_interruption()
+    if (
+        incident_reference != incident.incident_reference
+        or latch_sha256 != incident.latch_sha256
+        or error_code != classify_reason(incident.original_reason).code
+        or original_reason != incident.original_reason
+    ):
+        raise RecoveryBlocked(
+            "Corrected software-interruption clearance refused: authorization does "
+            "not match the raw failure latch."
+        )
+    return incident
+
+
+def _corrected_software_interruption_preflight(
+    incident_reference: str,
+    latch_sha256: str,
+    error_code: str,
+    original_reason: str,
+) -> SoftwareInterruptionClearanceBinding:
+    incident = _corrected_software_interruption_authorization(
+        incident_reference, latch_sha256, error_code, original_reason
+    )
+    installed_source_revision = _verify_corrected_source_revision(
+        CORRECTED_CHECKPOINT_MINIMUM_REVISION
+    )
+    current_state_path = state_root() / "lifecycle-service-state.json"
+    current_state_raw = _read_protected_bytes(
+        current_state_path, "current lifecycle state"
+    )
+    current = _json_record(current_state_raw, "current lifecycle state")
+    current_time = current.get("time")
+    if (
+        current.get("state") != "ready"
+        or current.get("reason") != HISTORICAL_READY_REASON
+        or not isinstance(current_time, (int, float))
+        or isinstance(current_time, bool)
+        or float(current_time) <= incident.failure_time
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: the corrected incident has not been replaced by an "
+            "authoritative healthy lifecycle."
+        )
+    readiness_time = float(current_time)
+    config_raw = _detector_policy_is_reviewed()
+    _verify_historical_running_environment(current, config_raw)
+    _verify_service_and_hardware(None)
+    journal_evidence_raw = _software_interruption_journal_evidence(
+        incident.failure_time, readiness_time
+    )
+    failure_path = state_root() / "ram-tetris-failure.json"
+    if _read_protected_bytes(failure_path, "software interruption latch") != (
+        incident.failure_raw
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: the corrected software interruption changed during "
+            "review."
+        )
+    if (
+        _read_protected_bytes(current_state_path, "current lifecycle state")
+        != current_state_raw
+        or _detector_policy_is_reviewed() != config_raw
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: lifecycle or configuration evidence changed during "
+            "review."
+        )
+    return SoftwareInterruptionClearanceBinding(
+        incident=incident,
+        current_state_raw=current_state_raw,
+        config_raw=config_raw,
+        journal_evidence_raw=journal_evidence_raw,
+        readiness_time=readiness_time,
+        installed_source_revision=installed_source_revision,
+    )
+
+
+def _verify_corrected_software_interruption_continuity(
+    binding: SoftwareInterruptionClearanceBinding,
+) -> None:
+    if (
+        _verify_corrected_source_revision(CORRECTED_CHECKPOINT_MINIMUM_REVISION)
+        != binding.installed_source_revision
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: the installed source changed during clearance."
+        )
+    current_state_path = state_root() / "lifecycle-service-state.json"
+    current_state_raw = _read_protected_bytes(
+        current_state_path, "current lifecycle state"
+    )
+    if current_state_raw != binding.current_state_raw:
+        raise RecoveryBlocked(
+            "Recovery blocked: lifecycle identity changed during clearance."
+        )
+    current = _json_record(current_state_raw, "current lifecycle state")
+    _verify_historical_running_environment(current, binding.config_raw)
+    _verify_service_and_hardware(None)
+    if (
+        _software_interruption_journal_evidence(
+            binding.incident.failure_time, binding.readiness_time
+        )
+        != binding.journal_evidence_raw
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: journal evidence changed during clearance."
+        )
+    if (
+        _read_protected_bytes(current_state_path, "current lifecycle state")
+        != binding.current_state_raw
+        or _detector_policy_is_reviewed() != binding.config_raw
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: service or configuration continuity changed."
+        )
+
+
 def _reviewed_software_race_authorization(
     incident_reference: str,
     latch_sha256: str,
@@ -2887,7 +3256,10 @@ def _software_race_clearance_preflight(
     config_raw = _detector_policy_is_reviewed()
     _verify_historical_running_environment(current, config_raw)
     _verify_service_and_hardware(failure_time)
-    if _read_protected_bytes(failure_path, "software-race failure latch") != failure_raw:
+    if (
+        _read_protected_bytes(failure_path, "software-race failure latch")
+        != failure_raw
+    ):
         raise RecoveryBlocked(
             "Recovery blocked: the software-race latch changed during review."
         )
@@ -3034,7 +3406,10 @@ def _hardware_health_clearance_preflight(
     historical_kernel_raw = _historical_kernel_evidence(
         failure_time, stability.observation_start
     )
-    if _read_protected_bytes(failure_path, "hardware-health failure latch") != failure_raw:
+    if (
+        _read_protected_bytes(failure_path, "hardware-health failure latch")
+        != failure_raw
+    ):
         raise RecoveryBlocked(
             "Recovery blocked: the hardware-health latch changed during review."
         )
@@ -3210,10 +3585,7 @@ def _preserve_evidence(raw: bytes, reference: str, kind: str = "failure") -> Pat
     try:
         descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
-        if (
-            _read_protected_bytes(destination, f"retained {kind} evidence")
-            != raw
-        ):
+        if _read_protected_bytes(destination, f"retained {kind} evidence") != raw:
             raise RecoveryBlocked(
                 "Recovery blocked: retained evidence does not match the current record."
             )
@@ -3268,7 +3640,10 @@ def _preserve_stability_evidence(
         try:
             descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
-            if _read_protected_bytes(path, f"retained stability evidence {name}") != raw:
+            if (
+                _read_protected_bytes(path, f"retained stability evidence {name}")
+                != raw
+            ):
                 raise RecoveryBlocked(
                     "Recovery blocked: retained hardware-health observation changed."
                 )
@@ -3579,6 +3954,73 @@ def clear_reviewed_software_race(
         os.close(lock_fd)
 
 
+def clear_reviewed_software_interruption(
+    incident_reference: str,
+    latch_sha256: str,
+    error_code: str,
+    original_reason: str,
+) -> dict[str, object]:
+    """Clear a provenance-qualified, corrected software-interruption latch."""
+
+    root = runtime_root()
+    _private_directory(root)
+    lock_fd = os.open(root / "lighting-recovery.lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RecoveryBlocked(
+                "Recovery blocked: another recovery is active."
+            ) from error
+
+        first = _corrected_software_interruption_preflight(
+            incident_reference, latch_sha256, error_code, original_reason
+        )
+        evidence = (
+            (first.incident.failure_raw, "failure"),
+            (first.current_state_raw, "lifecycle-state"),
+            (first.config_raw, "openrgb-config"),
+            (first.journal_evidence_raw, "software-interruption-journal"),
+        )
+        for raw, kind in evidence:
+            destination = _preserve_evidence(
+                raw, first.incident.incident_reference, kind
+            )
+            if _read_protected_bytes(destination, f"retained {kind} evidence") != raw:
+                raise RecoveryBlocked(
+                    "Recovery blocked: corrected software-interruption evidence "
+                    "readback changed."
+                )
+
+        second = _corrected_software_interruption_preflight(
+            incident_reference, latch_sha256, error_code, original_reason
+        )
+        if second != first:
+            raise RecoveryBlocked(
+                "Recovery blocked: incident or health bindings changed before "
+                "clearance."
+            )
+        for raw, kind in evidence:
+            _preserve_evidence(raw, first.incident.incident_reference, kind)
+
+        _unlink_unchanged_latch(first.incident.failure_raw)
+        _verify_corrected_software_interruption_continuity(first)
+        if (state_root() / "ram-tetris-failure.json").exists():
+            raise RecoveryBlocked(
+                "Recovery blocked: the corrected software-interruption latch remains "
+                "present."
+            )
+        return {
+            "failure": False,
+            "incident_reference": first.incident.incident_reference,
+            "message": "Corrected software-interruption latch cleared. RAM Tetris remains OFF.",
+            "preference": False,
+            "state": "off",
+        }
+    finally:
+        os.close(lock_fd)
+
+
 def clear_reviewed_hardware_health(
     incident_reference: str,
     latch_sha256: str,
@@ -3804,6 +4246,16 @@ def build_parser() -> argparse.ArgumentParser:
     software_race.add_argument(
         "--acknowledge-reviewed-software-race", action="store_true", required=True
     )
+    software_interruption = actions.add_parser("clear-reviewed-software-interruption")
+    software_interruption.add_argument("--incident-reference", required=True)
+    software_interruption.add_argument("--latch-sha256", required=True)
+    software_interruption.add_argument("--error-code", required=True)
+    software_interruption.add_argument("--original-reason", required=True)
+    software_interruption.add_argument(
+        "--acknowledge-reviewed-software-interruption",
+        action="store_true",
+        required=True,
+    )
     hardware_health = actions.add_parser("clear-reviewed-hardware-health")
     hardware_health.add_argument("--incident-reference", required=True)
     hardware_health.add_argument("--latch-sha256", required=True)
@@ -3858,6 +4310,19 @@ def main() -> int:
             print(
                 json.dumps(
                     clear_reviewed_software_race(
+                        args.incident_reference,
+                        args.latch_sha256,
+                        args.error_code,
+                        args.original_reason,
+                    ),
+                    sort_keys=True,
+                )
+            )
+            return 0
+        if args.action == "clear-reviewed-software-interruption":
+            print(
+                json.dumps(
+                    clear_reviewed_software_interruption(
                         args.incident_reference,
                         args.latch_sha256,
                         args.error_code,

@@ -199,6 +199,84 @@ class LightingRecoveryTests(unittest.TestCase):
         )
         return failure_raw, current_raw
 
+    def write_corrected_software_interruption_records(
+        self,
+        *,
+        pid: int = 1227358,
+        detail_overrides: dict[str, object] | None = None,
+        source_overrides: dict[str, object] | None = None,
+    ) -> tuple[bytes, bytes]:
+        details: dict[str, object] = {
+            "checkpoint_age_ms": 250.017,
+            "checkpoint_deadline_ms": 2000.0,
+            "checkpoint_elapsed_ms": 304.78,
+            "checkpoint_interval_ms": 250.0,
+            "checkpoint_started_unix": 1_792_864_340.3312109,
+            "failure_kind": "checkpoint-expired",
+            "kernel_evidence_status": "captured",
+            "kernel_messages": [],
+            "last_checkpoint_age_ms": 250.039,
+            "last_checkpoint_completed_unix": 1_792_864_340.3859522,
+            "last_checkpoint_duration_ms": 54.741,
+            "last_temperatures_mc": {
+                "10-0050": 44250,
+                "10-0051": 44500,
+                "10-0052": 43000,
+                "10-0053": 38500,
+            },
+            "writer_progress_count": 867,
+        }
+        details.update(detail_overrides or {})
+        source: dict[str, object] = {
+            "component": "ram-tetris",
+            "path": recovery.CORRECTED_CHECKPOINT_SOURCE_PATH,
+            "revision": recovery.CORRECTED_CHECKPOINT_SOURCE_REVISION,
+            "sha256": recovery.CORRECTED_CHECKPOINT_SOURCE_SHA256,
+            "version": "0.4.30",
+        }
+        source.update(source_overrides or {})
+        failure_raw = (
+            json.dumps(
+                {
+                    "details": details,
+                    "evidence_version": 1,
+                    "message": recovery.CORRECTED_CHECKPOINT_REASON,
+                    "pid": pid,
+                    "source": source,
+                    "state": "failed",
+                    "time": 1_792_864_340.6402085,
+                },
+                sort_keys=True,
+            ).encode()
+            + b"\n"
+        )
+        current_raw = (
+            json.dumps(
+                {
+                    "boot_id": "boot-a",
+                    "lifecycle_pid": 51,
+                    "lifecycle_start": "5100",
+                    "reason": recovery.HISTORICAL_READY_REASON,
+                    "server_pid": 52,
+                    "server_start": "5200",
+                    "state": "ready",
+                    "time": 1_792_868_400.0,
+                },
+                sort_keys=True,
+            ).encode()
+            + b"\n"
+        )
+        self.failure.parent.mkdir(parents=True, exist_ok=True)
+        self.failure.parent.chmod(0o700)
+        for path, raw in (
+            (self.failure, failure_raw),
+            (self.lifecycle_state, current_raw),
+            (self.failure.parent / "ram-tetris-enabled", b"off\n"),
+        ):
+            path.write_bytes(raw)
+            path.chmod(0o600)
+        return failure_raw, current_raw
+
     def write_reviewed_hardware_health_records(
         self,
     ) -> tuple[
@@ -207,9 +285,7 @@ class LightingRecoveryTests(unittest.TestCase):
         bytes,
         object,
     ]:
-        base = recovery.REVIEWED_HARDWARE_HEALTH_ALLOWLIST[
-            "LR-E8FE394802531DE7"
-        ]
+        base = recovery.REVIEWED_HARDWARE_HEALTH_ALLOWLIST["LR-E8FE394802531DE7"]
         failure_raw = (
             b'{"message": "10-0053 temperature is unreadable", "pid": 2295616, '
             b'"state": "failed", "time": 1792651066.1584392}\n'
@@ -218,12 +294,12 @@ class LightingRecoveryTests(unittest.TestCase):
         now = time.time()
         started = now - 120
         ended = started + 61
-        started_text = recovery.datetime.fromtimestamp(
-            started, recovery.UTC
-        ).isoformat(timespec="microseconds")
-        ended_text = recovery.datetime.fromtimestamp(
-            ended, recovery.UTC
-        ).isoformat(timespec="microseconds")
+        started_text = recovery.datetime.fromtimestamp(started, recovery.UTC).isoformat(
+            timespec="microseconds"
+        )
+        ended_text = recovery.datetime.fromtimestamp(ended, recovery.UTC).isoformat(
+            timespec="microseconds"
+        )
         boot_id = "a" * 32
         cursor = f"s=test;i=1;b={boot_id};m=1;t=1;x=1"
         metadata = "\n".join(
@@ -1855,10 +1931,452 @@ class LightingRecoveryTests(unittest.TestCase):
             os.close(descriptor)
         self.assertEqual(self.failure.read_bytes(), failure_raw)
 
-    def test_reviewed_hardware_health_cli_requires_explicit_acknowledgement(self):
-        reviewed = recovery.REVIEWED_HARDWARE_HEALTH_ALLOWLIST[
-            "LR-E8FE394802531DE7"
+    def test_corrected_software_interruption_cli_requires_acknowledgement(self):
+        arguments = [
+            "clear-reviewed-software-interruption",
+            "--incident-reference",
+            "LR-0123456789ABCDEF",
+            "--latch-sha256",
+            "0" * 64,
+            "--error-code",
+            "LGT-TET-001",
+            "--original-reason",
+            recovery.CORRECTED_CHECKPOINT_REASON,
         ]
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            recovery.build_parser().parse_args(arguments)
+        parsed = recovery.build_parser().parse_args(
+            arguments + ["--acknowledge-reviewed-software-interruption"]
+        )
+        self.assertEqual(parsed.action, "clear-reviewed-software-interruption")
+        self.assertTrue(parsed.acknowledge_reviewed_software_interruption)
+
+    def test_corrected_software_interruption_accepts_multiple_derived_references(self):
+        references = set()
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery,
+                "_verify_corrected_source_revision",
+                return_value=recovery.CORRECTED_CHECKPOINT_MINIMUM_REVISION,
+            ),
+            mock.patch.object(
+                recovery,
+                "_source_blob_sha256",
+                return_value=recovery.CORRECTED_CHECKPOINT_SOURCE_SHA256,
+            ) as source_blob,
+        ):
+            for pid in (1227358, 1227359):
+                raw, _ = self.write_corrected_software_interruption_records(pid=pid)
+                incident = recovery._classify_corrected_software_interruption()
+                self.assertEqual(
+                    incident.incident_reference, recovery._incident_reference(raw)
+                )
+                self.assertEqual(incident.latch_sha256, hashlib.sha256(raw).hexdigest())
+                references.add(incident.incident_reference)
+        self.assertEqual(len(references), 2)
+        source_blob.assert_called_with(
+            recovery.CORRECTED_CHECKPOINT_SOURCE_REVISION,
+            recovery.CORRECTED_CHECKPOINT_SOURCE_PATH,
+        )
+
+    def test_corrected_software_interruption_rejects_wrong_evidence_and_failures(self):
+        cases = (
+            ({"failure_kind": "spd5118-temperature"}, None, "reviewed corrected"),
+            ({"checkpoint_interval_ms": 251.0}, None, "reviewed corrected"),
+            ({"checkpoint_deadline_ms": 1999.0}, None, "reviewed corrected"),
+            ({"kernel_messages": ["i2c error"]}, None, "reviewed corrected"),
+            (None, {"revision": "0" * 40}, "not an eligible"),
+            (None, {"sha256": "0" * 64}, "not an eligible"),
+        )
+        for details, source, message in cases:
+            with self.subTest(details=details, source=source):
+                self.write_corrected_software_interruption_records(
+                    detail_overrides=details, source_overrides=source
+                )
+                with (
+                    self.patched_environment(),
+                    mock.patch.object(
+                        recovery,
+                        "_verify_corrected_source_revision",
+                        return_value=recovery.CORRECTED_CHECKPOINT_MINIMUM_REVISION,
+                    ),
+                    mock.patch.object(
+                        recovery,
+                        "_source_blob_sha256",
+                        return_value=recovery.CORRECTED_CHECKPOINT_SOURCE_SHA256,
+                    ),
+                    self.assertRaisesRegex(recovery.RecoveryBlocked, message),
+                ):
+                    recovery._classify_corrected_software_interruption()
+
+        for reason in ("10-0053 temperature is unreadable", "unknown failure"):
+            with self.subTest(reason=reason):
+                self.write_failure(reason)
+                with (
+                    self.patched_environment(),
+                    self.assertRaisesRegex(recovery.RecoveryBlocked, "not an eligible"),
+                ):
+                    recovery._classify_corrected_software_interruption()
+
+    def test_corrected_software_interruption_requires_clean_corrected_source(self):
+        self.write_corrected_software_interruption_records()
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery,
+                "_source_blob_sha256",
+                return_value=recovery.CORRECTED_CHECKPOINT_SOURCE_SHA256,
+            ),
+            mock.patch.object(
+                recovery,
+                "_verify_corrected_source_revision",
+                side_effect=recovery.RecoveryBlocked("installed source is not clean"),
+            ),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "not clean"),
+        ):
+            recovery._classify_corrected_software_interruption()
+
+        self.write_corrected_software_interruption_records()
+        with (
+            self.patched_environment(),
+            mock.patch.object(recovery, "_source_blob_sha256", return_value="0" * 64),
+            mock.patch.object(
+                recovery,
+                "_verify_corrected_source_revision",
+                return_value=recovery.CORRECTED_CHECKPOINT_MINIMUM_REVISION,
+            ),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "provenance changed"),
+        ):
+            recovery._classify_corrected_software_interruption()
+
+    def test_corrected_software_authorization_is_derived_from_raw_latch(self):
+        raw, _ = self.write_corrected_software_interruption_records()
+        reference = recovery._incident_reference(raw)
+        checksum = hashlib.sha256(raw).hexdigest()
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery,
+                "_verify_corrected_source_revision",
+                return_value=recovery.CORRECTED_CHECKPOINT_MINIMUM_REVISION,
+            ),
+            mock.patch.object(
+                recovery,
+                "_source_blob_sha256",
+                return_value=recovery.CORRECTED_CHECKPOINT_SOURCE_SHA256,
+            ),
+        ):
+            accepted = recovery._corrected_software_interruption_authorization(
+                reference,
+                checksum,
+                "LGT-TET-001",
+                recovery.CORRECTED_CHECKPOINT_REASON,
+            )
+            self.assertEqual(accepted.incident_reference, reference)
+            for arguments in (
+                ("LR-0000000000000000", checksum, "LGT-TET-001"),
+                (reference, "0" * 64, "LGT-TET-001"),
+                (reference, checksum, "LGT-CTL-002"),
+            ):
+                with self.assertRaisesRegex(
+                    recovery.RecoveryBlocked, "raw failure latch"
+                ):
+                    recovery._corrected_software_interruption_authorization(
+                        *arguments, recovery.CORRECTED_CHECKPOINT_REASON
+                    )
+
+    def test_corrected_software_journal_retains_history_and_rejects_new_events(self):
+        completed = lambda output="": subprocess.CompletedProcess([], 0, output, "")
+        retained_kernel = "spd5118 10-0053: PM: failed to resume: error -6\n"
+        retained_service = "Main process exited before authoritative readiness\n"
+        with mock.patch.object(
+            recovery.subprocess,
+            "run",
+            side_effect=(
+                completed(retained_kernel),
+                completed(retained_service),
+                completed(),
+                completed(),
+            ),
+        ):
+            raw = recovery._software_interruption_journal_evidence(10.0, 20.0)
+        document = json.loads(raw)
+        self.assertEqual(document["historical_kernel"], retained_kernel)
+        self.assertEqual(document["historical_service"], retained_service)
+
+        post_cases = (
+            ("spd5118 10-0053: read failed: error -6\n", "", "kernel"),
+            ("PM: suspend entry (deep)\n", "", "kernel"),
+            ("", "Main process exited, code=exited, status=1\n", "service"),
+        )
+        for post_kernel, post_service, message in post_cases:
+            with (
+                self.subTest(post_kernel=post_kernel, post_service=post_service),
+                mock.patch.object(
+                    recovery.subprocess,
+                    "run",
+                    side_effect=(
+                        completed(retained_kernel),
+                        completed(retained_service),
+                        completed(post_kernel),
+                        completed(post_service),
+                    ),
+                ),
+                self.assertRaisesRegex(recovery.RecoveryBlocked, message),
+            ):
+                recovery._software_interruption_journal_evidence(10.0, 20.0)
+
+    def test_corrected_software_interruption_preflight_binds_all_evidence(self):
+        failure_raw, current_raw = self.write_corrected_software_interruption_records()
+        incident = recovery.CorrectedSoftwareInterruption(
+            failure_raw=failure_raw,
+            incident_reference=recovery._incident_reference(failure_raw),
+            latch_sha256=hashlib.sha256(failure_raw).hexdigest(),
+            original_reason=recovery.CORRECTED_CHECKPOINT_REASON,
+            failure_time=1_792_864_340.6402085,
+            source_revision=recovery.CORRECTED_CHECKPOINT_SOURCE_REVISION,
+            source_path=recovery.CORRECTED_CHECKPOINT_SOURCE_PATH,
+            source_sha256=recovery.CORRECTED_CHECKPOINT_SOURCE_SHA256,
+        )
+        journal_raw = b'{"category":"corrected-software-interruption"}\n'
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery,
+                "_corrected_software_interruption_authorization",
+                return_value=incident,
+            ),
+            mock.patch.object(
+                recovery,
+                "_verify_corrected_source_revision",
+                return_value=recovery.CORRECTED_CHECKPOINT_MINIMUM_REVISION,
+            ),
+            mock.patch.object(
+                recovery, "_detector_policy_is_reviewed", return_value=self.config_raw
+            ),
+            mock.patch.object(
+                recovery, "_verify_historical_running_environment"
+            ) as runtime_verify,
+            mock.patch.object(recovery, "_verify_service_and_hardware") as health,
+            mock.patch.object(
+                recovery,
+                "_software_interruption_journal_evidence",
+                return_value=journal_raw,
+            ),
+        ):
+            binding = recovery._corrected_software_interruption_preflight(
+                incident.incident_reference,
+                incident.latch_sha256,
+                "LGT-TET-001",
+                incident.original_reason,
+            )
+        self.assertEqual(binding.incident, incident)
+        self.assertEqual(binding.current_state_raw, current_raw)
+        self.assertEqual(binding.journal_evidence_raw, journal_raw)
+        runtime_verify.assert_called_once()
+        health.assert_called_once_with(None)
+
+    def test_corrected_software_interruption_propagates_runtime_blockers(self):
+        failure_raw, _ = self.write_corrected_software_interruption_records()
+        incident = recovery.CorrectedSoftwareInterruption(
+            failure_raw,
+            recovery._incident_reference(failure_raw),
+            hashlib.sha256(failure_raw).hexdigest(),
+            recovery.CORRECTED_CHECKPOINT_REASON,
+            1_792_864_340.6402085,
+            recovery.CORRECTED_CHECKPOINT_SOURCE_REVISION,
+            recovery.CORRECTED_CHECKPOINT_SOURCE_PATH,
+            recovery.CORRECTED_CHECKPOINT_SOURCE_SHA256,
+        )
+        cases = (
+            ("runtime", "a RAM Tetris writer owns its lock"),
+            ("runtime", "lifecycle or SDK ownership is ambiguous"),
+            ("health", "accepted controller inventory is incomplete"),
+            ("health", "four SPD5118 endpoints were not verified"),
+            ("journal", "kernel communication after authoritative readiness"),
+        )
+        for verifier, message in cases:
+            with self.subTest(verifier=verifier):
+                runtime_effect = (
+                    recovery.RecoveryBlocked(message) if verifier == "runtime" else None
+                )
+                health_effect = (
+                    recovery.RecoveryBlocked(message) if verifier == "health" else None
+                )
+                journal_effect = (
+                    recovery.RecoveryBlocked(message) if verifier == "journal" else None
+                )
+                with (
+                    self.patched_environment(),
+                    mock.patch.object(
+                        recovery,
+                        "_corrected_software_interruption_authorization",
+                        return_value=incident,
+                    ),
+                    mock.patch.object(
+                        recovery,
+                        "_verify_corrected_source_revision",
+                        return_value=recovery.CORRECTED_CHECKPOINT_MINIMUM_REVISION,
+                    ),
+                    mock.patch.object(
+                        recovery,
+                        "_detector_policy_is_reviewed",
+                        return_value=self.config_raw,
+                    ),
+                    mock.patch.object(
+                        recovery,
+                        "_verify_historical_running_environment",
+                        side_effect=runtime_effect,
+                    ),
+                    mock.patch.object(
+                        recovery,
+                        "_verify_service_and_hardware",
+                        side_effect=health_effect,
+                    ),
+                    mock.patch.object(
+                        recovery,
+                        "_software_interruption_journal_evidence",
+                        side_effect=journal_effect,
+                    ),
+                    self.assertRaisesRegex(recovery.RecoveryBlocked, message),
+                ):
+                    recovery._corrected_software_interruption_preflight(
+                        incident.incident_reference,
+                        incident.latch_sha256,
+                        "LGT-TET-001",
+                        incident.original_reason,
+                    )
+
+    def test_corrected_software_interruption_clearance_preserves_evidence_only(self):
+        failure_raw, current_raw = self.write_corrected_software_interruption_records()
+        incident = recovery.CorrectedSoftwareInterruption(
+            failure_raw,
+            recovery._incident_reference(failure_raw),
+            hashlib.sha256(failure_raw).hexdigest(),
+            recovery.CORRECTED_CHECKPOINT_REASON,
+            1_792_864_340.6402085,
+            recovery.CORRECTED_CHECKPOINT_SOURCE_REVISION,
+            recovery.CORRECTED_CHECKPOINT_SOURCE_PATH,
+            recovery.CORRECTED_CHECKPOINT_SOURCE_SHA256,
+        )
+        journal_raw = b'{"category":"corrected-software-interruption"}\n'
+        binding = recovery.SoftwareInterruptionClearanceBinding(
+            incident,
+            current_raw,
+            self.config_raw,
+            journal_raw,
+            1_792_868_400.0,
+            recovery.CORRECTED_CHECKPOINT_MINIMUM_REVISION,
+        )
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery,
+                "_corrected_software_interruption_preflight",
+                return_value=binding,
+            ) as preflight,
+            mock.patch.object(
+                recovery, "_verify_corrected_software_interruption_continuity"
+            ) as continuity,
+            mock.patch.object(
+                recovery.subprocess,
+                "run",
+                side_effect=AssertionError("no service or RGB operation is permitted"),
+            ),
+        ):
+            result = recovery.clear_reviewed_software_interruption(
+                incident.incident_reference,
+                incident.latch_sha256,
+                "LGT-TET-001",
+                incident.original_reason,
+            )
+        self.assertEqual(result["state"], "off")
+        self.assertFalse(self.failure.exists())
+        self.assertEqual(preflight.call_count, 2)
+        continuity.assert_called_once_with(binding)
+        evidence = self.failure.parent / "recovery-evidence"
+        for kind, raw in (
+            ("failure", failure_raw),
+            ("lifecycle-state", current_raw),
+            ("openrgb-config", self.config_raw),
+            ("software-interruption-journal", journal_raw),
+        ):
+            path = evidence / f"{incident.incident_reference}.{kind}.json"
+            self.assertEqual(path.read_bytes(), raw)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_corrected_software_interruption_rejects_change_and_concurrency(self):
+        failure_raw, current_raw = self.write_corrected_software_interruption_records()
+        incident = recovery.CorrectedSoftwareInterruption(
+            failure_raw,
+            recovery._incident_reference(failure_raw),
+            hashlib.sha256(failure_raw).hexdigest(),
+            recovery.CORRECTED_CHECKPOINT_REASON,
+            1_792_864_340.6402085,
+            recovery.CORRECTED_CHECKPOINT_SOURCE_REVISION,
+            recovery.CORRECTED_CHECKPOINT_SOURCE_PATH,
+            recovery.CORRECTED_CHECKPOINT_SOURCE_SHA256,
+        )
+        binding = recovery.SoftwareInterruptionClearanceBinding(
+            incident,
+            current_raw,
+            self.config_raw,
+            b"{}\n",
+            1_792_868_400.0,
+            recovery.CORRECTED_CHECKPOINT_MINIMUM_REVISION,
+        )
+        calls = 0
+
+        def changed_preflight(*_args):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                self.failure.write_bytes(failure_raw + b"changed")
+            return binding
+
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery,
+                "_corrected_software_interruption_preflight",
+                side_effect=changed_preflight,
+            ),
+            self.assertRaisesRegex(
+                recovery.RecoveryBlocked, "changed before clearance"
+            ),
+        ):
+            recovery.clear_reviewed_software_interruption(
+                incident.incident_reference,
+                incident.latch_sha256,
+                "LGT-TET-001",
+                incident.original_reason,
+            )
+
+        self.failure.write_bytes(failure_raw)
+        self.runtime.mkdir(parents=True, exist_ok=True)
+        self.runtime.chmod(0o700)
+        descriptor = os.open(
+            self.runtime / "lighting-recovery.lock", os.O_WRONLY | os.O_CREAT, 0o600
+        )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with (
+                self.patched_environment(),
+                self.assertRaisesRegex(recovery.RecoveryBlocked, "another recovery"),
+            ):
+                recovery.clear_reviewed_software_interruption(
+                    incident.incident_reference,
+                    incident.latch_sha256,
+                    "LGT-TET-001",
+                    incident.original_reason,
+                )
+        finally:
+            os.close(descriptor)
+        self.assertEqual(self.failure.read_bytes(), failure_raw)
+
+    def test_reviewed_hardware_health_cli_requires_explicit_acknowledgement(self):
+        reviewed = recovery.REVIEWED_HARDWARE_HEALTH_ALLOWLIST["LR-E8FE394802531DE7"]
         arguments = [
             "clear-reviewed-hardware-health",
             "--incident-reference",
@@ -1881,9 +2399,7 @@ class LightingRecoveryTests(unittest.TestCase):
         self.assertTrue(parsed.acknowledge_reviewed_hardware_health)
 
     def test_reviewed_hardware_health_accepts_only_exact_binding(self):
-        reviewed = recovery.REVIEWED_HARDWARE_HEALTH_ALLOWLIST[
-            "LR-E8FE394802531DE7"
-        ]
+        reviewed = recovery.REVIEWED_HARDWARE_HEALTH_ALLOWLIST["LR-E8FE394802531DE7"]
         self.assertEqual(
             recovery._reviewed_hardware_health_authorization(
                 reviewed.incident_reference,
@@ -2052,9 +2568,7 @@ class LightingRecoveryTests(unittest.TestCase):
                     recovery.REVIEWED_HARDWARE_HEALTH_ALLOWLIST,
                     {reviewed.incident_reference: reviewed},
                 ),
-                mock.patch.object(
-                    recovery, "_current_boot_id", return_value="a" * 32
-                ),
+                mock.patch.object(recovery, "_current_boot_id", return_value="a" * 32),
                 mock.patch.object(
                     recovery,
                     "_verify_corrected_source_revision",
