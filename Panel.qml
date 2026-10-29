@@ -458,7 +458,9 @@ Panel {
               root.recoveryFeedback = "Recovery preparation did not bind the incident."
             } else {
               root.recoveryAction = "recover"
-              root.recoveryFeedback = "Recovering safely…"
+              root.recoveryFeedback = String(result.recovery_kind || "") === "transient-spd"
+                ? "Observing four SPD sensors for 60 seconds…"
+                : "Recovering safely…"
               root.recoveryProcessOutput = ""
               root.recoveryProcessError = ""
               recoveryDispatchTimer.restart()

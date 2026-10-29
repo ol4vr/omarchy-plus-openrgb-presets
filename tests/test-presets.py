@@ -326,7 +326,7 @@ class PresetTests(unittest.TestCase):
 
     def test_manifest_and_panel_order(self) -> None:
         manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.4.32")
+        self.assertEqual(manifest["version"], "0.4.33")
         self.assertEqual(manifest["kinds"], ["bar-widget"])
         self.assertNotIn("service", manifest["entryPoints"])
         self.assertFalse((ROOT / "Service.qml").exists())
@@ -411,6 +411,7 @@ class PresetTests(unittest.TestCase):
         self.assertIn("root.diagnosticsExpanded = !root.diagnosticsExpanded", panel)
         self.assertIn("onClicked: root.beginRecovery()", panel)
         self.assertIn('root.recoveryAction = "recover"', panel)
+        self.assertIn('"Observing four SPD sensors for 60 seconds…"', panel)
         self.assertIn("recoveryDispatchTimer.restart()", panel)
         self.assertIn(
             "if (!lightingFailure || recoveryProc.running || recoveryAttemptActive)",

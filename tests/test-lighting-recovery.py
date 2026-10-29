@@ -1268,6 +1268,8 @@ class LightingRecoveryTests(unittest.TestCase):
                 "",
             ),
         )
+        executable = self.root / "openrgb"
+        executable.write_bytes(b"reviewed executable")
         with (
             self.patched_environment(),
             mock.patch.object(recovery, "INSTALLED_UNIT", unit),
@@ -1299,11 +1301,17 @@ class LightingRecoveryTests(unittest.TestCase):
                 recovery, "_detector_policy_is_reviewed", return_value=config_raw
             ),
             mock.patch.object(recovery, "PROC_ROOT", self.proc),
+            mock.patch.object(recovery, "OPENRGB_EXECUTABLE", executable),
+            mock.patch.object(
+                recovery,
+                "EXPECTED_OPENRGB_EXECUTABLE_SHA256",
+                hashlib.sha256(executable.read_bytes()).hexdigest(),
+            ),
             mock.patch.object(recovery.subprocess, "run", side_effect=commands) as run,
         ):
             recovery._verify_historical_running_environment(current, config_raw)
         invoked = [call.args[0] for call in run.call_args_list]
-        self.assertEqual(invoked[0], [recovery.PACMAN, "-Q", "openrgb"])
+        self.assertEqual(invoked[0], [recovery.PACMAN, "-Q", "openrgb-hugin"])
         self.assertEqual(invoked[1][0], recovery.SS)
         self.assertFalse(
             any(
@@ -1312,6 +1320,51 @@ class LightingRecoveryTests(unittest.TestCase):
                 for command in invoked
             )
         )
+
+    def test_reviewed_openrgb_package_requires_exact_package_and_executable(self):
+        executable = self.root / "openrgb"
+        executable.write_bytes(b"approved executable")
+        approved_sha256 = hashlib.sha256(executable.read_bytes()).hexdigest()
+        package = subprocess.CompletedProcess(
+            [], 0, recovery.EXPECTED_OPENRGB_PACKAGE + "\n", ""
+        )
+        with (
+            mock.patch.object(recovery, "OPENRGB_EXECUTABLE", executable),
+            mock.patch.object(
+                recovery, "EXPECTED_OPENRGB_EXECUTABLE_SHA256", approved_sha256
+            ),
+            mock.patch.object(recovery.subprocess, "run", return_value=package) as run,
+        ):
+            recovery._reviewed_openrgb_package_is_installed()
+        run.assert_called_once_with(
+            [recovery.PACMAN, "-Q", "openrgb-hugin"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+        cases = (
+            (
+                "wrong package",
+                subprocess.CompletedProcess([], 0, "openrgb 1.0rc3-3\n", ""),
+                approved_sha256,
+            ),
+            ("wrong executable", package, "0" * 64),
+        )
+        for label, result, expected_sha256 in cases:
+            with (
+                self.subTest(label=label),
+                mock.patch.object(recovery, "OPENRGB_EXECUTABLE", executable),
+                mock.patch.object(
+                    recovery,
+                    "EXPECTED_OPENRGB_EXECUTABLE_SHA256",
+                    expected_sha256,
+                ),
+                mock.patch.object(recovery.subprocess, "run", return_value=result),
+                self.assertRaisesRegex(recovery.RecoveryBlocked, "not reviewed"),
+            ):
+                recovery._reviewed_openrgb_package_is_installed()
 
     def test_historical_clearance_rejects_changed_latch_or_evidence(self):
         for changed in ("latch", "failure-evidence", "boundary", "config"):
@@ -2821,6 +2874,136 @@ class LightingRecoveryTests(unittest.TestCase):
         self.assertEqual(actual.classification, "structured-kernel-read-error")
         self.assertEqual(actual.endpoint, "10-0053")
 
+    def test_all_four_structured_transient_spd_endpoints_are_eligible(self):
+        for endpoint in recovery.TRANSIENT_SPD_ENDPOINTS:
+            with self.subTest(endpoint=endpoint):
+                value = {
+                    "details": {
+                        "endpoint": endpoint,
+                        "exception_type": "OSError",
+                        "failure_kind": "spd5118-temperature",
+                        "read_state": "kernel-read-error",
+                        "sensor": f"{endpoint}/hwmon/temp1_input",
+                    },
+                    "evidence_version": 1,
+                    "message": f"{endpoint} temperature is unreadable",
+                    "pid": 77,
+                    "source": {
+                        "component": "ram-tetris",
+                        "path": "ram-tetris",
+                        "revision": "a" * 40,
+                        "sha256": "b" * 64,
+                        "version": "0.4.31",
+                    },
+                    "state": "failed",
+                    "time": time.time() - 120,
+                }
+                self.failure.parent.mkdir(parents=True, exist_ok=True)
+                self.failure.parent.chmod(0o700)
+                self.failure.write_text(
+                    json.dumps(value, sort_keys=True) + "\n", encoding="utf-8"
+                )
+                with (
+                    self.patched_environment(),
+                    mock.patch.object(
+                        recovery,
+                        "_verify_corrected_source_revision",
+                        return_value="a" * 40,
+                    ),
+                    mock.patch.object(
+                        recovery, "_source_blob_sha256", return_value="b" * 64
+                    ),
+                ):
+                    incident = recovery._classify_transient_spd_incident()
+                self.assertEqual(incident.endpoint, endpoint)
+                self.assertEqual(
+                    incident.classification, "structured-kernel-read-error"
+                )
+
+    def test_transient_spd_status_prepare_and_recover_use_reviewed_path(self):
+        incident, current_raw, _ = self.write_transient_spd_records()
+        self.failure.parent.joinpath("ram-tetris-enabled").write_bytes(b"on\n")
+        token = recovery._transient_spd_confirmation_token(incident.failure_raw)
+        observed = {
+            "observation_directory": "LR-0123456789ABCDEF-transient-spd-20261024T100000+0200",
+            "stability_manifest_sha256": "a" * 64,
+        }
+        cleared = {
+            "failure": False,
+            "incident_reference": incident.incident_reference,
+            "preference": False,
+            "state": "off",
+        }
+        qualification = b'{"category":"transient-spd-post-incident"}\n'
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery, "_classify_transient_spd_incident", return_value=incident
+            ),
+            mock.patch.object(
+                recovery,
+                "_transient_spd_environment_preflight",
+                return_value=(current_raw, self.config_raw, {}, qualification),
+            ) as preflight,
+            mock.patch.object(
+                recovery,
+                "_run_ram_tetris_status",
+                return_value={"preference": True, "state": "failed"},
+            ),
+            mock.patch.object(recovery, "_service_quick_health", return_value=True),
+            mock.patch.object(recovery, "observe_transient_spd", return_value=observed),
+            mock.patch.object(
+                recovery, "clear_reviewed_transient_spd", return_value=cleared
+            ) as clear,
+            mock.patch.object(
+                recovery.subprocess,
+                "run",
+                side_effect=AssertionError("no service, preset, or RGB command"),
+            ),
+        ):
+            status = recovery.status_document()
+            prepared = recovery.prepare_document()
+            result = recovery.recover(token)
+        self.assertTrue(status["recovery_available"])
+        self.assertEqual(prepared["recovery_kind"], "transient-spd")
+        self.assertEqual(prepared["confirmation_token"], token)
+        self.assertEqual(result["state"], "off")
+        self.assertIn("Transient SPD recovery complete", result["message"])
+        self.assertEqual(
+            self.failure.parent.joinpath("ram-tetris-enabled").read_bytes(), b"off\n"
+        )
+        self.assertEqual(preflight.call_count, 2)
+        self.assertFalse(preflight.call_args_list[0].kwargs["require_preference_off"])
+        self.assertFalse(preflight.call_args_list[1].kwargs["require_preference_off"])
+        clear.assert_called_once_with(
+            observed["observation_directory"],
+            observed["stability_manifest_sha256"],
+        )
+
+    def test_transient_spd_recover_refuses_concurrent_attempt(self):
+        incident, _, _ = self.write_transient_spd_records()
+        token = recovery._transient_spd_confirmation_token(incident.failure_raw)
+        self.runtime.mkdir(parents=True)
+        self.runtime.chmod(0o700)
+        descriptor = os.open(
+            self.runtime / "lighting-recovery.lock", os.O_WRONLY | os.O_CREAT, 0o600
+        )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with (
+                self.patched_environment(),
+                mock.patch.object(
+                    recovery,
+                    "_classify_transient_spd_incident",
+                    return_value=incident,
+                ),
+                self.assertRaisesRegex(recovery.RecoveryBlocked, "another recovery"),
+            ):
+                recovery.recover(token)
+        finally:
+            os.close(descriptor)
+        self.assertEqual(self.failure.read_bytes(), incident.failure_raw)
+
     def test_transient_spd_rejects_wrong_classification_and_provenance(self):
         incident, _, _ = self.write_transient_spd_records()
         wrong_endpoint = json.loads(incident.failure_raw)
@@ -2909,6 +3092,71 @@ class LightingRecoveryTests(unittest.TestCase):
             ):
                 recovery._transient_spd_environment_preflight(incident)
 
+    def test_transient_spd_qualifies_unchanged_ready_lifecycle_before_incident(self):
+        incident, _, _ = self.write_transient_spd_records()
+        current = json.loads(self.lifecycle_state.read_text(encoding="utf-8"))
+        current["time"] = incident.failure_time - 30
+        current_raw = (json.dumps(current, sort_keys=True) + "\n").encode()
+        self.lifecycle_state.write_bytes(current_raw)
+        qualification = b'{"category":"transient-spd-post-incident"}\n'
+        health = {"controller_count": 7, "dimm_count": 4}
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery, "_current_boot_id", return_value=current["boot_id"]
+            ),
+            mock.patch.object(
+                recovery,
+                "_detector_policy_is_reviewed",
+                return_value=self.config_raw,
+            ),
+            mock.patch.object(
+                recovery, "_verify_historical_running_environment"
+            ) as runtime,
+            mock.patch.object(
+                recovery,
+                "_verify_service_and_hardware",
+                return_value=health,
+            ),
+            mock.patch.object(
+                recovery,
+                "_transient_spd_post_incident_evidence",
+                return_value=qualification,
+            ) as journal,
+        ):
+            actual = recovery._transient_spd_environment_preflight(incident)
+        self.assertEqual(actual, (current_raw, self.config_raw, health, qualification))
+        runtime.assert_called_once_with(
+            current, self.config_raw, require_preference_off=True
+        )
+        journal.assert_called_once_with(incident, incident.failure_time - 30)
+
+    def test_transient_spd_post_incident_history_rejects_new_unsafe_events(self):
+        incident, _, _ = self.write_transient_spd_records()
+        cases = (
+            ("kernel", "kernel: i801 SMBus timeout\n", "", "kernel communication"),
+            ("suspend", "kernel: PM: suspend exit\n", "", "suspend event"),
+            (
+                "service",
+                "",
+                "Main process exited, status=1/FAILURE\n",
+                "service failure",
+            ),
+        )
+        for label, kernel, service, message in cases:
+            with (
+                self.subTest(label=label),
+                mock.patch.object(
+                    recovery,
+                    "_software_interruption_journal_slice",
+                    side_effect=[kernel, service],
+                ),
+                self.assertRaisesRegex(recovery.RecoveryBlocked, message),
+            ):
+                recovery._transient_spd_post_incident_evidence(
+                    incident, incident.failure_time - 30
+                )
+
     def test_transient_spd_clearance_rejects_changed_lifecycle_identity(self):
         incident, current_raw, observation = self.write_transient_spd_records()
         changed = recovery.TransientSpdObservation(
@@ -2937,7 +3185,7 @@ class LightingRecoveryTests(unittest.TestCase):
             mock.patch.object(
                 recovery,
                 "_transient_spd_environment_preflight",
-                return_value=(current_raw, self.config_raw, {}),
+                return_value=(current_raw, self.config_raw, {}, b"{}\n"),
             ),
             mock.patch.object(recovery, "_current_boot_id", return_value="a" * 32),
             mock.patch.object(recovery, "_current_suspend_count", return_value=11),
@@ -3024,6 +3272,71 @@ class LightingRecoveryTests(unittest.TestCase):
                     observation.directory_name,
                     observation.manifest_sha256,
                 )
+
+    def test_transient_spd_observation_preserves_post_incident_qualification(self):
+        incident, _, observation = self.write_transient_spd_records()
+        evidence = (
+            self.failure.parent / "recovery-evidence" / observation.directory_name
+        )
+        metadata_path = evidence / "metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        started = recovery._parse_observation_time(
+            metadata["observation"]["started"], "start time"
+        )
+        metadata["plugin_version"] = "0.4.33"
+        metadata["qualification"] = {
+            "schema_version": 1,
+            "category": "transient-spd-post-incident",
+            "failure_time": incident.failure_time,
+            "lifecycle_ready_time": incident.failure_time - 30,
+            "qualified_at": started - 1,
+            "kernel": "historical kernel evidence\n",
+            "service": "historical service evidence\n",
+        }
+        metadata_path.write_text(
+            json.dumps(metadata, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        def refresh_manifest() -> str:
+            payloads = {
+                name: (evidence / name).read_bytes()
+                for name in recovery.TRANSIENT_SPD_EVIDENCE_FILES
+            }
+            manifest = b"".join(
+                f"{hashlib.sha256(payloads[name]).hexdigest()}  {name}\n".encode()
+                for name in sorted(payloads)
+            )
+            evidence.joinpath("manifest.sha256").write_bytes(manifest)
+            return hashlib.sha256(manifest).hexdigest()
+
+        manifest_sha256 = refresh_manifest()
+        with (
+            self.patched_environment(),
+            mock.patch.object(recovery, "_current_boot_id", return_value="a" * 32),
+            mock.patch.object(recovery, "_current_suspend_count", return_value=11),
+        ):
+            verified = recovery._verify_transient_spd_observation(
+                incident, observation.directory_name, manifest_sha256
+            )
+        self.assertEqual(
+            json.loads(verified.metadata_raw)["qualification"],
+            metadata["qualification"],
+        )
+
+        metadata["qualification"]["kernel"] = "kernel: spd5118 read failed\n"
+        metadata_path.write_text(
+            json.dumps(metadata, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        manifest_sha256 = refresh_manifest()
+        with (
+            self.patched_environment(),
+            mock.patch.object(recovery, "_current_boot_id", return_value="a" * 32),
+            mock.patch.object(recovery, "_current_suspend_count", return_value=11),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "qualification evidence"),
+        ):
+            recovery._verify_transient_spd_observation(
+                incident, observation.directory_name, manifest_sha256
+            )
 
     def test_transient_spd_rejects_changed_evidence_or_kernel_event(self):
         incident, _, observation = self.write_transient_spd_records()
@@ -3138,7 +3451,7 @@ class LightingRecoveryTests(unittest.TestCase):
                 mock.patch.object(
                     recovery,
                     "_transient_spd_environment_preflight",
-                    return_value=(current_raw, self.config_raw, {}),
+                    return_value=(current_raw, self.config_raw, {}, b"{}\n"),
                 ),
                 mock.patch.object(recovery, "_current_boot_id", return_value="a" * 32),
                 mock.patch.object(recovery, "_current_suspend_count", return_value=11),

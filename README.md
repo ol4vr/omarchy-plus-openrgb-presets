@@ -501,13 +501,27 @@ lighting-recovery clear-reviewed-transient-spd \
   --acknowledge-reviewed-transient-spd
 ```
 
-This source-only release does not change `Panel.qml`. A later UI release can
-safely make Recover serialize the same two commands: show the bounded
-observation as working, pass only the returned directory and manifest to
-clearance, return to the normal OFF toggle only after the verified clearance
-result, and otherwise display the backend's actual blocker. The UI must not
-derive eligibility itself, retry automatically, or treat a display code as
-authorization.
+Version 0.4.33 connects the existing Recover control to this reviewed workflow
+for raw-latch-qualified transient SPD failures. The first click performs the
+current read-only package, executable, lifecycle, SDK, controller, sensor,
+Effects, lock, and post-incident journal checks. The confirmed action verifies
+zero writers, persists the Tetris preference OFF, runs the existing 60-second
+observation, and passes only its returned directory and manifest checksum to
+the existing clearance. One recovery process and the existing singleton block
+duplicate attempts; there is no retry, service operation, preset change, RGB
+write, or automatic Tetris activation.
+
+The transient category alone may qualify an unchanged authenticated lifecycle
+whose `ready` record predates the incident. It preserves complete kernel and
+service journal history from the raw incident, establishes current health and
+identity before observation, rechecks those gates throughout and immediately
+before clearance, and rejects any later suspend/resume, communication error,
+service failure, or identity change. All other recovery categories retain their
+existing readiness rules. Package qualification now requires exactly
+`openrgb-hugin 1.0rc3-3.2` and executable SHA-256
+`d0d065994b7328aec2cc0ae2b06a3c9ab8f99f4693aba35bd669e2fea406e301`.
+Unknown, malformed, persistent-hardware, and unreviewed controller failures
+remain blocked with the backend's specific refusal.
 
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
@@ -1062,6 +1076,16 @@ previous incident-specific recovery inventory. Preserve the original latch and
 all retained lifecycle, configuration, journal, and source-provenance evidence.
 Rollback does not authorize a service operation, latch clearance, preference
 change, preset write, or Tetris activation.
+
+## Roll back the 0.4.33 transient-SPD Recover integration
+
+Redeploy exact published v0.4.32 commit
+`0a1972697e18dcc94d75fd7a873d866f604ff6c6`. This removes only the normal
+Recover dispatch for transient SPD incidents, the post-incident qualification,
+and the `openrgb-hugin` package binding. It restores the two administrative
+transient-SPD commands and their existing evidence. Preserve the current latch,
+preference, observations, and retained evidence. Rollback does not authorize a
+service operation, RGB write, preset change, or latch clearance.
 
 ## Remove
 

@@ -62,7 +62,13 @@ SENSITIVE_VALUE: Final = re.compile(
 PRIVATE_HOME_PATH: Final = re.compile(r"(?:file://)?/home/[^/\s]+(?:/[^\s,;|]+)*")
 SERVICE_NAME: Final = "omarchy-plus-openrgb-presets.service"
 GRAPHICAL_TARGET: Final = "graphical-session.target"
-EXPECTED_OPENRGB_PACKAGE: Final = "openrgb 1.0rc3-3"
+EXPECTED_OPENRGB_PACKAGE: Final = "openrgb-hugin 1.0rc3-3.2"
+EXPECTED_OPENRGB_EXECUTABLE_SHA256: Final = (
+    "d0d065994b7328aec2cc0ae2b06a3c9ab8f99f4693aba35bd669e2fea406e301"
+)
+OPENRGB_EXECUTABLE: Final = Path(
+    os.environ.get("OPENRGB_EXECUTABLE", "/usr/bin/openrgb")
+)
 SOURCE_UNIT: Final = ROOT / "systemd" / SERVICE_NAME
 INSTALLED_UNIT: Final = (
     Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
@@ -1094,6 +1100,31 @@ def _unit_is_reviewed() -> None:
         )
 
 
+def _reviewed_openrgb_package_is_installed() -> None:
+    package = subprocess.run(
+        [PACMAN, "-Q", "openrgb-hugin"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if package.returncode != 0 or package.stdout.strip() != EXPECTED_OPENRGB_PACKAGE:
+        raise RecoveryBlocked(
+            "Recovery blocked: the installed OpenRGB package is not reviewed."
+        )
+    try:
+        with OPENRGB_EXECUTABLE.open("rb") as handle:
+            executable_sha256 = hashlib.file_digest(handle, "sha256").hexdigest()
+    except OSError as error:
+        raise RecoveryBlocked(
+            "Recovery blocked: the installed OpenRGB executable is unreadable."
+        ) from error
+    if executable_sha256 != EXPECTED_OPENRGB_EXECUTABLE_SHA256:
+        raise RecoveryBlocked(
+            "Recovery blocked: the installed OpenRGB executable is not reviewed."
+        )
+
+
 def _detector_policy_is_reviewed() -> bytes:
     try:
         raw = OPENRGB_CONFIG.read_bytes()
@@ -1525,9 +1556,54 @@ def _read_spd_temperature(endpoint: str, path: Path) -> int:
     return value
 
 
+def _transient_spd_post_incident_evidence(
+    incident: TransientSpdIncident, lifecycle_ready_time: float
+) -> bytes:
+    """Capture and qualify complete journal history after an SPD incident."""
+
+    qualified_at = time.time()
+    kernel = _software_interruption_journal_slice(
+        kernel=True,
+        since=incident.failure_time,
+        until=qualified_at,
+        label="transient SPD kernel",
+    )
+    service = _software_interruption_journal_slice(
+        kernel=False,
+        since=incident.failure_time,
+        until=qualified_at,
+        label="transient SPD service",
+    )
+    if any(
+        RELEVANT_KERNEL_ERROR.search(line) or SUSPEND_RESUME_EVENT.search(line)
+        for line in kernel.splitlines()
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: a kernel communication or suspend event followed "
+            "the transient SPD incident."
+        )
+    if any(POST_READY_SERVICE_FAILURE.search(line) for line in service.splitlines()):
+        raise RecoveryBlocked(
+            "Recovery blocked: a service failure or ownership transition followed "
+            "the transient SPD incident."
+        )
+    document = {
+        "schema_version": 1,
+        "category": "transient-spd-post-incident",
+        "failure_time": incident.failure_time,
+        "lifecycle_ready_time": lifecycle_ready_time,
+        "qualified_at": qualified_at,
+        "kernel": kernel,
+        "service": service,
+    }
+    return (json.dumps(document, sort_keys=True) + "\n").encode()
+
+
 def _transient_spd_environment_preflight(
     incident: TransientSpdIncident,
-) -> tuple[bytes, bytes, dict[str, object]]:
+    *,
+    require_preference_off: bool = True,
+) -> tuple[bytes, bytes, dict[str, object], bytes]:
     current_state_path = state_root() / "lifecycle-service-state.json"
     current_state_raw = _read_protected_bytes(
         current_state_path, "current lifecycle state"
@@ -1540,14 +1616,20 @@ def _transient_spd_environment_preflight(
         or current.get("boot_id") != _current_boot_id()
         or not isinstance(current_time, (int, float))
         or isinstance(current_time, bool)
-        or float(current_time) <= incident.failure_time
     ):
         raise RecoveryBlocked(
             "Recovery blocked: the incident has no authoritative healthy lifecycle."
         )
     config_raw = _detector_policy_is_reviewed()
-    _verify_historical_running_environment(current, config_raw)
+    _verify_historical_running_environment(
+        current,
+        config_raw,
+        require_preference_off=require_preference_off,
+    )
     health = _verify_service_and_hardware(None)
+    qualification_raw = _transient_spd_post_incident_evidence(
+        incident, float(current_time)
+    )
     if _failure_record()[0] != incident.failure_raw:
         raise RecoveryBlocked(
             "Recovery blocked: the transient SPD latch changed during review."
@@ -1560,7 +1642,7 @@ def _transient_spd_environment_preflight(
         raise RecoveryBlocked(
             "Recovery blocked: service or configuration identity changed during review."
         )
-    return current_state_raw, config_raw, health
+    return current_state_raw, config_raw, health, qualification_raw
 
 
 def _write_transient_spd_observation(
@@ -1623,8 +1705,8 @@ def observe_transient_spd() -> dict[str, object]:
             ) from error
 
         incident = _classify_transient_spd_incident()
-        current_state_raw, config_raw, _ = _transient_spd_environment_preflight(
-            incident
+        current_state_raw, config_raw, _, qualification_raw = (
+            _transient_spd_environment_preflight(incident)
         )
         current = _json_record(current_state_raw, "current lifecycle state")
         lifecycle_pid, lifecycle_start = _identity(current, "lifecycle")
@@ -1679,8 +1761,8 @@ def observe_transient_spd() -> dict[str, object]:
             raise RecoveryBlocked(
                 "Recovery blocked: the SPD observation exceeded 60 seconds."
             )
-        second_state_raw, second_config_raw, _ = _transient_spd_environment_preflight(
-            incident
+        second_state_raw, second_config_raw, _, _ = (
+            _transient_spd_environment_preflight(incident)
         )
         if second_state_raw != current_state_raw or second_config_raw != config_raw:
             raise RecoveryBlocked(
@@ -1700,7 +1782,7 @@ def observe_transient_spd() -> dict[str, object]:
         metadata = {
             "schema_version": 1,
             "category": "reviewed-transient-spd",
-            "plugin_version": "0.4.30",
+            "plugin_version": "0.4.33",
             "incident": {
                 "reference": incident.incident_reference,
                 "latch_sha256": incident.latch_sha256,
@@ -1721,6 +1803,7 @@ def observe_transient_spd() -> dict[str, object]:
                 "kernel_cursor_start": cursor_start,
                 "kernel_cursor_end": cursor,
             },
+            "qualification": json.loads(qualification_raw),
             "observation": {
                 "started": datetime.fromtimestamp(started_wall, UTC).isoformat(
                     timespec="microseconds"
@@ -1894,24 +1977,31 @@ def _verify_transient_spd_observation(
         )
     _verify_transient_spd_samples(files["samples.tsv"])
     metadata = _json_record(files["metadata.json"], "transient SPD metadata")
-    if set(metadata) != {
+    legacy_keys = {
         "schema_version",
         "category",
         "plugin_version",
         "incident",
         "environment",
         "observation",
-    }:
+    }
+    current_keys = legacy_keys | {"qualification"}
+    plugin_version = metadata.get("plugin_version")
+    if (
+        (plugin_version == "0.4.30" and set(metadata) != legacy_keys)
+        or (plugin_version == "0.4.33" and set(metadata) != current_keys)
+        or plugin_version not in {"0.4.30", "0.4.33"}
+    ):
         raise RecoveryBlocked(
             "Recovery blocked: transient SPD metadata schema is invalid."
         )
     incident_data = metadata.get("incident")
     environment = metadata.get("environment")
     observation = metadata.get("observation")
+    qualification = metadata.get("qualification")
     if (
         metadata.get("schema_version") != 1
         or metadata.get("category") != "reviewed-transient-spd"
-        or metadata.get("plugin_version") != "0.4.30"
         or not isinstance(incident_data, dict)
         or not isinstance(environment, dict)
         or not isinstance(observation, dict)
@@ -2004,6 +2094,46 @@ def _verify_transient_spd_observation(
         raise RecoveryBlocked(
             "Recovery blocked: observation completion record is invalid."
         )
+    if plugin_version == "0.4.33":
+        if not isinstance(qualification, dict) or set(qualification) != {
+            "schema_version",
+            "category",
+            "failure_time",
+            "lifecycle_ready_time",
+            "qualified_at",
+            "kernel",
+            "service",
+        }:
+            raise RecoveryBlocked(
+                "Recovery blocked: transient SPD qualification evidence is invalid."
+            )
+        failure_time = qualification.get("failure_time")
+        ready_time = qualification.get("lifecycle_ready_time")
+        qualified_at = qualification.get("qualified_at")
+        kernel = qualification.get("kernel")
+        service = qualification.get("service")
+        if (
+            qualification.get("schema_version") != 1
+            or qualification.get("category") != "transient-spd-post-incident"
+            or failure_time != incident.failure_time
+            or not isinstance(ready_time, (int, float))
+            or isinstance(ready_time, bool)
+            or not isinstance(qualified_at, (int, float))
+            or isinstance(qualified_at, bool)
+            or not incident.failure_time <= float(qualified_at) <= started
+            or not isinstance(kernel, str)
+            or not isinstance(service, str)
+            or any(
+                RELEVANT_KERNEL_ERROR.search(line) or SUSPEND_RESUME_EVENT.search(line)
+                for line in kernel.splitlines()
+            )
+            or any(
+                POST_READY_SERVICE_FAILURE.search(line) for line in service.splitlines()
+            )
+        ):
+            raise RecoveryBlocked(
+                "Recovery blocked: transient SPD qualification evidence is invalid."
+            )
     return TransientSpdObservation(
         directory_name=directory_name,
         manifest_sha256=manifest_sha256,
@@ -2033,7 +2163,7 @@ def _transient_spd_clearance_preflight(
         raise RecoveryBlocked(
             "Recovery blocked: the SPD observation predates the incident."
         )
-    current_state_raw, config_raw, _ = _transient_spd_environment_preflight(incident)
+    current_state_raw, config_raw, _, _ = _transient_spd_environment_preflight(incident)
     current = _json_record(current_state_raw, "current lifecycle state")
     lifecycle_pid, lifecycle_start = _identity(current, "lifecycle")
     server_pid, server_start = _identity(current, "server")
@@ -2273,17 +2403,7 @@ def _verify_no_lighting_owners() -> None:
 
 def _verify_lifecycle_environment(failure_time: float) -> bytes:
     _unit_is_reviewed()
-    package = subprocess.run(
-        [PACMAN, "-Q", "openrgb"],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    if package.returncode != 0 or package.stdout.strip() != EXPECTED_OPENRGB_PACKAGE:
-        raise RecoveryBlocked(
-            "Recovery blocked: the installed OpenRGB revision is not reviewed."
-        )
+    _reviewed_openrgb_package_is_installed()
 
     service = _service_properties(
         SERVICE_NAME,
@@ -2533,14 +2653,26 @@ def status_document() -> dict[str, object]:
     _, timestamp = _timestamp(record)
     service_healthy = _service_quick_health()
     lifecycle_candidate = _lifecycle_recovery_candidate(record, message)
+    transient_spd_candidate = False
+    if TRANSIENT_SPD_REASON.fullmatch(message):
+        try:
+            _classify_transient_spd_incident()
+        except RecoveryBlocked:
+            pass
+        else:
+            transient_spd_candidate = True
     scope = failure_class.scope
     if scope == "tetris" and not service_healthy:
         scope = "lighting"
     available = (
-        failure_class.reviewed_recovery
-        and message in ELIGIBLE_REASONS
-        and service_healthy
-    ) or lifecycle_candidate
+        (
+            failure_class.reviewed_recovery
+            and message in ELIGIBLE_REASONS
+            and service_healthy
+        )
+        or lifecycle_candidate
+        or (transient_spd_candidate and service_healthy)
+    )
     recovery_status = (
         "available"
         if available
@@ -2549,6 +2681,8 @@ def status_document() -> dict[str, object]:
     recovery_summary = (
         "Reviewed lifecycle recovery can be checked."
         if lifecycle_candidate
+        else "Reviewed 60-second SPD recovery can be checked."
+        if transient_spd_candidate and service_healthy
         else "Safe Tetris-only recovery can be checked."
         if available
         else "Manual lifecycle recovery is required."
@@ -2738,20 +2872,13 @@ def _verify_historical_acknowledgement(
 
 
 def _verify_historical_running_environment(
-    current: dict[str, object], config_evidence: bytes
+    current: dict[str, object],
+    config_evidence: bytes,
+    *,
+    require_preference_off: bool = True,
 ) -> None:
     _unit_is_reviewed()
-    package = subprocess.run(
-        [PACMAN, "-Q", "openrgb"],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    if package.returncode != 0 or package.stdout.strip() != EXPECTED_OPENRGB_PACKAGE:
-        raise RecoveryBlocked(
-            "Recovery blocked: the installed OpenRGB revision is not reviewed."
-        )
+    _reviewed_openrgb_package_is_installed()
 
     lifecycle_pid, lifecycle_start = _identity(current, "lifecycle")
     server_pid, server_start = _identity(current, "server")
@@ -2883,7 +3010,7 @@ def _verify_historical_running_environment(
         raise RecoveryBlocked("Recovery blocked: a RAM Tetris writer owns its lock.")
     if _lock_is_owned(root / "ram-tetris-write.lock"):
         raise RecoveryBlocked("Recovery blocked: a lighting write is active.")
-    if (
+    if require_preference_off and (
         _read_protected_bytes(
             state_root() / "ram-tetris-enabled", "RAM Tetris preference"
         )
@@ -3518,6 +3645,19 @@ def prepare_document() -> dict[str, object]:
                 "Confirm one reviewed lifecycle start. RAM Tetris will remain OFF."
             ),
         }
+    if TRANSIENT_SPD_REASON.fullmatch(message):
+        incident = _classify_transient_spd_incident()
+        _transient_spd_environment_preflight(incident, require_preference_off=False)
+        return {
+            "state": "confirmation-required",
+            "confirmation_token": _transient_spd_confirmation_token(raw),
+            "incident_reference": incident.incident_reference,
+            "recovery_kind": "transient-spd",
+            "message": (
+                "Confirm one 60-second SPD observation and reviewed clearance. "
+                "RAM Tetris will remain OFF."
+            ),
+        }
     if not failure_class.reviewed_recovery or message not in ELIGIBLE_REASONS:
         raise RecoveryBlocked(
             "Recovery blocked: this incident has no reviewed automatic recovery procedure."
@@ -3544,6 +3684,10 @@ def _lifecycle_confirmation_token(
         + b"\0"
         + config_raw
     ).hexdigest()
+
+
+def _transient_spd_confirmation_token(failure_raw: bytes) -> str:
+    return hashlib.sha256(b"reviewed-transient-spd\0" + failure_raw).hexdigest()
 
 
 def _atomic_text(path: Path, text: str) -> None:
@@ -3792,7 +3936,68 @@ def _recover_lifecycle(
     }
 
 
+def _recover_transient_spd(confirmation_token: str) -> dict[str, object]:
+    """Run the existing transient-SPD observation and clearance exactly once."""
+
+    root = runtime_root()
+    _private_directory(root)
+    lock_fd = os.open(root / "lighting-recovery.lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RecoveryBlocked(
+                "Recovery blocked: another recovery is active."
+            ) from error
+
+        incident = _classify_transient_spd_incident()
+        expected_token = _transient_spd_confirmation_token(incident.failure_raw)
+        if not confirmation_token or confirmation_token != expected_token:
+            raise RecoveryBlocked(
+                "Recovery blocked: confirmation does not match this transient SPD incident."
+            )
+        current_state_raw, config_raw, _, qualification_raw = (
+            _transient_spd_environment_preflight(incident, require_preference_off=False)
+        )
+        for raw, kind in (
+            (incident.failure_raw, "failure"),
+            (current_state_raw, "lifecycle-state"),
+            (config_raw, "openrgb-config"),
+            (qualification_raw, "transient-spd-qualification"),
+        ):
+            _preserve_evidence(raw, incident.incident_reference, kind)
+        _atomic_text(state_root() / "ram-tetris-enabled", "off\n")
+        if (
+            _failure_record()[0] != incident.failure_raw
+            or _read_protected_bytes(
+                state_root() / "ram-tetris-enabled", "RAM Tetris preference"
+            )
+            != b"off\n"
+        ):
+            raise RecoveryBlocked(
+                "Recovery blocked: incident or preference changed while disabling "
+                "RAM Tetris."
+            )
+    finally:
+        os.close(lock_fd)
+
+    observation = observe_transient_spd()
+    directory = observation.get("observation_directory")
+    manifest_sha256 = observation.get("stability_manifest_sha256")
+    if not isinstance(directory, str) or not isinstance(manifest_sha256, str):
+        raise RecoveryBlocked(
+            "Recovery blocked: transient SPD observation result is incomplete."
+        )
+    result = clear_reviewed_transient_spd(directory, manifest_sha256)
+    result["message"] = "Transient SPD recovery complete. RAM Tetris remains OFF."
+    return result
+
+
 def recover(confirmation_token: str) -> dict[str, object]:
+    _, initial_record = _failure_record()
+    if TRANSIENT_SPD_REASON.fullmatch(_failure_message(initial_record)):
+        return _recover_transient_spd(confirmation_token)
+
     root = runtime_root()
     _private_directory(root)
     lock_fd = os.open(root / "lighting-recovery.lock", os.O_WRONLY | os.O_CREAT, 0o600)
