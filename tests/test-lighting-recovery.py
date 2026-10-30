@@ -1082,16 +1082,43 @@ class LightingRecoveryTests(unittest.TestCase):
             },
         )
 
-    def test_shutdown_race_journal_uses_compact_boot_id_and_fails_closed(self):
+    def test_shutdown_race_journal_argument_contract_and_failure(self):
         canonical_boot_id = "8f7fdab1-de77-4db2-864c-ea5ce41a279c"
+        compact_boot_id = canonical_boot_id.replace("-", "")
+        expected_command = [
+            recovery.JOURNALCTL,
+            "--boot",
+            compact_boot_id,
+            "-k",
+            "--output=json",
+            "--no-pager",
+        ]
         completed = self.kernel_journal_result()
+
+        def strict_journalctl(command, **_kwargs):
+            if "--kernel" in command:
+                return subprocess.CompletedProcess(
+                    command, 1, "", "journalctl: unrecognized option '--kernel'\n"
+                )
+            if command != expected_command:
+                return subprocess.CompletedProcess(command, 2, "", "unexpected argv\n")
+            return completed
+
+        rejected = strict_journalctl(
+            [recovery.JOURNALCTL, "--boot", compact_boot_id, "--kernel"]
+        )
+        self.assertEqual(rejected.returncode, 1)
+
         with mock.patch.object(
-            recovery.subprocess, "run", return_value=completed
+            recovery.subprocess, "run", side_effect=strict_journalctl
         ) as journalctl:
-            recovery._shutdown_race_relevant_kernel_records()
-        command = journalctl.call_args.args[0]
+            relevant = recovery._shutdown_race_relevant_kernel_records()
+        self.assertEqual(journalctl.call_args.args[0], expected_command)
+        self.assertEqual(relevant[0][0], recovery.SHUTDOWN_RACE_REVIEWED_KERNEL_MESSAGE)
+        retained_record = json.loads(relevant[0][1])
+        self.assertEqual(retained_record["_BOOT_ID"], compact_boot_id)
         self.assertEqual(
-            command[command.index("--boot") + 1], canonical_boot_id.replace("-", "")
+            retained_record["MESSAGE"], recovery.SHUTDOWN_RACE_REVIEWED_KERNEL_MESSAGE
         )
         self.assertEqual(recovery.SHUTDOWN_RACE_RECOVERY_BOOT_ID, canonical_boot_id)
 
@@ -1103,7 +1130,9 @@ class LightingRecoveryTests(unittest.TestCase):
             mock.patch.object(
                 recovery, "_capture_kernel_cursor", return_value="review-cursor"
             ),
-            mock.patch.object(recovery.subprocess, "run", return_value=completed),
+            mock.patch.object(
+                recovery.subprocess, "run", side_effect=strict_journalctl
+            ),
         ):
             qualification = recovery._shutdown_race_kernel_qualification(config_raw)
         self.assertEqual(

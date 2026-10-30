@@ -137,7 +137,7 @@ SHUTDOWN_RACE_SERVER_START: Final = "85366961"
 SHUTDOWN_RACE_WRITER_PID: Final = 394561
 SHUTDOWN_RACE_BOUNDARY_TIME: Final = 1793310621.0151148
 SHUTDOWN_RACE_FAILURE_TIME: Final = 1793310623.257292
-SHUTDOWN_RACE_CORRECTED_VERSION: Final = "0.4.35"
+SHUTDOWN_RACE_CORRECTED_VERSION: Final = "0.4.36"
 SHUTDOWN_RACE_CORRECTED_LIFECYCLE_SHA256: Final = (
     "d03cb8a1525ea70f0e296a2a6bd9cc10f6c4f69a8aee685e1a03a5fb17ada7b2"
 )
@@ -3504,7 +3504,7 @@ def _shutdown_race_relevant_kernel_records() -> tuple[tuple[str, str], ...]:
             JOURNALCTL,
             "--boot",
             SHUTDOWN_RACE_RECOVERY_BOOT_ID.replace("-", ""),
-            "--kernel",
+            "-k",
             "--output=json",
             "--no-pager",
         ],
