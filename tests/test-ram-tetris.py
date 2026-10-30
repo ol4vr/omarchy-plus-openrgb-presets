@@ -19,7 +19,7 @@ import tempfile
 import threading
 import unittest
 from collections import Counter
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
@@ -2002,6 +2002,102 @@ class RuntimeSafetyTests(unittest.TestCase):
             self.assertEqual(failure["state"], "failed")
             self.assertIn("SDK connection", failure["message"])
 
+    def test_authenticated_shutdown_intent_suppresses_sdk_identity_latch(self):
+        class ShutdownWriter:
+            preset = "horde-red"
+            animation_writes = 17
+
+            def run(self):
+                raise runtime.SafetyStop("process 1354566 identity is unreadable")
+
+            def _validated_stop_request(self):
+                return runtime.StopRequest("shutdown", 300, "400", 100, "200")
+
+            def failure_evidence(self, _error):
+                raise AssertionError("deliberate shutdown must not create evidence")
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory, "state/omarchy-plus/openrgb-presets")
+            state.mkdir(parents=True)
+            environment = {
+                "XDG_STATE_HOME": str(Path(directory, "state")),
+                "OPENRGB_RUNTIME_DIR": str(Path(directory, "runtime")),
+            }
+            arguments = runtime.argparse.Namespace(
+                server_pid=100,
+                server_start="200",
+                lifecycle_pid=300,
+                lifecycle_start="400",
+            )
+            continuity = runtime.LifecycleIdentity(300, "400", "boot", 0)
+            with (
+                mock.patch.dict(os.environ, environment, clear=False),
+                mock.patch.object(runtime, "_preference", return_value=True),
+                mock.patch.object(
+                    runtime, "_selected_preset", return_value="horde-red"
+                ),
+                mock.patch.object(runtime, "OpenRGBSDK", return_value=FakeSDK()),
+                mock.patch.object(
+                    runtime, "_lifecycle_identity", return_value=continuity
+                ),
+                mock.patch.object(
+                    runtime, "TetrisWriter", return_value=ShutdownWriter()
+                ),
+            ):
+                self.assertEqual(runtime._run(arguments), 0)
+            self.assertFalse((state / "ram-tetris-failure.json").exists())
+            status = json.loads(
+                Path(
+                    environment["OPENRGB_RUNTIME_DIR"], "ram-tetris-status.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(status["state"], "stopped")
+
+    def test_unexpected_sdk_identity_loss_still_latches(self):
+        class FailedWriter:
+            preset = "horde-red"
+            animation_writes = 9
+
+            def run(self):
+                raise runtime.SafetyStop("OpenRGB SDK process identity changed")
+
+            def _validated_stop_request(self):
+                return None
+
+            def failure_evidence(self, _error):
+                return {"failure_kind": "safety-stop"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory, "state/omarchy-plus/openrgb-presets")
+            state.mkdir(parents=True)
+            environment = {
+                "XDG_STATE_HOME": str(Path(directory, "state")),
+                "OPENRGB_RUNTIME_DIR": str(Path(directory, "runtime")),
+            }
+            arguments = runtime.argparse.Namespace(
+                server_pid=100,
+                server_start="200",
+                lifecycle_pid=300,
+                lifecycle_start="400",
+            )
+            continuity = runtime.LifecycleIdentity(300, "400", "boot", 0)
+            with (
+                mock.patch.dict(os.environ, environment, clear=False),
+                mock.patch.object(runtime, "_preference", return_value=True),
+                mock.patch.object(
+                    runtime, "_selected_preset", return_value="horde-red"
+                ),
+                mock.patch.object(runtime, "OpenRGBSDK", return_value=FakeSDK()),
+                mock.patch.object(
+                    runtime, "_lifecycle_identity", return_value=continuity
+                ),
+                mock.patch.object(runtime, "TetrisWriter", return_value=FailedWriter()),
+                redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(runtime._run(arguments), 1)
+            failure = json.loads((state / "ram-tetris-failure.json").read_text())
+            self.assertEqual(failure["message"], "OpenRGB SDK process identity changed")
+
 
 class ServiceReadinessTests(unittest.TestCase):
     @staticmethod
@@ -2392,8 +2488,8 @@ class IntegrationSourceTests(unittest.TestCase):
             "reconcile_tetris() {", 1
         )[0]
         self.assertLess(
-            stop.index('"${FLOCK_BIN}" --wait "${lock_wait}" "${stop_lock_fd}"'),
             stop.index("TETRIS_STOP_FILE"),
+            stop.index('"${FLOCK_BIN}" --wait "${lock_wait}" "${stop_lock_fd}"'),
         )
         self.assertLess(
             stop.index("TETRIS_STOP_FILE"),

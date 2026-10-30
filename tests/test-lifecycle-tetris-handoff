@@ -17,6 +17,7 @@ trap test_cleanup EXIT
 
 /usr/bin/mkdir -p "${TEST_ROOT}/runtime"
 export OPENRGB_RUNTIME_DIR="${TEST_ROOT}/runtime"
+export OPENRGB_TETRIS_WRITE_GATE_WAIT_SECONDS=1
 
 # shellcheck source=../openrgb-lifecycle
 source "${REPOSITORY_ROOT}/openrgb-lifecycle"
@@ -88,3 +89,31 @@ PY
 
 /usr/bin/printf '%s\n' \
   'PASS: authenticated handoff stops writer and releases singleton before return'
+
+/usr/bin/rm -f -- "${TETRIS_STOP_FILE}"
+(
+  exec 9>"${RUNTIME_DIR}/ram-tetris.lock"
+  "${FLOCK_BIN}" 9
+  exec 10>"${RUNTIME_DIR}/ram-tetris-write.lock"
+  "${FLOCK_BIN}" -s 10
+  while [[ ! -e "${TETRIS_STOP_FILE}" ]]; do
+    "${SLEEP_BIN}" 0.01
+  done
+  "${SLEEP_BIN}" 2
+) &
+writer_pid=$!
+tetris_pid="${writer_pid}"
+tetris_start_time=writer-start
+shutdown_deadline=$((SECONDS + 4))
+
+if stop_tetris shutdown >/dev/null; then
+  /usr/bin/printf '%s\n' 'FAIL: write-gate timeout was accepted as quiescence' >&2
+  exit 1
+fi
+[[ -s "${TETRIS_STOP_FILE}" ]]
+kill -TERM "${writer_pid}" 2>/dev/null || true
+wait "${writer_pid}" 2>/dev/null || true
+writer_pid=''
+
+/usr/bin/printf '%s\n' \
+  'PASS: bounded write-gate timeout retains authenticated shutdown intent and fails closed'

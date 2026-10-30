@@ -73,6 +73,159 @@ class LightingRecoveryTests(unittest.TestCase):
         self.failure.write_bytes(raw)
         return raw
 
+    def write_shutdown_race_records(
+        self,
+    ) -> tuple[recovery.ShutdownRaceIncident, bytes, bytes]:
+        failure_raw = (
+            json.dumps(
+                {
+                    "details": {
+                        "checkpoint_deadline_ms": 2000.0,
+                        "checkpoint_elapsed_ms": 2397.566,
+                        "checkpoint_interval_ms": 250.0,
+                        "checkpoint_started_unix": 1793310620.8548636,
+                        "failure_kind": "safety-stop",
+                        "kernel_evidence_status": "captured",
+                        "kernel_messages": [],
+                        "last_checkpoint_age_ms": 2362.979,
+                        "last_checkpoint_completed_unix": 1793310620.8894513,
+                        "last_checkpoint_duration_ms": 34.587,
+                        "last_temperatures_mc": {
+                            "10-0050": 40500,
+                            "10-0051": 40250,
+                            "10-0052": 39000,
+                            "10-0053": 35750,
+                        },
+                        "writer_progress_count": 557863,
+                    },
+                    "evidence_version": 1,
+                    "message": recovery.SHUTDOWN_RACE_REASON,
+                    "pid": recovery.SHUTDOWN_RACE_WRITER_PID,
+                    "source": {
+                        "component": "ram-tetris",
+                        "path": recovery.SHUTDOWN_RACE_SOURCE_PATH,
+                        "revision": recovery.SHUTDOWN_RACE_SOURCE_REVISION,
+                        "sha256": recovery.SHUTDOWN_RACE_SOURCE_SHA256,
+                        "version": "0.4.31",
+                    },
+                    "state": "failed",
+                    "time": recovery.SHUTDOWN_RACE_FAILURE_TIME,
+                },
+                sort_keys=True,
+            ).encode()
+            + b"\n"
+        )
+        self.assertEqual(
+            hashlib.sha256(failure_raw).hexdigest(),
+            recovery.SHUTDOWN_RACE_LATCH_SHA256,
+        )
+        boundary_raw = (
+            json.dumps(
+                {
+                    "boot_id": recovery.SHUTDOWN_RACE_OLD_BOOT_ID,
+                    "lifecycle_pid": recovery.SHUTDOWN_RACE_LIFECYCLE_PID,
+                    "lifecycle_start": recovery.SHUTDOWN_RACE_LIFECYCLE_START,
+                    "reason": "deliberate",
+                    "server_pid": recovery.SHUTDOWN_RACE_SERVER_PID,
+                    "server_start": recovery.SHUTDOWN_RACE_SERVER_START,
+                    "state": "stopping",
+                    "stop_result": {
+                        "classification": "incomplete-lifecycle-exit",
+                        "exit_code": "exited",
+                        "exit_status": "1",
+                        "service_result": "exit-code",
+                        "time": 1793310625.0,
+                    },
+                    "time": recovery.SHUTDOWN_RACE_BOUNDARY_TIME,
+                },
+                sort_keys=True,
+            ).encode()
+            + b"\n"
+        )
+        self.failure.parent.mkdir(parents=True, exist_ok=True)
+        self.failure.parent.chmod(0o700)
+        for path, raw in (
+            (self.failure, failure_raw),
+            (self.lifecycle_state, boundary_raw),
+            (self.failure.parent / "ram-tetris-enabled", b"on\n"),
+        ):
+            path.write_bytes(raw)
+            path.chmod(0o600)
+        incident = recovery.ShutdownRaceIncident(
+            failure_raw=failure_raw,
+            incident_reference=recovery.SHUTDOWN_RACE_REFERENCE,
+            latch_sha256=recovery.SHUTDOWN_RACE_LATCH_SHA256,
+            original_reason=recovery.SHUTDOWN_RACE_REASON,
+            failure_time=recovery.SHUTDOWN_RACE_FAILURE_TIME,
+            source_revision=recovery.SHUTDOWN_RACE_SOURCE_REVISION,
+            source_path=recovery.SHUTDOWN_RACE_SOURCE_PATH,
+            source_sha256=recovery.SHUTDOWN_RACE_SOURCE_SHA256,
+        )
+        return incident, boundary_raw, self.config_raw
+
+    def shutdown_race_binding(self) -> recovery.ShutdownRaceRecoveryBinding:
+        incident, boundary_raw, config_raw = self.write_shutdown_race_records()
+        historical = b'{"category":"reviewed-old-boot-shutdown-race"}\n'
+        kernel = recovery.ShutdownRaceKernelQualification(
+            evidence_raw=(
+                json.dumps(
+                    {
+                        "category": "reviewed-unrelated-ite8853-registration",
+                        "message": recovery.SHUTDOWN_RACE_REVIEWED_KERNEL_MESSAGE,
+                    },
+                    sort_keys=True,
+                ).encode()
+                + b"\n"
+            ),
+            journal_cursor="qualification-cursor",
+        )
+        return recovery.ShutdownRaceRecoveryBinding(
+            incident=incident,
+            boundary_raw=boundary_raw,
+            config_raw=config_raw,
+            historical_journal_raw=historical,
+            current_boot_kernel=kernel,
+            current_boot_id="current-boot",
+            installed_source_revision="f" * 40,
+        )
+
+    @staticmethod
+    def shutdown_race_config_raw() -> bytes:
+        return (
+            json.dumps(
+                {
+                    "Detectors": {
+                        "detectors": {
+                            recovery.DISABLED_DETECTOR: False,
+                            recovery.REQUIRED_DETECTOR: True,
+                        }
+                    }
+                },
+                sort_keys=True,
+            ).encode()
+            + b"\n"
+        )
+
+    @staticmethod
+    def kernel_journal_result(
+        message: str = recovery.SHUTDOWN_RACE_REVIEWED_KERNEL_MESSAGE,
+        *,
+        boot_id: str = recovery.SHUTDOWN_RACE_RECOVERY_BOOT_ID,
+        additional: tuple[str, ...] = (),
+    ) -> subprocess.CompletedProcess:
+        records = [
+            json.dumps(
+                {
+                    "MESSAGE": item,
+                    "_BOOT_ID": boot_id.replace("-", ""),
+                    "__CURSOR": f"cursor-{index}",
+                },
+                sort_keys=True,
+            )
+            for index, item in enumerate((message, *additional), start=1)
+        ]
+        return subprocess.CompletedProcess([], 0, "\n".join(records) + "\n", "")
+
     def patched_environment(self):
         return mock.patch.dict(os.environ, self.environment, clear=False)
 
@@ -852,6 +1005,491 @@ class LightingRecoveryTests(unittest.TestCase):
             if call.args[0][:3] == [recovery.SYSTEMCTL, "--user", "start"]
         ]
         self.assertEqual(len(starts), 1)
+
+    def test_shutdown_race_classifier_requires_exact_raw_latch_and_provenance(self):
+        expected, _, _ = self.write_shutdown_race_records()
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery,
+                "_source_blob_sha256",
+                return_value=recovery.SHUTDOWN_RACE_SOURCE_SHA256,
+            ),
+        ):
+            self.assertEqual(recovery._classify_shutdown_race_incident(), expected)
+
+        modified = json.loads(expected.failure_raw)
+        modified["details"]["writer_progress_count"] += 1
+        self.failure.write_text(
+            json.dumps(modified, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery,
+                "_source_blob_sha256",
+                return_value=recovery.SHUTDOWN_RACE_SOURCE_SHA256,
+            ),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "not the reviewed"),
+        ):
+            recovery._classify_shutdown_race_incident()
+
+    def test_shutdown_race_corrected_source_digests_match_candidate(self):
+        self.assertEqual(
+            hashlib.sha256((ROOT / "openrgb-lifecycle").read_bytes()).hexdigest(),
+            recovery.SHUTDOWN_RACE_CORRECTED_LIFECYCLE_SHA256,
+        )
+        self.assertEqual(
+            hashlib.sha256((ROOT / "ram-tetris").read_bytes()).hexdigest(),
+            recovery.SHUTDOWN_RACE_CORRECTED_RAM_TETRIS_SHA256,
+        )
+        self.assertEqual(
+            json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))["version"],
+            recovery.SHUTDOWN_RACE_CORRECTED_VERSION,
+        )
+
+    def test_exact_shutdown_race_kernel_registration_is_qualified_and_retained(self):
+        config_raw = self.shutdown_race_config_raw()
+        completed = self.kernel_journal_result()
+        with (
+            mock.patch.object(
+                recovery,
+                "_current_boot_id",
+                return_value=recovery.SHUTDOWN_RACE_RECOVERY_BOOT_ID,
+            ),
+            mock.patch.object(
+                recovery, "_capture_kernel_cursor", return_value="review-cursor"
+            ),
+            mock.patch.object(recovery.subprocess, "run", return_value=completed),
+        ):
+            qualification = recovery._shutdown_race_kernel_qualification(config_raw)
+        evidence = json.loads(qualification.evidence_raw)
+        self.assertEqual(
+            evidence["message"], recovery.SHUTDOWN_RACE_REVIEWED_KERNEL_MESSAGE
+        )
+        self.assertIn(
+            recovery.SHUTDOWN_RACE_REVIEWED_KERNEL_MESSAGE,
+            evidence["journal_record"],
+        )
+        self.assertEqual(
+            sum(item["count"] for item in evidence["controller_contract"]), 7
+        )
+        self.assertEqual(
+            evidence["detector_policy"],
+            {
+                recovery.DISABLED_DETECTOR: False,
+                recovery.REQUIRED_DETECTOR: True,
+            },
+        )
+
+    def test_shutdown_race_kernel_qualification_rejects_changed_boot(self):
+        config_raw = self.shutdown_race_config_raw()
+        with (
+            mock.patch.object(recovery, "_current_boot_id", return_value="other-boot"),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "another boot"),
+        ):
+            recovery._shutdown_race_kernel_qualification(config_raw)
+
+        completed = self.kernel_journal_result(boot_id="other-boot")
+        with (
+            mock.patch.object(
+                recovery,
+                "_current_boot_id",
+                return_value=recovery.SHUTDOWN_RACE_RECOVERY_BOOT_ID,
+            ),
+            mock.patch.object(
+                recovery, "_capture_kernel_cursor", return_value="review-cursor"
+            ),
+            mock.patch.object(recovery.subprocess, "run", return_value=completed),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "another boot"),
+        ):
+            recovery._shutdown_race_kernel_qualification(config_raw)
+
+    def test_shutdown_race_kernel_qualification_rejects_changed_detector_policy(self):
+        for disabled, required in ((True, True), (False, False), (None, True)):
+            config_raw = (
+                json.dumps(
+                    {
+                        "Detectors": {
+                            "detectors": {
+                                recovery.DISABLED_DETECTOR: disabled,
+                                recovery.REQUIRED_DETECTOR: required,
+                            }
+                        }
+                    },
+                    sort_keys=True,
+                ).encode()
+                + b"\n"
+            )
+            with (
+                self.subTest(disabled=disabled, required=required),
+                mock.patch.object(
+                    recovery,
+                    "_current_boot_id",
+                    return_value=recovery.SHUTDOWN_RACE_RECOVERY_BOOT_ID,
+                ),
+                self.assertRaisesRegex(recovery.RecoveryBlocked, "policy changed"),
+            ):
+                recovery._shutdown_race_kernel_qualification(config_raw)
+
+    def test_shutdown_race_kernel_qualification_rejects_event_variants(self):
+        config_raw = self.shutdown_race_config_raw()
+        variants = (
+            "i2c i2c-9: Failed to register i2c client ITE8853:00 at 0x40 (-16)",
+            "i2c i2c-8: Failed to register i2c client ITE8853:00 at 0x41 (-16)",
+            "i2c i2c-8: Failed to register i2c client ITE8853:00 at 0x40 (-5)",
+            "i2c i2c-8: Failed to register i2c client ITE8854:00 at 0x40 (-16)",
+            "i2c i2c-8: Failed to register i2c client ITE8853:00 at 0x40 (-16) changed",
+        )
+        for message in variants:
+            with (
+                self.subTest(message=message),
+                mock.patch.object(
+                    recovery,
+                    "_current_boot_id",
+                    return_value=recovery.SHUTDOWN_RACE_RECOVERY_BOOT_ID,
+                ),
+                mock.patch.object(
+                    recovery, "_capture_kernel_cursor", return_value="review-cursor"
+                ),
+                mock.patch.object(
+                    recovery.subprocess,
+                    "run",
+                    return_value=self.kernel_journal_result(message),
+                ),
+                self.assertRaisesRegex(recovery.RecoveryBlocked, "exact reviewed"),
+            ):
+                recovery._shutdown_race_kernel_qualification(config_raw)
+
+    def test_shutdown_race_kernel_qualification_rejects_additional_error(self):
+        config_raw = self.shutdown_race_config_raw()
+        completed = self.kernel_journal_result(
+            additional=("i801_smbus: controller timed out",)
+        )
+        with (
+            mock.patch.object(
+                recovery,
+                "_current_boot_id",
+                return_value=recovery.SHUTDOWN_RACE_RECOVERY_BOOT_ID,
+            ),
+            mock.patch.object(
+                recovery, "_capture_kernel_cursor", return_value="review-cursor"
+            ),
+            mock.patch.object(recovery.subprocess, "run", return_value=completed),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "exact reviewed"),
+        ):
+            recovery._shutdown_race_kernel_qualification(config_raw)
+
+    def test_shutdown_race_kernel_qualification_rejects_new_error(self):
+        config_raw = self.shutdown_race_config_raw()
+        completed = self.kernel_journal_result()
+        with (
+            mock.patch.object(
+                recovery,
+                "_current_boot_id",
+                return_value=recovery.SHUTDOWN_RACE_RECOVERY_BOOT_ID,
+            ),
+            mock.patch.object(
+                recovery, "_capture_kernel_cursor", return_value="review-cursor"
+            ),
+            mock.patch.object(recovery.subprocess, "run", return_value=completed),
+        ):
+            qualification = recovery._shutdown_race_kernel_qualification(config_raw)
+        with (
+            mock.patch.object(
+                recovery,
+                "_current_boot_id",
+                return_value=recovery.SHUTDOWN_RACE_RECOVERY_BOOT_ID,
+            ),
+            mock.patch.object(
+                recovery,
+                "_shutdown_race_relevant_kernel_records",
+                return_value=((recovery.SHUTDOWN_RACE_REVIEWED_KERNEL_MESSAGE, "{}"),),
+            ),
+            mock.patch.object(
+                recovery,
+                "_kernel_history_after_observation",
+                side_effect=recovery.RecoveryBlocked("new relevant kernel error"),
+            ),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "new relevant"),
+        ):
+            recovery._verify_shutdown_race_kernel_qualification(
+                qualification, config_raw
+            )
+
+    def test_global_kernel_error_policy_still_rejects_reviewed_registration(self):
+        completed = subprocess.CompletedProcess(
+            [], 0, recovery.SHUTDOWN_RACE_REVIEWED_KERNEL_MESSAGE + "\n", ""
+        )
+        with (
+            mock.patch.object(recovery.subprocess, "run", return_value=completed),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "communication errors"),
+        ):
+            recovery._kernel_errors_since(recovery.SHUTDOWN_RACE_FAILURE_TIME)
+
+    def test_shutdown_race_preflight_accepts_only_later_clean_boot_boundary(self):
+        incident, boundary_raw, _ = self.write_shutdown_race_records()
+        historical = b'{"category":"reviewed-old-boot-shutdown-race"}\n'
+        qualification = recovery.ShutdownRaceKernelQualification(
+            b'{"category":"reviewed-unrelated-ite8853-registration"}\n',
+            "cursor",
+        )
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery, "_classify_shutdown_race_incident", return_value=incident
+            ),
+            mock.patch.object(
+                recovery,
+                "_verify_shutdown_race_corrected_source",
+                return_value="f" * 40,
+            ),
+            mock.patch.object(
+                recovery, "_current_boot_id", return_value="current-boot"
+            ),
+            mock.patch.object(recovery, "_process_start", return_value=None),
+            mock.patch.object(
+                recovery,
+                "_verify_lifecycle_environment",
+                return_value=self.config_raw,
+            ) as environment,
+            mock.patch.object(
+                recovery,
+                "_shutdown_race_kernel_qualification",
+                return_value=qualification,
+            ),
+            mock.patch.object(
+                recovery,
+                "_verify_four_spd_endpoints",
+                return_value={
+                    endpoint: 40_000 for endpoint in recovery.TRANSIENT_SPD_ENDPOINTS
+                },
+            ) as spd,
+            mock.patch.object(
+                recovery,
+                "_shutdown_race_historical_evidence",
+                return_value=historical,
+            ),
+            mock.patch.object(
+                recovery, "_detector_policy_is_reviewed", return_value=self.config_raw
+            ),
+        ):
+            binding = recovery._shutdown_race_recovery_preflight(
+                require_preference_off=False
+            )
+        self.assertEqual(binding.boundary_raw, boundary_raw)
+        self.assertEqual(binding.current_boot_id, "current-boot")
+        self.assertEqual(binding.current_boot_kernel, qualification)
+        environment.assert_called_once_with(
+            incident.failure_time, check_kernel_history=False
+        )
+        spd.assert_called_once_with()
+
+        with (
+            mock.patch.object(
+                recovery,
+                "_current_boot_id",
+                return_value=recovery.SHUTDOWN_RACE_OLD_BOOT_ID,
+            ),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "later clean boot"),
+        ):
+            recovery._verify_shutdown_race_boundary(json.loads(boundary_raw))
+
+    def test_shutdown_race_requires_authenticated_shutdown_journal_without_crash(self):
+        journal = (
+            "System is rebooting\n"
+            "Stopping Omarchy+ OpenRGB lifecycle\n"
+            "Timed out acquiring the RAM Tetris write gate for shutdown\n"
+            "OpenRGB server stopped for deliberate lifecycle shutdown\n"
+            "omarchy-plus-openrgb-presets.service: Main process exited"
+        )
+        with mock.patch.object(
+            recovery, "_shutdown_race_journal_slice", side_effect=(journal, "")
+        ):
+            evidence = recovery._shutdown_race_historical_evidence()
+        self.assertIn(b"reviewed-old-boot-shutdown-race", evidence)
+
+        with (
+            mock.patch.object(
+                recovery,
+                "_shutdown_race_journal_slice",
+                side_effect=(journal + "\nopenrgb segfault core dumped", ""),
+            ),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "crash"),
+        ):
+            recovery._shutdown_race_historical_evidence()
+
+    def test_shutdown_race_prepare_returns_incident_bound_confirmation(self):
+        binding = self.shutdown_race_binding()
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery, "_shutdown_race_recovery_preflight", return_value=binding
+            ),
+        ):
+            value = recovery.prepare_document()
+        self.assertEqual(value["recovery_kind"], "old-boot-shutdown-race")
+        self.assertEqual(value["incident_reference"], recovery.SHUTDOWN_RACE_REFERENCE)
+        self.assertEqual(
+            value["confirmation_token"],
+            recovery._shutdown_race_confirmation_token(binding),
+        )
+
+    def test_unrelated_sdk_latch_never_uses_shutdown_race_recovery(self):
+        self.write_failure(recovery.SHUTDOWN_RACE_REASON)
+        with (
+            self.patched_environment(),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "not the reviewed"),
+        ):
+            recovery.prepare_document()
+
+    def test_shutdown_race_recovery_preserves_then_acknowledges_starts_once(self):
+        binding = self.shutdown_race_binding()
+        token = recovery._shutdown_race_confirmation_token(binding)
+        commands: list[list[str]] = []
+
+        def run(command, **_kwargs):
+            commands.append(command)
+            evidence = self.failure.parent / "recovery-evidence"
+            self.assertEqual(
+                (
+                    evidence / f"{recovery.SHUTDOWN_RACE_REFERENCE}.failure.json"
+                ).read_bytes(),
+                binding.incident.failure_raw,
+            )
+            self.assertEqual(
+                (
+                    evidence
+                    / f"{recovery.SHUTDOWN_RACE_REFERENCE}.lifecycle-state.json"
+                ).read_bytes(),
+                binding.boundary_raw,
+            )
+            self.assertEqual(
+                (
+                    evidence / f"{recovery.SHUTDOWN_RACE_REFERENCE}.openrgb-config.json"
+                ).read_bytes(),
+                binding.config_raw,
+            )
+            self.assertEqual(
+                (
+                    evidence
+                    / f"{recovery.SHUTDOWN_RACE_REFERENCE}.shutdown-race-journal.json"
+                ).read_bytes(),
+                binding.historical_journal_raw,
+            )
+            retained_kernel = (
+                evidence
+                / f"{recovery.SHUTDOWN_RACE_REFERENCE}.current-boot-kernel-qualification.json"
+            ).read_bytes()
+            self.assertEqual(retained_kernel, binding.current_boot_kernel.evidence_raw)
+            self.assertIn(
+                recovery.SHUTDOWN_RACE_REVIEWED_KERNEL_MESSAGE.encode(),
+                retained_kernel,
+            )
+            self.assertEqual(
+                (self.failure.parent / "ram-tetris-enabled").read_bytes(), b"off\n"
+            )
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        acknowledged = {
+            "boot_id": binding.current_boot_id,
+            "reason": "acknowledged-reviewed-recovery",
+            "state": "clean-stopped",
+        }
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery,
+                "_shutdown_race_recovery_preflight",
+                side_effect=(binding, binding),
+            ) as preflight,
+            mock.patch.object(recovery.subprocess, "run", side_effect=run),
+            mock.patch.object(
+                recovery, "_read_service_state", return_value=acknowledged
+            ),
+            mock.patch.object(
+                recovery, "_wait_for_authoritative_lifecycle_ready"
+            ) as wait,
+            mock.patch.object(
+                recovery,
+                "_verify_shutdown_race_running_continuity",
+                side_effect=(b"ready-state\n", b"ready-state\n"),
+            ) as continuity,
+            mock.patch.object(
+                recovery, "_verify_shutdown_race_kernel_qualification"
+            ) as kernel,
+            mock.patch.object(recovery, "_verify_service_and_hardware") as health,
+        ):
+            value = recovery._recover_shutdown_race(token)
+        self.assertEqual(value["state"], "recovered")
+        self.assertFalse(self.failure.exists())
+        self.assertEqual(preflight.call_count, 2)
+        wait.assert_called_once()
+        self.assertEqual(continuity.call_count, 2)
+        kernel.assert_called_once_with(binding.current_boot_kernel, binding.config_raw)
+        health.assert_called_once_with(None)
+        self.assertEqual(
+            commands,
+            [
+                [
+                    recovery.SERVICE_GUARD,
+                    "acknowledge-reviewed-recovery",
+                    "--acknowledge-reviewed-recovery",
+                ],
+                [recovery.SYSTEMCTL, "--user", "start", recovery.SERVICE_NAME],
+            ],
+        )
+
+    def test_shutdown_race_failed_readiness_never_retries_or_clears_latch(self):
+        binding = self.shutdown_race_binding()
+        token = recovery._shutdown_race_confirmation_token(binding)
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        acknowledged = {
+            "boot_id": binding.current_boot_id,
+            "reason": "acknowledged-reviewed-recovery",
+            "state": "clean-stopped",
+        }
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery,
+                "_shutdown_race_recovery_preflight",
+                side_effect=(binding, binding),
+            ),
+            mock.patch.object(
+                recovery.subprocess, "run", return_value=completed
+            ) as run,
+            mock.patch.object(
+                recovery, "_read_service_state", return_value=acknowledged
+            ),
+            mock.patch.object(
+                recovery,
+                "_wait_for_authoritative_lifecycle_ready",
+                side_effect=recovery.RecoveryBlocked("readiness failed"),
+            ),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "readiness failed"),
+        ):
+            recovery._recover_shutdown_race(token)
+        self.assertEqual(self.failure.read_bytes(), binding.incident.failure_raw)
+        self.assertEqual(
+            (self.failure.parent / "ram-tetris-enabled").read_bytes(), b"off\n"
+        )
+        starts = [
+            call
+            for call in run.call_args_list
+            if call.args[0]
+            == [
+                recovery.SYSTEMCTL,
+                "--user",
+                "start",
+                recovery.SERVICE_NAME,
+            ]
+        ]
+        self.assertEqual(len(starts), 1)
+        evidence = self.failure.parent / "recovery-evidence"
+        self.assertTrue(
+            (evidence / f"{recovery.SHUTDOWN_RACE_REFERENCE}.failure.json").is_file()
+        )
 
     def test_display_code_alone_never_grants_eligibility(self):
         raw = self.write_failure("unreviewed failure")

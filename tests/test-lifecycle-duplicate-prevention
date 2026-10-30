@@ -451,6 +451,40 @@ test_deliberate_cleanup_stops_verified_server() {
   [[ "${server_origin}" == none ]]
 }
 
+test_failed_tetris_quiescence_skips_sdk_teardown() (
+  start_server >/dev/null
+  local owned_pid="${server_pid}"
+  stop_tetris() {
+    return 1
+  }
+  verify_tetris_lock_released() {
+    return 1
+  }
+  if cleanup deliberate >/dev/null; then
+    return 1
+  fi
+  [[ ! -s "${SIGNAL_LOG}" ]]
+  [[ -d "${PROC_FIXTURE}/${owned_pid}" ]]
+  [[ "${server_pid}" == "${owned_pid}" ]]
+)
+
+test_writer_exit_immediately_before_sdk_teardown_is_accepted() (
+  start_server >/dev/null
+  local owned_pid="${server_pid}"
+  tetris_pid=4998
+  tetris_start_time=8998
+  stop_tetris() {
+    clear_tetris_identity
+    return 0
+  }
+  verify_tetris_lock_released() {
+    return 0
+  }
+  cleanup deliberate >/dev/null
+  [[ "$(<"${SIGNAL_LOG}")" == "-TERM ${owned_pid}" ]]
+  [[ ! -d "${PROC_FIXTURE}/${owned_pid}" ]]
+)
+
 test_slow_sdk_exit_is_reaped_within_bound() {
   start_server >/dev/null
   local owned_pid="${server_pid}"
@@ -514,10 +548,12 @@ run_test 'identity change between checks is persisted without signaling' test_li
 run_test 'repeated shell reloads do not launch duplicates' test_repeated_handoffs_do_not_duplicate
 run_test 'existing duplicate-server prevention remains active' test_duplicate_start_reuses_listener
 run_test 'deliberate cleanup stops only the verified SDK' test_deliberate_cleanup_stops_verified_server
+run_test 'failed Tetris quiescence prevents deliberate SDK teardown' test_failed_tetris_quiescence_skips_sdk_teardown
+run_test 'writer exit immediately before SDK teardown is accepted' test_writer_exit_immediately_before_sdk_teardown_is_accepted
 run_test 'slow SDK exit remains inside the bounded wait' test_slow_sdk_exit_is_reaped_within_bound
 run_test 'SDK ignoring TERM receives bounded SIGKILL escalation' test_sdk_ignoring_term_is_killed_within_bound
 run_test 'overall shutdown deadline fails closed without an unbounded wait' test_overall_deadline_fails_closed
 run_test 'an SDK child retaining the listener prevents clean shutdown' test_lingering_sdk_listener_fails_closed
 
-[[ "${pass_count}" -eq 19 ]]
+[[ "${pass_count}" -eq 21 ]]
 /usr/bin/printf 'SDK ownership lifecycle: PASS (%s signal-free cases)\n' "${pass_count}"

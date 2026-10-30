@@ -35,7 +35,7 @@ core = importlib.import_module("ram_tetris_core")
 
 HOST = "127.0.0.1"
 PORT = 6742
-SOURCE_VERSION = "0.4.31"
+SOURCE_VERSION = "0.4.34"
 SOURCE_PATH = "ram-tetris"
 EXPECTED_CONTROLLER_COUNT = 7
 HARDWARE_GATE_ATTEMPTS = 15
@@ -1590,6 +1590,19 @@ def _run(args: argparse.Namespace) -> int:
             )
             writer.run()
         except SafetyStop as error:
+            if writer is not None:
+                try:
+                    request = writer._validated_stop_request()
+                except SafetyStop:
+                    request = None
+                if request is not None and request.reason in LIFECYCLE_STOP_REASONS:
+                    control.status(
+                        "stopped",
+                        f"RAM Tetris stopped for {request.reason}",
+                        preset=writer.preset,
+                        writes=writer.animation_writes,
+                    )
+                    return 0
             evidence = writer.failure_evidence(error) if writer is not None else None
             control.fail(str(error), evidence)
             print(f"RAM Tetris stopped without restoration: {error}", file=sys.stderr)

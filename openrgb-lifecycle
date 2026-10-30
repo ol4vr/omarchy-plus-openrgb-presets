@@ -45,6 +45,7 @@ readonly USER_MANAGER_COMMAND="${USER_MANAGER_COMMAND:-/usr/lib/systemd/systemd 
 readonly RESTORE_TIMEOUT="75s"
 readonly RESUME_DELAY="${OPENRGB_RESUME_DELAY:-3}"
 readonly SHUTDOWN_BUDGET_SECONDS=15
+readonly TETRIS_WRITE_GATE_WAIT_SECONDS="${OPENRGB_TETRIS_WRITE_GATE_WAIT_SECONDS:-5}"
 readonly -a OPENRGB_SERVER_ARGS=(
   --noautoconnect
   --startminimized
@@ -587,6 +588,18 @@ stop_tetris() {
   if [[ "${reason}" == @(handoff|suspend|shutdown) ]]; then
     lifecycle_start="$(process_start_time $$)"
     is_server_listener "${server_pid}" "${server_start_time}" || return 1
+    stop_temp="${TETRIS_STOP_FILE}.$$"
+    stop_time="${EPOCHREALTIME}"
+    if ! (
+      umask 077
+      /usr/bin/printf \
+        '{"lifecycle_pid":%s,"lifecycle_start":"%s","reason":"%s","server_pid":%s,"server_start":"%s","time":%s}\n' \
+        "$$" "${lifecycle_start}" "${reason}" \
+        "${server_pid}" "${server_start_time}" "${stop_time}" >"${stop_temp}"
+    ) || ! "${MV_BIN}" -f -- "${stop_temp}" "${TETRIS_STOP_FILE}"; then
+      log "Failed to establish authenticated RAM Tetris ${reason} intent"
+      return 1
+    fi
     old_umask="$(umask)"
     umask 077
     exec {stop_lock_fd}>"${TETRIS_WRITE_LOCK_FILE}"
@@ -597,25 +610,12 @@ stop_tetris() {
       log "Lifecycle shutdown deadline expired before the RAM Tetris write gate was acquired"
       return 1
     fi
-    if ((lock_wait > 2)); then
-      lock_wait=2
+    if ((lock_wait > TETRIS_WRITE_GATE_WAIT_SECONDS)); then
+      lock_wait="${TETRIS_WRITE_GATE_WAIT_SECONDS}"
     fi
     if ! "${FLOCK_BIN}" --wait "${lock_wait}" "${stop_lock_fd}"; then
       close_fd "${stop_lock_fd}"
       log "Timed out acquiring the RAM Tetris write gate for ${reason}"
-      return 1
-    fi
-    stop_temp="${TETRIS_STOP_FILE}.$$"
-    stop_time="${EPOCHREALTIME}"
-    if ! (
-      umask 077
-      /usr/bin/printf \
-        '{"lifecycle_pid":%s,"lifecycle_start":"%s","reason":"%s","server_pid":%s,"server_start":"%s","time":%s}\n' \
-        "$$" "${lifecycle_start}" "${reason}" \
-        "${server_pid}" "${server_start_time}" "${stop_time}" >"${stop_temp}"
-    ) || ! "${MV_BIN}" -f -- "${stop_temp}" "${TETRIS_STOP_FILE}"; then
-      close_fd "${stop_lock_fd}"
-      log "Failed to establish authenticated RAM Tetris ${reason} stop"
       return 1
     fi
     close_fd "${stop_lock_fd}"
@@ -1083,10 +1083,10 @@ handle_sleep_signal() {
     fi
     suspended=true
     log "PrepareForSleep(true): stopping OpenRGB"
-    if ! stop_tetris suspend; then
+    if ! stop_tetris suspend || ! verify_tetris_lock_released; then
       /usr/bin/printf '%s\n' 'RAM Tetris could not be stopped safely before sleep' >&2
-    fi
-    if ! stop_server 'suspend'; then
+      /usr/bin/printf '%s\n' 'OpenRGB SDK teardown skipped because RAM Tetris still owns shutdown state' >&2
+    elif ! stop_server 'suspend'; then
       /usr/bin/printf '%s\n' 'OpenRGB could not be stopped safely before sleep' >&2
     fi
     release_inhibitor
@@ -1138,6 +1138,7 @@ cleanup() {
   local mode="${1:-handoff}"
   local tetris_reason='handoff'
   local failed=false
+  local tetris_quiesced=true
 
   if [[ "${shutting_down}" == true ]]; then
     return 0
@@ -1150,15 +1151,27 @@ cleanup() {
   mark_service_state stopping "${mode}" || failed=true
   notify_service_status "Stopping OpenRGB lifecycle (${mode})" || true
 
-  stop_tetris "${tetris_reason}" || failed=true
-  verify_tetris_lock_released || failed=true
+  if ! stop_tetris "${tetris_reason}"; then
+    failed=true
+    tetris_quiesced=false
+  fi
+  if ! verify_tetris_lock_released; then
+    failed=true
+    tetris_quiesced=false
+  fi
 
   case "${mode}" in
     handoff)
-      detach_server || failed=true
+      if [[ "${tetris_quiesced}" == true ]]; then
+        detach_server || failed=true
+      fi
       ;;
     deliberate)
-      stop_server 'deliberate lifecycle shutdown' || failed=true
+      if [[ "${tetris_quiesced}" == true ]]; then
+        stop_server 'deliberate lifecycle shutdown' || failed=true
+      else
+        log 'OpenRGB SDK teardown skipped because RAM Tetris did not quiesce'
+      fi
       ;;
     *)
       /usr/bin/printf 'Unknown cleanup mode: %s\n' "${mode}" >&2

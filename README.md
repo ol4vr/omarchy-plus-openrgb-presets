@@ -523,6 +523,41 @@ existing readiness rules. Package qualification now requires exactly
 Unknown, malformed, persistent-hardware, and unreviewed controller failures
 remain blocked with the backend's specific refusal.
 
+Version 0.4.34 corrects the shutdown ordering that produced incident
+`LR-D9EEF3E29A1F07C9`. The lifecycle now publishes its authenticated shutdown
+intent before waiting a bounded time for the exclusive write gate. It tears
+down the SDK only after the writer has exited and released both writer and
+write ownership; a timeout remains an incomplete, fail-closed shutdown and no
+longer proceeds as if quiescence succeeded. If an SDK identity check races with
+an already-authenticated lifecycle shutdown, the writer exits cleanly instead
+of creating an unexpected-death latch. Missing, malformed, mismatched, or
+absent shutdown intent still latches genuine SDK or ownership loss.
+
+The normal Recover dispatcher gains one incident-specific path for that exact
+old-boot latch. Eligibility is bound to its raw SHA-256, source provenance,
+old boot and lifecycle/SDK identities, deliberate-shutdown journal, preserved
+failed service boundary, patched source, reviewed package and executable,
+zero writers and locks, Tetris OFF before mutation, four readable SPD5118
+endpoints, and clean current-boot hardware history. Recovery preserves the
+complete original latch, lifecycle, configuration, and journal evidence,
+repeats preflight, acknowledges only the stale boundary, and performs exactly
+one service start. It requires authoritative lifecycle readiness, seven
+controllers, four SPD endpoints, SDK ownership, and Effects restoration twice
+before removing only the unchanged latch. Any failed gate leaves the latch and
+evidence in place with no retry. Tetris remains OFF, and unrelated SDK failures
+remain ineligible.
+
+For that incident alone, current boot
+`8f7fdab1-de77-4db2-864c-ea5ce41a279c` may contain exactly the retained
+registration message `i2c i2c-8: Failed to register i2c client ITE8853:00 at
+0x40 (-16)`. Qualification binds its complete journal record and cursor to the
+reviewed detector policy and the seven accepted controller interfaces, none of
+which uses `i2c-8` address `0x40`. The protected recovery evidence retains that
+record. Any changed or additional I2C, I801, SMBus, SPD5118, controller, or
+ownership failure remains blocking, as does every new relevant kernel event
+after the qualification cursor. The global kernel-error classifier and all
+other recovery categories remain unchanged.
+
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
 The experimental orange, blue, and red Sunrise gradients are therefore stored
@@ -1086,6 +1121,15 @@ and the `openrgb-hugin` package binding. It restores the two administrative
 transient-SPD commands and their existing evidence. Preserve the current latch,
 preference, observations, and retained evidence. Rollback does not authorize a
 service operation, RGB write, preset change, or latch clearance.
+
+## Roll back the 0.4.34 shutdown-ordering correction
+
+Redeploy exact published v0.4.33 commit
+`2aa7068e419fc1179b450cf7cea34864f5709d0f`. This removes the corrected
+shutdown ordering and the exact `LR-D9EEF3E29A1F07C9` recovery qualification.
+Preserve the old-boot latch and every retained evidence artifact. Rollback does
+not authorize a service operation, latch clearance, RGB write, preset change,
+or Tetris activation.
 
 ## Remove
 
