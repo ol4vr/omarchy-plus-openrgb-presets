@@ -1385,6 +1385,84 @@ class LightingRecoveryTests(unittest.TestCase):
         ):
             recovery._shutdown_race_historical_evidence()
 
+    def test_shutdown_race_historical_journal_argument_contract(self):
+        canonical_boot_id = "b9e66617-6750-4fe0-be09-ff54467b5ac5"
+        compact_boot_id = canonical_boot_id.replace("-", "")
+        suffix = [
+            f"--since=@{recovery.SHUTDOWN_RACE_BOUNDARY_TIME - 5}",
+            f"--until=@{recovery.SHUTDOWN_RACE_FAILURE_TIME + 10}",
+            "--output=short-unix",
+            "--no-pager",
+        ]
+        expected_journal = [recovery.JOURNALCTL, "--boot", compact_boot_id, *suffix]
+        expected_kernel = [
+            recovery.JOURNALCTL,
+            "--boot",
+            compact_boot_id,
+            "-k",
+            *suffix,
+        ]
+        journal = (
+            "System is rebooting\n"
+            "Stopping Omarchy+ OpenRGB lifecycle\n"
+            "Timed out acquiring the RAM Tetris write gate for shutdown\n"
+            "OpenRGB server stopped for deliberate lifecycle shutdown\n"
+            "omarchy-plus-openrgb-presets.service: Main process exited"
+        )
+
+        def strict_journalctl(command, **_kwargs):
+            if canonical_boot_id in command:
+                return subprocess.CompletedProcess(command, 1, "", "Invalid argument\n")
+            if "--kernel" in command:
+                return subprocess.CompletedProcess(
+                    command, 1, "", "journalctl: unrecognized option '--kernel'\n"
+                )
+            if command == expected_journal:
+                return subprocess.CompletedProcess(command, 0, journal, "")
+            if command == expected_kernel:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return subprocess.CompletedProcess(command, 2, "", "unexpected argv\n")
+
+        self.assertEqual(
+            strict_journalctl(
+                [recovery.JOURNALCTL, "--boot", canonical_boot_id, *suffix]
+            ).returncode,
+            1,
+        )
+        self.assertEqual(
+            strict_journalctl(
+                [recovery.JOURNALCTL, "--boot", compact_boot_id, "--kernel", *suffix]
+            ).returncode,
+            1,
+        )
+        with mock.patch.object(
+            recovery.subprocess, "run", side_effect=strict_journalctl
+        ) as journalctl:
+            evidence_raw = recovery._shutdown_race_historical_evidence()
+        self.assertEqual(
+            [call.args[0] for call in journalctl.call_args_list],
+            [expected_journal, expected_kernel],
+        )
+        evidence = json.loads(evidence_raw)
+        self.assertEqual(evidence["boot_id"], canonical_boot_id)
+        for marker in (
+            "System is rebooting",
+            "Stopping Omarchy+ OpenRGB lifecycle",
+            "Timed out acquiring the RAM Tetris write gate for shutdown",
+            "OpenRGB server stopped for deliberate lifecycle shutdown",
+            "omarchy-plus-openrgb-presets.service: Main process exited",
+        ):
+            self.assertIn(marker, evidence["journal"])
+
+        failed = subprocess.CompletedProcess([], 1, "", "journal failure")
+        with (
+            mock.patch.object(recovery.subprocess, "run", return_value=failed),
+            self.assertRaisesRegex(
+                recovery.RecoveryBlocked, "historical shutdown journal is unreadable"
+            ),
+        ):
+            recovery._shutdown_race_historical_evidence()
+
     def test_shutdown_race_prepare_returns_incident_bound_confirmation(self):
         binding = self.shutdown_race_binding()
         with (
