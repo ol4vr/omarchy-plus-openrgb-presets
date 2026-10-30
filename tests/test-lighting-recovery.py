@@ -16,6 +16,7 @@ import tempfile
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -166,11 +167,31 @@ class LightingRecoveryTests(unittest.TestCase):
     def shutdown_race_binding(self) -> recovery.ShutdownRaceRecoveryBinding:
         incident, boundary_raw, config_raw = self.write_shutdown_race_records()
         historical = b'{"category":"reviewed-old-boot-shutdown-race"}\n'
+        journal_record = json.dumps(
+            {
+                "MESSAGE": recovery.SHUTDOWN_RACE_REVIEWED_KERNEL_MESSAGE,
+                "_BOOT_ID": recovery.SHUTDOWN_RACE_RECOVERY_BOOT_ID.replace("-", ""),
+                "__CURSOR": "reviewed-record-cursor",
+            },
+            sort_keys=True,
+        )
         kernel = recovery.ShutdownRaceKernelQualification(
             evidence_raw=(
                 json.dumps(
                     {
+                        "schema_version": 1,
                         "category": "reviewed-unrelated-ite8853-registration",
+                        "boot_id": recovery.SHUTDOWN_RACE_RECOVERY_BOOT_ID,
+                        "controller_contract": recovery.SHUTDOWN_RACE_CONTROLLER_CONTRACT,
+                        "detector_policy": {
+                            recovery.DISABLED_DETECTOR: False,
+                            recovery.REQUIRED_DETECTOR: True,
+                        },
+                        "detector_policy_sha256": hashlib.sha256(
+                            config_raw
+                        ).hexdigest(),
+                        "journal_cursor": "qualification-cursor",
+                        "journal_record": journal_record,
                         "message": recovery.SHUTDOWN_RACE_REVIEWED_KERNEL_MESSAGE,
                     },
                     sort_keys=True,
@@ -1479,6 +1500,151 @@ class LightingRecoveryTests(unittest.TestCase):
             recovery._shutdown_race_confirmation_token(binding),
         )
 
+    def test_shutdown_race_confirmation_accepts_cursor_only_advancement(self):
+        prepared_binding = self.shutdown_race_binding()
+        advanced_document = json.loads(
+            prepared_binding.current_boot_kernel.evidence_raw
+        )
+        advanced_document["journal_cursor"] = "advanced-qualification-cursor"
+        advanced_kernel = recovery.ShutdownRaceKernelQualification(
+            evidence_raw=(
+                json.dumps(advanced_document, sort_keys=True).encode() + b"\n"
+            ),
+            journal_cursor="advanced-qualification-cursor",
+        )
+        recover_binding = replace(prepared_binding, current_boot_kernel=advanced_kernel)
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery,
+                "_shutdown_race_recovery_preflight",
+                return_value=prepared_binding,
+            ),
+        ):
+            prepared = recovery.prepare_document()
+
+        class TokenAccepted(Exception):
+            pass
+
+        original_evidence = prepared_binding.current_boot_kernel.evidence_raw
+        with (
+            mock.patch.object(
+                recovery,
+                "_shutdown_race_recovery_preflight",
+                return_value=recover_binding,
+            ),
+            mock.patch.object(
+                recovery, "_preserve_evidence", side_effect=TokenAccepted
+            ) as preserve,
+            mock.patch.object(recovery, "_atomic_text") as atomic_text,
+            mock.patch.object(recovery.subprocess, "run") as service_operation,
+            self.assertRaises(TokenAccepted),
+        ):
+            recovery._recover_shutdown_race(prepared["confirmation_token"])
+        preserve.assert_called_once()
+        atomic_text.assert_not_called()
+        service_operation.assert_not_called()
+        self.assertEqual(
+            prepared_binding.current_boot_kernel.evidence_raw, original_evidence
+        )
+        self.assertEqual(
+            json.loads(original_evidence)["journal_cursor"], "qualification-cursor"
+        )
+
+    def test_shutdown_race_confirmation_binds_every_non_cursor_input(self):
+        binding = self.shutdown_race_binding()
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery, "_shutdown_race_recovery_preflight", return_value=binding
+            ),
+        ):
+            prepared = recovery.prepare_document()
+
+        def changed_kernel(change):
+            document = json.loads(binding.current_boot_kernel.evidence_raw)
+            change(document)
+            qualification = recovery.ShutdownRaceKernelQualification(
+                evidence_raw=(json.dumps(document, sort_keys=True).encode() + b"\n"),
+                journal_cursor=document["journal_cursor"],
+            )
+            return replace(binding, current_boot_kernel=qualification)
+
+        def changed_controller(document):
+            document["controller_contract"][0]["count"] += 1
+
+        def changed_policy(document):
+            document["detector_policy"][recovery.DISABLED_DETECTOR] = True
+
+        def changed_record(document):
+            record = json.loads(document["journal_record"])
+            record["MESSAGE"] += " changed"
+            document["journal_record"] = json.dumps(record, sort_keys=True)
+
+        cases = {
+            "latch": replace(
+                binding,
+                incident=replace(
+                    binding.incident,
+                    failure_raw=binding.incident.failure_raw + b"changed",
+                ),
+            ),
+            "historical": replace(
+                binding,
+                historical_journal_raw=binding.historical_journal_raw + b"changed",
+            ),
+            "controller": changed_kernel(changed_controller),
+            "policy": changed_kernel(changed_policy),
+            "kernel-record": changed_kernel(changed_record),
+        }
+        for name, changed_binding in cases.items():
+            with (
+                self.subTest(name=name),
+                mock.patch.object(
+                    recovery,
+                    "_shutdown_race_recovery_preflight",
+                    return_value=changed_binding,
+                ),
+                mock.patch.object(recovery, "_preserve_evidence") as preserve,
+                mock.patch.object(recovery, "_atomic_text") as atomic_text,
+                mock.patch.object(recovery.subprocess, "run") as service_operation,
+                self.assertRaisesRegex(
+                    recovery.RecoveryBlocked,
+                    "confirmation does not match this shutdown-race incident",
+                ),
+            ):
+                recovery._recover_shutdown_race(prepared["confirmation_token"])
+            preserve.assert_not_called()
+            atomic_text.assert_not_called()
+            service_operation.assert_not_called()
+
+    def test_shutdown_race_confirmation_evidence_must_be_complete(self):
+        binding = self.shutdown_race_binding()
+        document = json.loads(binding.current_boot_kernel.evidence_raw)
+        del document["journal_cursor"]
+        malformed_bindings = (
+            replace(
+                binding,
+                current_boot_kernel=recovery.ShutdownRaceKernelQualification(
+                    evidence_raw=b"{", journal_cursor="qualification-cursor"
+                ),
+            ),
+            replace(
+                binding,
+                current_boot_kernel=recovery.ShutdownRaceKernelQualification(
+                    evidence_raw=(
+                        json.dumps(document, sort_keys=True).encode() + b"\n"
+                    ),
+                    journal_cursor="qualification-cursor",
+                ),
+            ),
+        )
+        for malformed in malformed_bindings:
+            with self.assertRaisesRegex(
+                recovery.RecoveryBlocked, "kernel confirmation evidence"
+            ):
+                recovery._shutdown_race_confirmation_token(malformed)
+
     def test_unrelated_sdk_latch_never_uses_shutdown_race_recovery(self):
         self.write_failure(recovery.SHUTDOWN_RACE_REASON)
         with (
@@ -1526,6 +1692,10 @@ class LightingRecoveryTests(unittest.TestCase):
                 / f"{recovery.SHUTDOWN_RACE_REFERENCE}.current-boot-kernel-qualification.json"
             ).read_bytes()
             self.assertEqual(retained_kernel, binding.current_boot_kernel.evidence_raw)
+            self.assertEqual(
+                json.loads(retained_kernel)["journal_cursor"],
+                binding.current_boot_kernel.journal_cursor,
+            )
             self.assertIn(
                 recovery.SHUTDOWN_RACE_REVIEWED_KERNEL_MESSAGE.encode(),
                 retained_kernel,

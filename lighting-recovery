@@ -137,7 +137,7 @@ SHUTDOWN_RACE_SERVER_START: Final = "85366961"
 SHUTDOWN_RACE_WRITER_PID: Final = 394561
 SHUTDOWN_RACE_BOUNDARY_TIME: Final = 1793310621.0151148
 SHUTDOWN_RACE_FAILURE_TIME: Final = 1793310623.257292
-SHUTDOWN_RACE_CORRECTED_VERSION: Final = "0.4.37"
+SHUTDOWN_RACE_CORRECTED_VERSION: Final = "0.4.38"
 SHUTDOWN_RACE_CORRECTED_LIFECYCLE_SHA256: Final = (
     "d03cb8a1525ea70f0e296a2a6bd9cc10f6c4f69a8aee685e1a03a5fb17ada7b2"
 )
@@ -3677,6 +3677,37 @@ def _shutdown_race_recovery_preflight(
     )
 
 
+def _shutdown_race_confirmation_kernel_evidence(
+    qualification: ShutdownRaceKernelQualification,
+) -> bytes:
+    document = _json_record(
+        qualification.evidence_raw, "shutdown-race kernel confirmation evidence"
+    )
+    if (
+        set(document)
+        != {
+            "schema_version",
+            "category",
+            "boot_id",
+            "controller_contract",
+            "detector_policy",
+            "detector_policy_sha256",
+            "journal_cursor",
+            "journal_record",
+            "message",
+        }
+        or not isinstance(document.get("journal_cursor"), str)
+        or not document["journal_cursor"]
+        or document["journal_cursor"] != qualification.journal_cursor
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: shutdown-race kernel confirmation evidence is malformed."
+        )
+    projection = dict(document)
+    del projection["journal_cursor"]
+    return (json.dumps(projection, sort_keys=True) + "\n").encode()
+
+
 def _shutdown_race_confirmation_token(binding: ShutdownRaceRecoveryBinding) -> str:
     return hashlib.sha256(
         b"reviewed-old-boot-shutdown-race\0"
@@ -3688,7 +3719,7 @@ def _shutdown_race_confirmation_token(binding: ShutdownRaceRecoveryBinding) -> s
         + b"\0"
         + binding.historical_journal_raw
         + b"\0"
-        + binding.current_boot_kernel.evidence_raw
+        + _shutdown_race_confirmation_kernel_evidence(binding.current_boot_kernel)
         + b"\0"
         + binding.current_boot_id.encode()
     ).hexdigest()
