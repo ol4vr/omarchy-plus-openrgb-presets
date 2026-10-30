@@ -137,7 +137,7 @@ SHUTDOWN_RACE_SERVER_START: Final = "85366961"
 SHUTDOWN_RACE_WRITER_PID: Final = 394561
 SHUTDOWN_RACE_BOUNDARY_TIME: Final = 1793310621.0151148
 SHUTDOWN_RACE_FAILURE_TIME: Final = 1793310623.257292
-SHUTDOWN_RACE_CORRECTED_VERSION: Final = "0.4.38"
+SHUTDOWN_RACE_CORRECTED_VERSION: Final = "0.4.39"
 SHUTDOWN_RACE_CORRECTED_LIFECYCLE_SHA256: Final = (
     "d03cb8a1525ea70f0e296a2a6bd9cc10f6c4f69a8aee685e1a03a5fb17ada7b2"
 )
@@ -3683,6 +3683,14 @@ def _shutdown_race_confirmation_kernel_evidence(
     document = _json_record(
         qualification.evidence_raw, "shutdown-race kernel confirmation evidence"
     )
+    journal_record = document.get("journal_record")
+    try:
+        parsed_journal_record = (
+            json.loads(journal_record) if isinstance(journal_record, str) else None
+        )
+    except json.JSONDecodeError:
+        parsed_journal_record = None
+    expected_boot = SHUTDOWN_RACE_RECOVERY_BOOT_ID.replace("-", "").lower()
     if (
         set(document)
         != {
@@ -3699,12 +3707,20 @@ def _shutdown_race_confirmation_kernel_evidence(
         or not isinstance(document.get("journal_cursor"), str)
         or not document["journal_cursor"]
         or document["journal_cursor"] != qualification.journal_cursor
+        or not isinstance(parsed_journal_record, dict)
+        or parsed_journal_record.get("MESSAGE")
+        != SHUTDOWN_RACE_REVIEWED_KERNEL_MESSAGE
+        or not isinstance(parsed_journal_record.get("_BOOT_ID"), str)
+        or parsed_journal_record["_BOOT_ID"].lower() != expected_boot
     ):
         raise RecoveryBlocked(
             "Recovery blocked: shutdown-race kernel confirmation evidence is malformed."
         )
     projection = dict(document)
     del projection["journal_cursor"]
+    projection["journal_record"] = json.dumps(
+        parsed_journal_record, sort_keys=True, separators=(",", ":")
+    )
     return (json.dumps(projection, sort_keys=True) + "\n").encode()
 
 

@@ -1500,6 +1500,207 @@ class LightingRecoveryTests(unittest.TestCase):
             recovery._shutdown_race_confirmation_token(binding),
         )
 
+    def test_shutdown_race_cli_canonicalizes_nested_journal_record(self):
+        prepared_binding = self.shutdown_race_binding()
+
+        def kernel_binding(binding, change, *, cursor=None):
+            document = json.loads(binding.current_boot_kernel.evidence_raw)
+            change(document)
+            if cursor is not None:
+                document["journal_cursor"] = cursor
+            qualification = recovery.ShutdownRaceKernelQualification(
+                evidence_raw=(json.dumps(document, sort_keys=True).encode() + b"\n"),
+                journal_cursor=document["journal_cursor"],
+            )
+            return replace(binding, current_boot_kernel=qualification)
+
+        def reorder_record(document):
+            record = json.loads(document["journal_record"])
+            document["journal_record"] = json.dumps(
+                dict(reversed(tuple(record.items())))
+            )
+
+        recovered_binding = kernel_binding(
+            prepared_binding,
+            reorder_record,
+            cursor="advanced-qualification-cursor",
+        )
+
+        def cli_prepare(binding):
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                self.patched_environment(),
+                mock.patch.object(
+                    recovery,
+                    "_shutdown_race_recovery_preflight",
+                    return_value=binding,
+                ),
+                mock.patch.object(sys, "argv", ["lighting-recovery", "prepare"]),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                return recovery.main(), stdout, stderr
+
+        prepare_result, prepare_stdout, prepare_stderr = cli_prepare(prepared_binding)
+        self.assertEqual(prepare_result, 0)
+        self.assertEqual(prepare_stderr.getvalue(), "")
+        prepared = json.loads(prepare_stdout.getvalue())
+        token = prepared["confirmation_token"]
+        self.assertRegex(token, r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            token, recovery._shutdown_race_confirmation_token(recovered_binding)
+        )
+
+        submitted_tokens = []
+        preserved = {}
+
+        def validation_stub(submitted_token):
+            submitted_tokens.append(submitted_token)
+            return recovery._recover_shutdown_race(submitted_token)
+
+        def preserve(raw, _incident_reference, kind):
+            preserved[kind] = raw
+
+        class StopBeforeMutation(Exception):
+            pass
+
+        with (
+            self.patched_environment(),
+            mock.patch.object(recovery, "recover", side_effect=validation_stub),
+            mock.patch.object(
+                recovery,
+                "_shutdown_race_recovery_preflight",
+                return_value=recovered_binding,
+            ),
+            mock.patch.object(recovery, "_preserve_evidence", side_effect=preserve),
+            mock.patch.object(
+                recovery, "_atomic_text", side_effect=StopBeforeMutation
+            ) as atomic_text,
+            mock.patch.object(recovery, "_unlink_unchanged_latch") as latch_clear,
+            mock.patch.object(recovery.subprocess, "run") as runtime_operation,
+            mock.patch.object(
+                sys,
+                "argv",
+                ["lighting-recovery", "recover", "--confirm", token],
+            ),
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(io.StringIO()),
+            self.assertRaises(StopBeforeMutation),
+        ):
+            recovery.main()
+        self.assertEqual(submitted_tokens, [token])
+        atomic_text.assert_called_once()
+        latch_clear.assert_not_called()
+        runtime_operation.assert_not_called()
+        retained = preserved["current-boot-kernel-qualification"]
+        self.assertEqual(retained, recovered_binding.current_boot_kernel.evidence_raw)
+        retained_document = json.loads(retained)
+        prepared_document = json.loads(
+            prepared_binding.current_boot_kernel.evidence_raw
+        )
+        self.assertEqual(
+            retained_document["journal_cursor"], "advanced-qualification-cursor"
+        )
+        self.assertNotEqual(
+            retained_document["journal_record"],
+            prepared_document["journal_record"],
+        )
+        self.assertEqual(
+            json.loads(retained_document["journal_record"]),
+            json.loads(prepared_document["journal_record"]),
+        )
+        self.assertEqual(
+            retained_document["journal_record"],
+            json.loads(recovered_binding.current_boot_kernel.evidence_raw)[
+                "journal_record"
+            ],
+        )
+
+        def changed_record(document):
+            record = json.loads(document["journal_record"])
+            record["__CURSOR"] = "changed-reviewed-record-cursor"
+            document["journal_record"] = json.dumps(record)
+
+        rejected_bindings = {
+            "journal-field": kernel_binding(prepared_binding, changed_record),
+            "latch": replace(
+                prepared_binding,
+                incident=replace(
+                    prepared_binding.incident,
+                    failure_raw=prepared_binding.incident.failure_raw + b"changed",
+                ),
+            ),
+            "historical": replace(
+                prepared_binding,
+                historical_journal_raw=(
+                    prepared_binding.historical_journal_raw + b"changed"
+                ),
+            ),
+        }
+        for name, rejected_binding in rejected_bindings.items():
+            submitted_tokens.clear()
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                self.subTest(name=name),
+                self.patched_environment(),
+                mock.patch.object(recovery, "recover", side_effect=validation_stub),
+                mock.patch.object(
+                    recovery,
+                    "_shutdown_race_recovery_preflight",
+                    return_value=rejected_binding,
+                ),
+                mock.patch.object(recovery, "_preserve_evidence") as preserve_call,
+                mock.patch.object(recovery, "_atomic_text") as atomic_text,
+                mock.patch.object(recovery, "_unlink_unchanged_latch") as latch_clear,
+                mock.patch.object(recovery.subprocess, "run") as runtime_operation,
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    ["lighting-recovery", "recover", "--confirm", token],
+                ),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                result = recovery.main()
+            self.assertEqual(result, 1)
+            self.assertEqual(submitted_tokens, [token])
+            self.assertIn(
+                "confirmation does not match this shutdown-race incident",
+                stderr.getvalue(),
+            )
+            preserve_call.assert_not_called()
+            atomic_text.assert_not_called()
+            latch_clear.assert_not_called()
+            runtime_operation.assert_not_called()
+
+        missing_document = json.loads(prepared_binding.current_boot_kernel.evidence_raw)
+        del missing_document["journal_record"]
+        malformed_document = json.loads(
+            prepared_binding.current_boot_kernel.evidence_raw
+        )
+        malformed_document["journal_record"] = "{"
+        for name, document in (
+            ("missing", missing_document),
+            ("malformed", malformed_document),
+        ):
+            invalid_binding = replace(
+                prepared_binding,
+                current_boot_kernel=recovery.ShutdownRaceKernelQualification(
+                    evidence_raw=(
+                        json.dumps(document, sort_keys=True).encode() + b"\n"
+                    ),
+                    journal_cursor=prepared_binding.current_boot_kernel.journal_cursor,
+                ),
+            )
+            with self.subTest(name=name):
+                result, _stdout, stderr = cli_prepare(invalid_binding)
+                self.assertEqual(result, 1)
+                self.assertIn(
+                    "kernel confirmation evidence is malformed", stderr.getvalue()
+                )
+
     def test_shutdown_race_confirmation_accepts_cursor_only_advancement(self):
         prepared_binding = self.shutdown_race_binding()
         advanced_document = json.loads(
@@ -1578,7 +1779,7 @@ class LightingRecoveryTests(unittest.TestCase):
 
         def changed_record(document):
             record = json.loads(document["journal_record"])
-            record["MESSAGE"] += " changed"
+            record["__CURSOR"] += "-changed"
             document["journal_record"] = json.dumps(record, sort_keys=True)
 
         cases = {
