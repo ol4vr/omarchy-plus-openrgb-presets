@@ -1082,6 +1082,43 @@ class LightingRecoveryTests(unittest.TestCase):
             },
         )
 
+    def test_shutdown_race_journal_uses_compact_boot_id_and_fails_closed(self):
+        canonical_boot_id = "8f7fdab1-de77-4db2-864c-ea5ce41a279c"
+        completed = self.kernel_journal_result()
+        with mock.patch.object(
+            recovery.subprocess, "run", return_value=completed
+        ) as journalctl:
+            recovery._shutdown_race_relevant_kernel_records()
+        command = journalctl.call_args.args[0]
+        self.assertEqual(
+            command[command.index("--boot") + 1], canonical_boot_id.replace("-", "")
+        )
+        self.assertEqual(recovery.SHUTDOWN_RACE_RECOVERY_BOOT_ID, canonical_boot_id)
+
+        config_raw = self.shutdown_race_config_raw()
+        with (
+            mock.patch.object(
+                recovery, "_current_boot_id", return_value=canonical_boot_id
+            ),
+            mock.patch.object(
+                recovery, "_capture_kernel_cursor", return_value="review-cursor"
+            ),
+            mock.patch.object(recovery.subprocess, "run", return_value=completed),
+        ):
+            qualification = recovery._shutdown_race_kernel_qualification(config_raw)
+        self.assertEqual(
+            json.loads(qualification.evidence_raw)["boot_id"], canonical_boot_id
+        )
+
+        failed = subprocess.CompletedProcess([], 1, "", "invalid boot")
+        with (
+            mock.patch.object(recovery.subprocess, "run", return_value=failed),
+            self.assertRaisesRegex(
+                recovery.RecoveryBlocked, "kernel qualification is unreadable"
+            ),
+        ):
+            recovery._shutdown_race_relevant_kernel_records()
+
     def test_shutdown_race_kernel_qualification_rejects_changed_boot(self):
         config_raw = self.shutdown_race_config_raw()
         with (
