@@ -1,0 +1,7 @@
+1793310620.861490 hugin systemd[2624]: Started [systemd-run] /usr/bin/systemctl reboot --no-wall.
+1793310620.919455 hugin systemd[2624]: Stopping Omarchy+ OpenRGB lifecycle...
+1793310623.074989 hugin omarchy-plus-openrgb-presets[2526658]: Timed out acquiring the RAM Tetris write gate for shutdown
+1793310623.229992 hugin omarchy-plus-openrgb-presets[2526740]: OpenRGB server stopped for deliberate lifecycle shutdown
+1793310623.252327 hugin systemd[2624]: omarchy-plus-openrgb-presets.service: Main process exited, code=exited, status=1/FAILURE
+1793310623.324776 hugin omarchy-plus-openrgb-presets[2526814]: OpenRGB lifecycle stop incomplete: incomplete-lifecycle-exit
+1793310623.328328 hugin systemd[2624]: omarchy-plus-openrgb-presets.service: Failed with result 'exit-code'.

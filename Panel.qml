@@ -44,6 +44,8 @@ Panel {
   property string failureSubsystem: ""
   property string recoveryStatus: ""
   property string recoverySummary: ""
+  property string recoveryOutcome: ""
+  property string recoveryKind: ""
   property string recoveryAction: ""
   property string recoveryToken: ""
   property string recoveryFeedback: ""
@@ -228,7 +230,7 @@ Panel {
   }
 
   function applyPreset(presetId) {
-    if (actionProc.running || currentProc.running) return
+    if (lightingFailure || actionProc.running || currentProc.running) return
     pendingPreset = presetId
     processOutput = ""
     processError = ""
@@ -284,6 +286,8 @@ Panel {
       failureSubsystem = String(state.subsystem || "unknown")
       recoveryStatus = String(state.recovery_status || "")
       recoverySummary = String(state.recovery_summary || "")
+      recoveryOutcome = String(state.recovery_outcome || "")
+      recoveryKind = String(state.recovery_kind || "")
       if (previousReference !== "" && previousReference !== failureReference) {
         recoveryFeedback = ""
         recoveryAttemptBlocked = false
@@ -306,6 +310,8 @@ Panel {
       failureSubsystem = "unknown"
       recoveryStatus = "manual-review"
       recoverySummary = "Manual review is required."
+      recoveryOutcome = ""
+      recoveryKind = ""
     }
   }
 
@@ -314,8 +320,10 @@ Panel {
       return
     recoveryAttemptActive = true
     recoveryAttemptBlocked = false
-    recoveryAction = "prepare"
-    recoveryFeedback = "Checking recovery safety…"
+    recoveryAction = recoveryKind === "old-boot-incomplete-shutdown"
+      ? "recover" : "prepare"
+    recoveryFeedback = recoveryAction === "recover"
+      ? "Recovering safely…" : "Checking recovery safety…"
     recoveryProcessOutput = ""
     recoveryProcessError = ""
     recoveryProc.running = true
@@ -426,7 +434,9 @@ Panel {
   Process {
     id: recoveryProc
     command: root.recoveryAction === "recover"
-      ? [root.recoveryHelperPath, "recover", "--confirm", root.recoveryToken]
+      ? root.recoveryToken === ""
+        ? [root.recoveryHelperPath, "recover"]
+        : [root.recoveryHelperPath, "recover", "--confirm", root.recoveryToken]
       : root.recoveryAction === "copy-diagnostics"
         ? [root.recoveryHelperPath, "copy-diagnostics"]
         : [root.recoveryHelperPath, "prepare"]
@@ -723,6 +733,10 @@ Panel {
             : root.ramTetrisPreference ? "#9ECE6A" : "#565F89"
           readonly property string compactRecoveryStatus: root.recoveryAttemptActive
             ? "Recovery in progress"
+            : root.recoveryStatus === "partial-cleaned"
+              ? "Partial recovery cleaned up"
+              : root.recoveryStatus === "partial-active"
+                ? "Partial recovery still active"
             : root.recoveryAttemptBlocked || root.recoveryStatus === "blocked"
               ? "Recovery blocked"
               : root.recoveryStatus === "available"
@@ -792,7 +806,9 @@ Panel {
                   ? "· " + tetrisToggle.compactRecoveryStatus
                   : tetrisActionProc.running
                   ? "UPDATING…"
-                  : root.ramTetrisPreference ? "Active" : "Static lighting"
+                  : root.recoveryStatus === "completed"
+                    ? "Recovery completed successfully"
+                    : root.ramTetrisPreference ? "Active" : "Static lighting"
                 color: tetrisToggle.accentColor
                 font.family: root.contentFontFamily
                 font.pixelSize: Style.font.caption
@@ -1068,6 +1084,7 @@ Panel {
 
               width: presetGrid.cardWidth
               height: Style.space(60)
+              opacity: root.lightingFailure ? 0.46 : 1
               radius: Style.cornerRadius
               color: isActive
                 ? Qt.rgba(accentColor.r, accentColor.g, accentColor.b, 0.11)
@@ -1158,7 +1175,8 @@ Panel {
                 anchors.fill: parent
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
-                enabled: !actionProc.running && !currentProc.running
+                enabled: !root.lightingFailure
+                  && !actionProc.running && !currentProc.running
                 onEntered: root.selectedIndex = presetCard.index
                 onClicked: root.applyPreset(presetCard.modelData.id)
               }

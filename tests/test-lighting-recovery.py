@@ -250,6 +250,64 @@ class LightingRecoveryTests(unittest.TestCase):
     def patched_environment(self):
         return mock.patch.dict(os.environ, self.environment, clear=False)
 
+    def load_incomplete_shutdown_fixture(
+        self, name: str
+    ) -> tuple[bytes, bytes, str, str]:
+        fixture = ROOT / "tests/fixtures/incomplete-shutdown" / name
+        failure_raw = (fixture / "failure.json").read_bytes()
+        boundary_raw = (fixture / "boundary.json").read_bytes()
+        journal = (fixture / "journal.log").read_text(encoding="utf-8")
+        kernel = (fixture / "kernel.log").read_text(encoding="utf-8")
+        self.failure.parent.mkdir(parents=True, exist_ok=True)
+        self.failure.parent.chmod(0o700)
+        for path, raw in (
+            (self.failure, failure_raw),
+            (self.lifecycle_state, boundary_raw),
+            (self.failure.parent / "ram-tetris-enabled", b"on\n"),
+        ):
+            path.write_bytes(raw)
+            path.chmod(0o600)
+        return failure_raw, boundary_raw, journal, kernel
+
+    def generic_incomplete_binding(
+        self, fixture: str = "c21"
+    ) -> recovery.IncompleteShutdownRecoveryBinding:
+        failure_raw, _boundary_raw, journal, kernel = (
+            self.load_incomplete_shutdown_fixture(fixture)
+        )
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery, "_current_boot_id", return_value="current-boot"
+            ),
+            mock.patch.object(recovery, "_process_start", return_value=None),
+            mock.patch.object(
+                recovery,
+                "_source_blob_sha256",
+                return_value=(
+                    json.loads(failure_raw).get("source", {}).get("sha256", "")
+                ),
+            ),
+        ):
+            incident = recovery._classify_incomplete_shutdown_incident()
+        qualification = recovery.IncompleteShutdownCurrentQualification(
+            evidence_raw=b'{"category":"current-boot-incomplete-shutdown-qualification"}\n',
+            journal_cursor="current-kernel-cursor",
+        )
+        return recovery.IncompleteShutdownRecoveryBinding(
+            incident=incident,
+            config_raw=self.config_raw,
+            historical_journal_raw=(
+                json.dumps(
+                    {"journal": journal, "kernel": kernel}, sort_keys=True
+                ).encode()
+                + b"\n"
+            ),
+            current_qualification=qualification,
+            current_boot_id="current-boot",
+            installed_source_revision="f" * 40,
+        )
+
     def write_lifecycle_state(
         self,
         *,
@@ -2005,6 +2063,932 @@ class LightingRecoveryTests(unittest.TestCase):
         self.assertTrue(
             (evidence / f"{recovery.SHUTDOWN_RACE_REFERENCE}.failure.json").is_file()
         )
+
+    def test_generic_incomplete_shutdown_classifies_c21_and_d9_fixtures(self):
+        references = set()
+        for fixture in ("c21", "d9"):
+            with self.subTest(fixture=fixture):
+                failure_raw, _boundary_raw, journal, kernel = (
+                    self.load_incomplete_shutdown_fixture(fixture)
+                )
+                source_sha = json.loads(failure_raw).get("source", {}).get("sha256", "")
+                with (
+                    self.patched_environment(),
+                    mock.patch.object(
+                        recovery, "_current_boot_id", return_value="current-boot"
+                    ),
+                    mock.patch.object(recovery, "_process_start", return_value=None),
+                    mock.patch.object(
+                        recovery, "_source_blob_sha256", return_value=source_sha
+                    ),
+                ):
+                    incident = recovery._classify_incomplete_shutdown_incident()
+                    with mock.patch.object(
+                        recovery,
+                        "_incomplete_shutdown_journal_slice",
+                        side_effect=(journal, kernel),
+                    ):
+                        evidence = json.loads(
+                            recovery._incomplete_shutdown_historical_evidence(incident)
+                        )
+                self.assertEqual(
+                    incident.incident_reference,
+                    recovery._incident_reference(failure_raw),
+                )
+                self.assertEqual(
+                    incident.latch_sha256, hashlib.sha256(failure_raw).hexdigest()
+                )
+                self.assertEqual(
+                    evidence["category"], "old-boot-incomplete-lifecycle-shutdown"
+                )
+                references.add(incident.incident_reference)
+        self.assertEqual(len(references), 2)
+
+    def test_generic_incomplete_shutdown_accepts_synthetic_incident_identities(self):
+        references = set()
+        for index in range(2):
+            boundary_time = 1_800_000_000.0 + index * 100
+            failure_raw = (
+                json.dumps(
+                    {
+                        "message": (
+                            "OpenRGB lifecycle service did not complete its previous "
+                            "bounded shutdown"
+                        ),
+                        "pid": 9000 + index,
+                        "state": "failed",
+                        "time": boundary_time + 5,
+                    },
+                    sort_keys=True,
+                ).encode()
+                + b"\n"
+            )
+            boundary_raw = (
+                json.dumps(
+                    {
+                        "boot_id": f"old-boot-{index}",
+                        "lifecycle_pid": 100 + index,
+                        "lifecycle_start": f"life-{index}",
+                        "reason": "deliberate",
+                        "server_pid": 200 + index,
+                        "server_start": f"sdk-{index}",
+                        "state": "stopping",
+                        "stop_result": {
+                            "classification": "incomplete-lifecycle-exit",
+                            "service_result": "exit-code",
+                        },
+                        "time": boundary_time,
+                    },
+                    sort_keys=True,
+                ).encode()
+                + b"\n"
+            )
+            self.failure.parent.mkdir(parents=True, exist_ok=True)
+            self.failure.parent.chmod(0o700)
+            for path, raw in (
+                (self.failure, failure_raw),
+                (self.lifecycle_state, boundary_raw),
+            ):
+                path.write_bytes(raw)
+                path.chmod(0o600)
+            with (
+                self.subTest(index=index),
+                self.patched_environment(),
+                mock.patch.object(
+                    recovery, "_current_boot_id", return_value="current-boot"
+                ),
+                mock.patch.object(recovery, "_process_start", return_value=None),
+            ):
+                incident = recovery._classify_incomplete_shutdown_incident()
+            references.add(incident.incident_reference)
+            self.assertEqual(incident.old_boot_id, f"old-boot-{index}")
+        self.assertEqual(len(references), 2)
+
+    def test_generic_incomplete_shutdown_rejects_modified_and_unprotected_latches(self):
+        failure_raw, _boundary_raw, _journal, _kernel = (
+            self.load_incomplete_shutdown_fixture("c21")
+        )
+        changed = json.loads(failure_raw)
+        changed["time"] += 121
+        self.failure.write_text(json.dumps(changed) + "\n", encoding="utf-8")
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery, "_current_boot_id", return_value="current-boot"
+            ),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "do not correlate"),
+        ):
+            recovery._classify_incomplete_shutdown_incident()
+
+        self.failure.write_bytes(failure_raw)
+        self.failure.chmod(0o644)
+        with (
+            self.patched_environment(),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "not protected"),
+        ):
+            recovery._classify_incomplete_shutdown_incident()
+
+    def test_generic_incomplete_shutdown_rejects_hardware_and_sdk_crash_history(self):
+        self.load_incomplete_shutdown_fixture("c21")
+        failure = json.loads(self.failure.read_bytes())
+        failure["message"] = "10-0053 temperature is unreadable"
+        self.failure.write_text(json.dumps(failure) + "\n", encoding="utf-8")
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery, "_current_boot_id", return_value="current-boot"
+            ),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "not an incomplete"),
+        ):
+            recovery._classify_incomplete_shutdown_incident()
+
+        failure_raw, _boundary_raw, journal, kernel = (
+            self.load_incomplete_shutdown_fixture("d9")
+        )
+        source_sha = json.loads(failure_raw)["source"]["sha256"]
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery, "_current_boot_id", return_value="current-boot"
+            ),
+            mock.patch.object(recovery, "_process_start", return_value=None),
+            mock.patch.object(recovery, "_source_blob_sha256", return_value=source_sha),
+        ):
+            incident = recovery._classify_incomplete_shutdown_incident()
+        with (
+            mock.patch.object(
+                recovery,
+                "_incomplete_shutdown_journal_slice",
+                side_effect=(
+                    journal + "1793310622.0 hugin openrgb: segfault\n",
+                    kernel,
+                ),
+            ),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "crash"),
+        ):
+            recovery._incomplete_shutdown_historical_evidence(incident)
+
+    def test_generic_historical_journal_requires_complete_unchanged_contract(self):
+        binding = self.generic_incomplete_binding()
+        fixture = ROOT / "tests/fixtures/incomplete-shutdown/c21"
+        journal = (fixture / "journal.log").read_text(encoding="utf-8")
+        kernel = (fixture / "kernel.log").read_text(encoding="utf-8")
+        for changed, refusal in (
+            (
+                journal.replace(
+                    "Timed out acquiring the RAM Tetris write gate for shutdown",
+                    "missing gate marker",
+                ),
+                "history is missing",
+            ),
+            (
+                journal + "1793421715.0 hugin: ownership violation\n",
+                "hardware, SDK, or ownership",
+            ),
+        ):
+            with (
+                self.subTest(refusal=refusal),
+                mock.patch.object(
+                    recovery,
+                    "_incomplete_shutdown_journal_slice",
+                    side_effect=(changed, kernel),
+                ),
+                self.assertRaisesRegex(recovery.RecoveryBlocked, refusal),
+            ):
+                recovery._incomplete_shutdown_historical_evidence(binding.incident)
+
+    def test_generic_journal_commands_bind_dynamic_boot_and_time_window(self):
+        binding = self.generic_incomplete_binding()
+        incident = binding.incident
+        expected_user = [
+            recovery.JOURNALCTL,
+            "--boot",
+            incident.old_boot_id.replace("-", ""),
+            f"--since=@{incident.boundary_time - 5}",
+            f"--until=@{incident.failure_time + recovery.INCOMPLETE_SHUTDOWN_JOURNAL_PADDING_SECONDS}",
+            "--output=short-unix",
+            "--no-pager",
+        ]
+        expected_kernel = expected_user[:3] + ["-k", *expected_user[3:]]
+        completed = subprocess.CompletedProcess([], 0, "evidence\n", "")
+        with mock.patch.object(
+            recovery.subprocess, "run", return_value=completed
+        ) as journalctl:
+            recovery._incomplete_shutdown_journal_slice(incident, kernel=False)
+            recovery._incomplete_shutdown_journal_slice(incident, kernel=True)
+        self.assertEqual(
+            [call.args[0] for call in journalctl.call_args_list],
+            [expected_user, expected_kernel],
+        )
+
+    def test_current_kernel_qualification_is_transport_based_and_fail_closed(self):
+        boot_id = "current-boot"
+
+        def result(message: str) -> subprocess.CompletedProcess:
+            return subprocess.CompletedProcess(
+                [],
+                0,
+                json.dumps(
+                    {
+                        "MESSAGE": message,
+                        "_BOOT_ID": boot_id.replace("-", ""),
+                        "__CURSOR": "record-cursor",
+                    }
+                )
+                + "\n",
+                "",
+            )
+
+        unrelated = "i2c i2c-9: Failed to register i2c client ITE8853:07 at 0x41 (-5)"
+        with mock.patch.object(
+            recovery.subprocess, "run", return_value=result(unrelated)
+        ):
+            retained = recovery._incomplete_shutdown_current_kernel_records(boot_id)
+        self.assertEqual(retained[0][1]["bus"], 9)
+        self.assertEqual(retained[0][1]["address"], 0x41)
+
+        for message in (
+            "i2c i2c-10: Failed to register i2c client ITE8853:00 at 0x18 (-16)",
+            "i2c i2c-10: transfer timed out",
+        ):
+            with (
+                self.subTest(message=message),
+                mock.patch.object(
+                    recovery.subprocess, "run", return_value=result(message)
+                ),
+                self.assertRaisesRegex(
+                    recovery.RecoveryBlocked, "protected-transport or kernel"
+                ),
+            ):
+                recovery._incomplete_shutdown_current_kernel_records(boot_id)
+
+    def test_generic_preflight_propagates_current_ownership_refusal(self):
+        binding = self.generic_incomplete_binding()
+        with (
+            mock.patch.object(
+                recovery,
+                "_classify_incomplete_shutdown_incident",
+                return_value=binding.incident,
+            ),
+            mock.patch.object(
+                recovery,
+                "_verify_shutdown_race_corrected_source",
+                return_value=binding.installed_source_revision,
+            ),
+            mock.patch.object(
+                recovery, "_current_boot_id", return_value=binding.current_boot_id
+            ),
+            mock.patch.object(
+                recovery,
+                "_verify_lifecycle_environment",
+                side_effect=recovery.RecoveryBlocked(
+                    "Recovery blocked: a lighting SDK is active."
+                ),
+            ),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "SDK is active"),
+        ):
+            recovery._incomplete_shutdown_recovery_preflight(
+                require_preference_off=False
+            )
+
+    def test_generic_recovery_is_one_process_double_preflight_and_one_start(self):
+        binding = self.generic_incomplete_binding()
+        commands: list[list[str]] = []
+
+        def run(command, **_kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        acknowledged = {
+            "boot_id": binding.current_boot_id,
+            "reason": "acknowledged-reviewed-recovery",
+            "state": "clean-stopped",
+        }
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery,
+                "_incomplete_shutdown_recovery_preflight",
+                side_effect=(binding, binding),
+            ) as preflight,
+            mock.patch.object(recovery.subprocess, "run", side_effect=run),
+            mock.patch.object(
+                recovery, "_read_service_state", return_value=acknowledged
+            ),
+            mock.patch.object(
+                recovery, "_wait_for_authoritative_lifecycle_ready"
+            ) as wait,
+            mock.patch.object(
+                recovery,
+                "_verify_incomplete_shutdown_running_continuity",
+                side_effect=(b"ready\n", b"ready\n"),
+            ) as continuity,
+        ):
+            value = recovery._recover_incomplete_shutdown()
+        self.assertEqual(value["state"], "recovered")
+        self.assertEqual(preflight.call_count, 2)
+        self.assertEqual(continuity.call_count, 2)
+        wait.assert_called_once()
+        self.assertEqual(
+            commands,
+            [
+                [
+                    recovery.SERVICE_GUARD,
+                    "acknowledge-reviewed-recovery",
+                    "--acknowledge-reviewed-recovery",
+                ],
+                [recovery.SYSTEMCTL, "--user", "start", recovery.SERVICE_NAME],
+            ],
+        )
+        self.assertFalse(self.failure.exists())
+        self.assertEqual(
+            (self.failure.parent / "ram-tetris-enabled").read_bytes(), b"off\n"
+        )
+        evidence = self.failure.parent / "recovery-evidence"
+        reference = binding.incident.incident_reference
+        for kind, raw in (
+            ("failure", binding.incident.failure_raw),
+            ("lifecycle-state", binding.incident.boundary_raw),
+            ("openrgb-config", binding.config_raw),
+            ("incomplete-shutdown-journal", binding.historical_journal_raw),
+            (
+                "current-boot-qualification",
+                binding.current_qualification.evidence_raw,
+            ),
+        ):
+            self.assertEqual((evidence / f"{reference}.{kind}.json").read_bytes(), raw)
+        self.assertFalse(any(command[0] == recovery.RAM_TETRIS for command in commands))
+
+    def test_generic_recovery_failure_never_retries_or_clears(self):
+        binding = self.generic_incomplete_binding()
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        acknowledged = {
+            "boot_id": binding.current_boot_id,
+            "reason": "acknowledged-reviewed-recovery",
+            "state": "clean-stopped",
+        }
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery,
+                "_incomplete_shutdown_recovery_preflight",
+                side_effect=(binding, binding),
+            ),
+            mock.patch.object(
+                recovery.subprocess, "run", return_value=completed
+            ) as run,
+            mock.patch.object(
+                recovery, "_read_service_state", return_value=acknowledged
+            ),
+            mock.patch.object(
+                recovery,
+                "_wait_for_authoritative_lifecycle_ready",
+                side_effect=recovery.RecoveryBlocked("readiness failed"),
+            ),
+            self.assertRaisesRegex(
+                recovery.RecoveryBlocked,
+                "partial recovery still active — ownership or writes not verified stopped",
+            ),
+        ):
+            recovery._recover_incomplete_shutdown()
+        self.assertEqual(self.failure.read_bytes(), binding.incident.failure_raw)
+        self.assertEqual(
+            self.failure.parent.joinpath("ram-tetris-enabled").read_bytes(), b"off\n"
+        )
+        outcome = json.loads(
+            self.failure.parent.joinpath(recovery.RECOVERY_OUTCOME_FILE).read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(outcome["outcome"], "partial-recovery-still-active")
+        starts = [
+            call
+            for call in run.call_args_list
+            if call.args[0]
+            == [recovery.SYSTEMCTL, "--user", "start", recovery.SERVICE_NAME]
+        ]
+        self.assertEqual(len(starts), 1)
+
+    def test_prestart_failure_is_persisted_without_service_operation(self):
+        binding = self.generic_incomplete_binding()
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery,
+                "_incomplete_shutdown_recovery_preflight",
+                side_effect=recovery.RecoveryBlocked("hardware gate failed"),
+            ),
+            mock.patch.object(recovery.subprocess, "run") as run,
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "hardware gate failed"),
+        ):
+            recovery._recover_incomplete_shutdown()
+        run.assert_not_called()
+        self.assertEqual(self.failure.read_bytes(), binding.incident.failure_raw)
+        outcome = json.loads(
+            self.failure.parent.joinpath(recovery.RECOVERY_OUTCOME_FILE).read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(outcome["outcome"], "blocked-before-service-start")
+
+    def test_post_start_acceptance_failures_share_one_cleanup_boundary(self):
+        failures = (
+            "hardware validation failed",
+            "Effects assignment mismatch",
+            "SDK lifecycle ownership failed",
+            "current-boot kernel error appeared",
+        )
+        for reason in failures:
+            with self.subTest(reason=reason):
+                binding = self.generic_incomplete_binding()
+                outcome_path = self.failure.parent / recovery.RECOVERY_OUTCOME_FILE
+                outcome_path.unlink(missing_ok=True)
+                commands: list[list[str]] = []
+
+                def run(command, command_log=commands, **_kwargs):
+                    command_log.append(command)
+                    return subprocess.CompletedProcess(command, 0, "", "")
+
+                acknowledged = {
+                    "boot_id": binding.current_boot_id,
+                    "reason": "acknowledged-reviewed-recovery",
+                    "state": "clean-stopped",
+                }
+                with (
+                    self.patched_environment(),
+                    mock.patch.object(
+                        recovery,
+                        "_incomplete_shutdown_recovery_preflight",
+                        side_effect=(binding, binding),
+                    ),
+                    mock.patch.object(recovery.subprocess, "run", side_effect=run),
+                    mock.patch.object(
+                        recovery, "_read_service_state", return_value=acknowledged
+                    ),
+                    mock.patch.object(
+                        recovery, "_wait_for_authoritative_lifecycle_ready"
+                    ),
+                    mock.patch.object(
+                        recovery,
+                        "_verify_incomplete_shutdown_running_continuity",
+                        side_effect=recovery.RecoveryBlocked(reason),
+                    ),
+                    mock.patch.object(
+                        recovery,
+                        "_cleanup_failed_incomplete_shutdown_recovery",
+                        return_value=True,
+                    ) as cleanup,
+                    self.assertRaisesRegex(
+                        recovery.RecoveryBlocked, "partial recovery cleaned up"
+                    ),
+                ):
+                    recovery._recover_incomplete_shutdown()
+
+                self.assertEqual(
+                    commands.count(
+                        [
+                            recovery.SYSTEMCTL,
+                            "--user",
+                            "start",
+                            recovery.SERVICE_NAME,
+                        ]
+                    ),
+                    1,
+                )
+                cleanup.assert_called_once_with(binding.incident.failure_raw)
+                self.assertEqual(
+                    self.failure.read_bytes(), binding.incident.failure_raw
+                )
+                self.assertEqual(
+                    self.failure.parent.joinpath("ram-tetris-enabled").read_bytes(),
+                    b"off\n",
+                )
+                outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    outcome["outcome"], "partial-recovery-cleaned-up"
+                )
+                retained = self.failure.parent / "recovery-evidence"
+                self.assertEqual(
+                    retained.joinpath(
+                        f"{binding.incident.incident_reference}.failure.json"
+                    ).read_bytes(),
+                    binding.incident.failure_raw,
+                )
+
+    def test_post_start_cleanup_issues_one_bounded_stop_and_never_retries(self):
+        binding = self.generic_incomplete_binding()
+        stop = [recovery.SYSTEMCTL, "--user", "stop", recovery.SERVICE_NAME]
+        completed = subprocess.CompletedProcess(stop, 0, "", "")
+        with (
+            mock.patch.object(recovery, "_authenticate_recovery_stop_unit") as auth,
+            mock.patch.object(
+                recovery.subprocess, "run", return_value=completed
+            ) as run,
+            mock.patch.object(
+                recovery, "_verify_post_start_cleanup_quiescence"
+            ) as verify,
+        ):
+            self.assertTrue(
+                recovery._cleanup_failed_incomplete_shutdown_recovery(
+                    binding.incident.failure_raw
+                )
+            )
+        auth.assert_called_once_with()
+        run.assert_called_once_with(
+            stop,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=recovery.RECOVERY_STOP_TIMEOUT,
+        )
+        verify.assert_called_once_with(binding.incident.failure_raw)
+
+    def test_failed_acceptance_performs_only_one_start_then_one_stop(self):
+        binding = self.generic_incomplete_binding()
+        commands: list[list[str]] = []
+
+        def run(command, **_kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        acknowledged = {
+            "boot_id": binding.current_boot_id,
+            "reason": "acknowledged-reviewed-recovery",
+            "state": "clean-stopped",
+        }
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery,
+                "_incomplete_shutdown_recovery_preflight",
+                side_effect=(binding, binding),
+            ),
+            mock.patch.object(recovery.subprocess, "run", side_effect=run),
+            mock.patch.object(
+                recovery, "_read_service_state", return_value=acknowledged
+            ),
+            mock.patch.object(recovery, "_wait_for_authoritative_lifecycle_ready"),
+            mock.patch.object(
+                recovery,
+                "_verify_incomplete_shutdown_running_continuity",
+                side_effect=recovery.RecoveryBlocked("Effects mismatch"),
+            ),
+            mock.patch.object(recovery, "_authenticate_recovery_stop_unit"),
+            mock.patch.object(recovery, "_verify_post_start_cleanup_quiescence"),
+            self.assertRaisesRegex(
+                recovery.RecoveryBlocked, "partial recovery cleaned up"
+            ),
+        ):
+            recovery._recover_incomplete_shutdown()
+
+        self.assertEqual(
+            commands,
+            [
+                [
+                    recovery.SERVICE_GUARD,
+                    "acknowledge-reviewed-recovery",
+                    "--acknowledge-reviewed-recovery",
+                ],
+                [recovery.SYSTEMCTL, "--user", "start", recovery.SERVICE_NAME],
+                [recovery.SYSTEMCTL, "--user", "stop", recovery.SERVICE_NAME],
+            ],
+        )
+
+    def test_post_start_cleanup_refusal_timeout_or_incomplete_state_is_unverified(self):
+        binding = self.generic_incomplete_binding()
+        failure_raw = binding.incident.failure_raw
+        stop = [recovery.SYSTEMCTL, "--user", "stop", recovery.SERVICE_NAME]
+        cases = (
+            (subprocess.CompletedProcess(stop, 1, "", "refused"), None),
+            (None, subprocess.TimeoutExpired(stop, recovery.RECOVERY_STOP_TIMEOUT)),
+        )
+        for result, error in cases:
+            patch_run = (
+                mock.patch.object(recovery.subprocess, "run", return_value=result)
+                if error is None
+                else mock.patch.object(recovery.subprocess, "run", side_effect=error)
+            )
+            with (
+                self.subTest(result="refusal" if error is None else "timeout"),
+                mock.patch.object(recovery, "_authenticate_recovery_stop_unit"),
+                patch_run as run,
+                mock.patch.object(
+                    recovery,
+                    "_verify_post_start_cleanup_quiescence",
+                    side_effect=recovery.RecoveryBlocked("still owned"),
+                ),
+            ):
+                self.assertFalse(
+                    recovery._cleanup_failed_incomplete_shutdown_recovery(failure_raw)
+                )
+                self.assertEqual(run.call_count, 1)
+
+        with (
+            mock.patch.object(
+                recovery,
+                "_authenticate_recovery_stop_unit",
+                side_effect=recovery.RecoveryBlocked("unreviewed unit"),
+            ),
+            mock.patch.object(recovery.subprocess, "run") as run,
+        ):
+            self.assertFalse(
+                recovery._cleanup_failed_incomplete_shutdown_recovery(failure_raw)
+            )
+        run.assert_not_called()
+
+    def test_cleanup_quiescence_covers_service_helpers_locks_and_latch(self):
+        binding = self.generic_incomplete_binding()
+        self.failure.parent.joinpath("ram-tetris-enabled").write_bytes(b"off\n")
+        inactive = {
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "MainPID": "0",
+            "ControlPID": "0",
+        }
+        with (
+            self.patched_environment(),
+            mock.patch.object(recovery, "PROC_ROOT", self.proc),
+            mock.patch.object(
+                recovery, "_service_properties", return_value=inactive
+            ),
+            mock.patch.object(recovery, "_verify_no_lighting_owners"),
+        ):
+            recovery._verify_post_start_cleanup_quiescence(
+                binding.incident.failure_raw
+            )
+
+            helper = self.proc / "812"
+            helper.mkdir()
+            helper.joinpath("cmdline").write_bytes(
+                b"/usr/bin/python3\0" + os.fsencode(recovery.ROOT / "effects-sdk") + b"\0"
+            )
+            with self.assertRaisesRegex(
+                recovery.RecoveryBlocked, "preset, Effects, or writer helper"
+            ):
+                recovery._verify_post_start_cleanup_quiescence(
+                    binding.incident.failure_raw
+                )
+
+    def test_cleanup_stop_authentication_requires_exact_reviewed_unit_contract(self):
+        source = self.root / "source.service"
+        installed = self.root / "installed.service"
+        source.write_text("reviewed\n", encoding="utf-8")
+        installed.write_text("reviewed\n", encoding="utf-8")
+        properties = {
+            "LoadState": "loaded",
+            "FragmentPath": str(installed),
+            "Type": "notify",
+            "Restart": "no",
+            "KillMode": "mixed",
+            "TimeoutStopUSec": "20s",
+        }
+        with (
+            mock.patch.object(recovery, "SOURCE_UNIT", source),
+            mock.patch.object(recovery, "INSTALLED_UNIT", installed),
+            mock.patch.object(
+                recovery, "_service_properties", return_value=properties
+            ),
+        ):
+            recovery._authenticate_recovery_stop_unit()
+            with (
+                mock.patch.object(
+                    recovery,
+                    "_service_properties",
+                    return_value=properties | {"KillMode": "control-group"},
+                ),
+                self.assertRaisesRegex(
+                    recovery.RecoveryBlocked, "stop contract is not reviewed"
+                ),
+            ):
+                recovery._authenticate_recovery_stop_unit()
+
+    def test_partial_outcome_blocks_a_second_service_start(self):
+        binding = self.generic_incomplete_binding()
+        with self.patched_environment():
+            recovery._write_recovery_outcome(
+                binding.incident.failure_raw,
+                "partial-recovery-still-active",
+                "partial recovery still active — ownership or writes not verified stopped",
+            )
+            with (
+                mock.patch.object(recovery.subprocess, "run") as run,
+                self.assertRaisesRegex(
+                    recovery.RecoveryBlocked, "prior service-start attempt"
+                ),
+            ):
+                recovery._recover_incomplete_shutdown()
+        run.assert_not_called()
+
+    def test_recovery_outcomes_persist_for_status_reopen(self):
+        binding = self.generic_incomplete_binding()
+        expected = {
+            "blocked-before-service-start": ("blocked", "blocked before"),
+            "partial-recovery-cleaned-up": ("partial-cleaned", "cleaned up"),
+            "partial-recovery-still-active": ("partial-active", "still active"),
+        }
+        for outcome, (status, summary) in expected.items():
+            with self.subTest(outcome=outcome), self.patched_environment():
+                recovery._write_recovery_outcome(
+                    binding.incident.failure_raw, outcome, summary
+                )
+                with (
+                    mock.patch.object(
+                        recovery,
+                        "_run_ram_tetris_status",
+                        return_value={"preference": False},
+                    ),
+                    mock.patch.object(
+                        recovery, "_service_quick_health", return_value=False
+                    ),
+                    mock.patch.object(
+                        recovery, "_lifecycle_recovery_candidate", return_value=False
+                    ),
+                    mock.patch.object(
+                        recovery,
+                        "_incomplete_shutdown_candidate_shape",
+                        return_value=True,
+                    ),
+                ):
+                    document = recovery.status_document()
+                self.assertEqual(document["recovery_status"], status)
+                self.assertIn(summary, document["recovery_summary"])
+                self.assertFalse(document["recovery_available"])
+
+        with self.patched_environment():
+            recovery._write_recovery_outcome(
+                binding.incident.failure_raw,
+                "recovery-completed",
+                "Recovery completed successfully.",
+            )
+            self.failure.unlink()
+            with mock.patch.object(
+                recovery,
+                "_run_ram_tetris_status",
+                return_value={"preference": False, "state": "off"},
+            ):
+                completed = recovery.status_document()
+        self.assertFalse(completed["failure"])
+        self.assertEqual(completed["recovery_status"], "completed")
+        self.assertEqual(
+            completed["recovery_summary"], "Recovery completed successfully."
+        )
+
+    def test_generic_preflight_and_acceptance_keep_hardware_and_kernel_gates(self):
+        binding = self.generic_incomplete_binding()
+        with (
+            mock.patch.object(
+                recovery,
+                "_classify_incomplete_shutdown_incident",
+                return_value=binding.incident,
+            ),
+            mock.patch.object(
+                recovery,
+                "_verify_shutdown_race_corrected_source",
+                return_value=binding.installed_source_revision,
+            ),
+            mock.patch.object(
+                recovery, "_current_boot_id", return_value=binding.current_boot_id
+            ),
+            mock.patch.object(
+                recovery,
+                "_verify_lifecycle_environment",
+                return_value=binding.config_raw,
+            ),
+            mock.patch.object(
+                recovery,
+                "_incomplete_shutdown_current_qualification",
+                return_value=binding.current_qualification,
+            ),
+            mock.patch.object(
+                recovery,
+                "_verify_four_spd_endpoints",
+                return_value={
+                    endpoint: 40_000 for endpoint in recovery.TRANSIENT_SPD_ENDPOINTS
+                },
+            ) as spd,
+            mock.patch.object(recovery, "_preference", return_value=False),
+            mock.patch.object(
+                recovery,
+                "_incomplete_shutdown_historical_evidence",
+                return_value=binding.historical_journal_raw,
+            ),
+            mock.patch.object(
+                recovery,
+                "_protected_failure_record",
+                return_value=(binding.incident.failure_raw, {}),
+            ),
+            mock.patch.object(
+                recovery,
+                "_read_protected_bytes",
+                return_value=binding.incident.boundary_raw,
+            ),
+            mock.patch.object(
+                recovery,
+                "_detector_policy_is_reviewed",
+                return_value=binding.config_raw,
+            ),
+        ):
+            second = recovery._incomplete_shutdown_recovery_preflight(
+                require_preference_off=True,
+                current_qualification=binding.current_qualification,
+            )
+        self.assertEqual(second, binding)
+        spd.assert_called_once()
+
+        ready_raw = b'{"state":"ready"}\n'
+        ready = {
+            "boot_id": binding.current_boot_id,
+            "reason": recovery.HISTORICAL_READY_REASON,
+            "state": "ready",
+        }
+        with (
+            mock.patch.object(
+                recovery,
+                "_verify_shutdown_race_corrected_source",
+                return_value=binding.installed_source_revision,
+            ),
+            mock.patch.object(
+                recovery, "_current_boot_id", return_value=binding.current_boot_id
+            ),
+            mock.patch.object(recovery, "_preference", return_value=False),
+            mock.patch.object(
+                recovery,
+                "_protected_failure_record",
+                return_value=(binding.incident.failure_raw, {}),
+            ),
+            mock.patch.object(
+                recovery,
+                "_detector_policy_is_reviewed",
+                return_value=binding.config_raw,
+            ),
+            mock.patch.object(
+                recovery,
+                "_incomplete_shutdown_historical_evidence",
+                return_value=binding.historical_journal_raw,
+            ),
+            mock.patch.object(recovery, "_kernel_history_after_observation") as kernel,
+            mock.patch.object(
+                recovery, "_service_state_record", return_value=(ready_raw, ready)
+            ),
+            mock.patch.object(recovery, "_verify_service_and_hardware") as health,
+        ):
+            self.assertEqual(
+                recovery._verify_incomplete_shutdown_running_continuity(binding),
+                ready_raw,
+            )
+        kernel.assert_called_once_with(binding.current_qualification.journal_cursor)
+        health.assert_called_once_with(None)
+
+    def test_generic_recovery_lock_and_cli_command_contract(self):
+        self.load_incomplete_shutdown_fixture("c21")
+        self.runtime.mkdir(mode=0o700)
+        lock_fd = os.open(
+            self.runtime / "lighting-recovery.lock", os.O_WRONLY | os.O_CREAT, 0o600
+        )
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            with (
+                self.patched_environment(),
+                mock.patch.object(
+                    recovery, "_incomplete_shutdown_candidate_shape", return_value=True
+                ),
+                self.assertRaisesRegex(recovery.RecoveryBlocked, "another recovery"),
+            ):
+                recovery.recover()
+        finally:
+            os.close(lock_fd)
+
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(
+                recovery,
+                "recover",
+                return_value={"state": "recovered", "message": "done"},
+            ) as operation,
+            mock.patch.object(sys, "argv", ["lighting-recovery", "recover"]),
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(recovery.main(), 0)
+        operation.assert_called_once_with("")
+        self.assertEqual(json.loads(stdout.getvalue())["state"], "recovered")
+
+    def test_generic_prepare_has_no_cross_process_confirmation_token(self):
+        binding = self.generic_incomplete_binding()
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery, "_incomplete_shutdown_candidate_shape", return_value=True
+            ),
+            mock.patch.object(
+                recovery,
+                "_incomplete_shutdown_recovery_preflight",
+                return_value=binding,
+            ),
+        ):
+            value = recovery.prepare_document()
+        self.assertEqual(value["state"], "recovery-ready")
+        self.assertEqual(value["recovery_kind"], "old-boot-incomplete-shutdown")
+        self.assertNotIn("confirmation_token", value)
 
     def test_display_code_alone_never_grants_eligibility(self):
         raw = self.write_failure("unreviewed failure")

@@ -558,6 +558,47 @@ ownership failure remains blocking, as does every new relevant kernel event
 after the qualification cursor. The global kernel-error classifier and all
 other recovery categories remain unchanged.
 
+Version 0.4.40 supersedes that incident-bound dispatcher with a reusable
+incomplete-lifecycle-shutdown category. Eligibility is derived from the
+unchanged protected latch and `stopping/deliberate` boundary, their timestamps
+and process identities, the old boot's complete shutdown journal, reviewed
+plugin/package/executable/detector identities, current service and lock
+ownership, four SPD5118 endpoints, and current-boot kernel history. Incident
+references, latch hashes, boot IDs, PIDs, and timestamps never grant
+eligibility. A parsed ITE8853 client-registration failure is retained as
+unrelated only when its I2C bus/address is outside every reviewed OpenRGB and
+SPD5118 transport; any protected or unclassified communication error blocks.
+
+The Recover control dispatches this category directly into one recovery
+process holding the existing singleton. That process preserves the original
+latch, boundary, OpenRGB configuration, and historical/current journal
+evidence, atomically leaves RAM Tetris OFF, repeats the complete preflight,
+acknowledges only the stale boundary, and starts the independent lifecycle
+once. It requires authoritative lifecycle/SDK ownership, seven controllers,
+four SPD5118 endpoints, the preset and Effects contract, and clean kernel
+continuity twice before unlinking only the unchanged latch. It never retries,
+starts a writer, selects a preset itself, or clears evidence after a failed
+gate. Other recovery categories retain their existing behavior.
+
+Every check after that one service start shares a single failure boundary. A
+failure leaves the original latch and retained evidence unchanged, keeps RAM
+Tetris OFF, and issues at most one authenticated `systemctl --user stop` of the
+reviewed unit under its existing 20-second deadline. Recovery reports
+`partial recovery cleaned up` only after systemd, lifecycle, SDK, listener,
+writer, preset/Effects helper, and lock quiescence are all proven; otherwise it
+reports that the partial recovery is still active or ownership is unverified.
+Neither result is retried, and both prevent a second lifecycle start pending
+owner review. The pre-start-blocked, partial-cleaned, partial-unverified, and
+completed outcomes are stored in protected state so the panel retains the
+disposition after reopening.
+
+While any failure latch remains, the panel disables preset cards and the
+`apply-preset` backend rejects user-requested mutations before OpenRGB, Effects,
+or writer helpers run. The only restoration exception is the existing bounded
+lifecycle child during the single guarded recovery start; it must be descended
+from that lifecycle, share the exclusive recovery lock, and match the protected
+in-progress outcome. Diagnostics and recovery review remain available.
+
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
 The experimental orange, blue, and red Sunrise gradients are therefore stored

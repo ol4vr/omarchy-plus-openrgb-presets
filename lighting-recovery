@@ -2,11 +2,11 @@
 """Classify OpenRGB failures and perform narrowly reviewed latch recovery.
 
 The status and prepare paths are read-only. Recovery is limited to explicitly
-reviewed Tetris-only incidents or an exact stale lifecycle boundary, repeats
-every applicable health gate, preserves the original evidence bytes, and
-leaves the preference OFF. Lifecycle recovery may acknowledge the reviewed
-boundary and start the user service exactly once; no path restarts a service,
-starts a writer or effect, or selects a preset.
+reviewed Tetris-only incidents or an evidence-qualified stale lifecycle
+boundary, repeats every applicable health gate, preserves the original
+evidence bytes, and leaves the preference OFF. Lifecycle recovery may
+acknowledge the reviewed boundary and start the user service exactly once; no
+path restarts a service, starts a writer or effect, or selects a preset.
 
 The administrative clearance paths are separately bound to source-reviewed
 incidents. They perform no service operation; they only remove an unchanged
@@ -83,6 +83,17 @@ DISABLED_DETECTOR: Final = "ASUS Aura SMBus Motherboard"
 REQUIRED_DETECTOR: Final = "ASUS Aura Motherboard"
 SERVICE_START_TIMEOUT: Final = 125.0
 LIFECYCLE_READY_POLL_SECONDS: Final = 0.1
+RECOVERY_STOP_TIMEOUT: Final = 25.0
+RECOVERY_OUTCOME_FILE: Final = "lighting-recovery-outcome.json"
+RECOVERY_OUTCOMES: Final = frozenset(
+    {
+        "blocked-before-service-start",
+        "recovery-in-progress",
+        "partial-recovery-cleaned-up",
+        "partial-recovery-still-active",
+        "recovery-completed",
+    }
+)
 TRANSIENT_SPD_OBSERVATION_SAMPLES: Final = 60
 TRANSIENT_SPD_SAMPLE_INTERVAL_SECONDS: Final = 1.0
 TRANSIENT_SPD_MAX_LATE_SECONDS: Final = 0.25
@@ -137,7 +148,7 @@ SHUTDOWN_RACE_SERVER_START: Final = "85366961"
 SHUTDOWN_RACE_WRITER_PID: Final = 394561
 SHUTDOWN_RACE_BOUNDARY_TIME: Final = 1793310621.0151148
 SHUTDOWN_RACE_FAILURE_TIME: Final = 1793310623.257292
-SHUTDOWN_RACE_CORRECTED_VERSION: Final = "0.4.39"
+SHUTDOWN_RACE_CORRECTED_VERSION: Final = "0.4.40"
 SHUTDOWN_RACE_CORRECTED_LIFECYCLE_SHA256: Final = (
     "d03cb8a1525ea70f0e296a2a6bd9cc10f6c4f69a8aee685e1a03a5fb17ada7b2"
 )
@@ -169,6 +180,49 @@ SHUTDOWN_RACE_CONTROLLER_CONTRACT: Final = (
         "name": "Corsair ST100 RGB",
         "transport": "USB HID",
     },
+)
+INCOMPLETE_SHUTDOWN_SIMPLE_REASONS: Final = frozenset(
+    {
+        "OpenRGB lifecycle service did not complete its previous bounded shutdown",
+        "OpenRGB lifecycle service required manager escalation before clean shutdown",
+    }
+)
+INCOMPLETE_SHUTDOWN_WINDOW_SECONDS: Final = 120.0
+INCOMPLETE_SHUTDOWN_JOURNAL_PADDING_SECONDS: Final = 15.0
+INCOMPLETE_SHUTDOWN_REQUIRED_JOURNAL_MARKERS: Final = (
+    "Stopping Omarchy+ OpenRGB lifecycle",
+    "Timed out acquiring the RAM Tetris write gate for shutdown",
+    "omarchy-plus-openrgb-presets.service: Main process exited, code=exited, status=1/FAILURE",
+    "OpenRGB lifecycle stop incomplete: incomplete-lifecycle-exit",
+    "omarchy-plus-openrgb-presets.service: Failed with result 'exit-code'",
+)
+INCOMPLETE_SHUTDOWN_TEARDOWN_MARKERS: Final = (
+    "OpenRGB SDK teardown skipped because RAM Tetris did not quiesce",
+    "OpenRGB server stopped for deliberate lifecycle shutdown",
+)
+INCOMPLETE_SHUTDOWN_UNSAFE_HISTORY: Final = re.compile(
+    r"(?:temperature is unreadable|expected seven controllers|DIMM (?:is not|state changed)|"
+    r"UPDATELEDS failed|ownership is ambiguous|ownership violation|listener owner changed|"
+    r"lifecycle identity changed|unexpected SDK (?:exit|crash))",
+    re.IGNORECASE,
+)
+OPENRGB_CRASH_HISTORY: Final = re.compile(
+    r"openrgb.*(?:segfault|core dumped|oom-kill|out of memory)", re.IGNORECASE
+)
+I2C_CLIENT_REGISTRATION_FAILURE: Final = re.compile(
+    r"^i2c i2c-(?P<bus>[0-9]+): Failed to register i2c client "
+    r"(?P<client>ITE8853:[0-9]+) at 0x(?P<address>[0-9a-fA-F]+) "
+    r"\((?P<errno>-[0-9]+)\)$"
+)
+# These are the reviewed OpenRGB/SPD transports. A failed ITE8853 registration
+# can be retained as unrelated only when its parsed bus/address is outside all
+# of them. This is a transport rule, not an incident-message exception.
+PROTECTED_I2C_TRANSPORTS: Final = frozenset(
+    {
+        (0, 0x67),
+        *((10, address) for address in range(0x18, 0x1C)),
+        *((10, address) for address in range(0x50, 0x54)),
+    }
 )
 CORRECTED_CHECKPOINT_DETAIL_FIELDS: Final = frozenset(
     {
@@ -361,6 +415,39 @@ class ShutdownRaceRecoveryBinding:
     config_raw: bytes
     historical_journal_raw: bytes
     current_boot_kernel: ShutdownRaceKernelQualification
+    current_boot_id: str
+    installed_source_revision: str
+
+
+@dataclass(frozen=True)
+class IncompleteShutdownIncident:
+    failure_raw: bytes
+    boundary_raw: bytes
+    incident_reference: str
+    latch_sha256: str
+    original_reason: str
+    failure_time: float
+    latch_pid: int
+    old_boot_id: str
+    boundary_time: float
+    lifecycle_pid: int
+    lifecycle_start: str
+    server_pid: int
+    server_start: str
+
+
+@dataclass(frozen=True)
+class IncompleteShutdownCurrentQualification:
+    evidence_raw: bytes
+    journal_cursor: str
+
+
+@dataclass(frozen=True)
+class IncompleteShutdownRecoveryBinding:
+    incident: IncompleteShutdownIncident
+    config_raw: bytes
+    historical_journal_raw: bytes
+    current_qualification: IncompleteShutdownCurrentQualification
     current_boot_id: str
     installed_source_revision: str
 
@@ -1018,6 +1105,120 @@ def _classify_shutdown_race_incident() -> ShutdownRaceIncident:
         source_revision=SHUTDOWN_RACE_SOURCE_REVISION,
         source_path=SHUTDOWN_RACE_SOURCE_PATH,
         source_sha256=SHUTDOWN_RACE_SOURCE_SHA256,
+    )
+
+
+def _protected_failure_record() -> tuple[bytes, dict[str, object]]:
+    raw = _read_protected_bytes(
+        state_root() / "ram-tetris-failure.json", "lighting failure latch"
+    )
+    return raw, _json_record(raw, "lighting failure latch")
+
+
+def _classify_incomplete_shutdown_incident() -> IncompleteShutdownIncident:
+    """Derive old-boot shutdown eligibility from protected raw evidence."""
+
+    failure_raw, failure = _protected_failure_record()
+    boundary_raw = _read_protected_bytes(
+        state_root() / "lifecycle-service-state.json", "lifecycle boundary"
+    )
+    boundary = _json_record(boundary_raw, "lifecycle boundary")
+    failure_time, _ = _timestamp(failure)
+    boundary_time = _number(boundary.get("time"))
+    message = _failure_message(failure)
+    latch_pid = failure.get("pid")
+    if (
+        failure.get("state") != "failed"
+        or failure_time is None
+        or not isinstance(latch_pid, int)
+        or isinstance(latch_pid, bool)
+        or latch_pid <= 0
+        or boundary_time is None
+        or failure_time < boundary_time
+        or failure_time - boundary_time > INCOMPLETE_SHUTDOWN_WINDOW_SECONDS
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: failure and lifecycle-boundary evidence do not correlate."
+        )
+
+    if set(failure) == {"message", "pid", "state", "time"}:
+        if message not in INCOMPLETE_SHUTDOWN_SIMPLE_REASONS:
+            raise RecoveryBlocked(
+                "Recovery blocked: the latch is not an incomplete lifecycle shutdown."
+            )
+    else:
+        source = failure.get("source")
+        details = failure.get("details")
+        if (
+            set(failure)
+            != {
+                "details",
+                "evidence_version",
+                "message",
+                "pid",
+                "source",
+                "state",
+                "time",
+            }
+            or failure.get("evidence_version") != 1
+            or not isinstance(details, dict)
+            or classify_reason(message).subsystem != "sdk"
+            or not isinstance(source, dict)
+            or set(source) != {"component", "path", "revision", "sha256", "version"}
+            or source.get("component") != "ram-tetris"
+            or source.get("path") != "ram-tetris"
+            or not isinstance(source.get("revision"), str)
+            or not re.fullmatch(r"[0-9a-f]{40}", source["revision"])
+            or not isinstance(source.get("sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", source["sha256"])
+            or not isinstance(source.get("version"), str)
+            or not source["version"]
+            or _source_blob_sha256(source["revision"], source["path"])
+            != source["sha256"]
+        ):
+            raise RecoveryBlocked(
+                "Recovery blocked: the SDK latch is not authenticated shutdown evidence."
+            )
+
+    old_boot_id = boundary.get("boot_id")
+    stop_result = boundary.get("stop_result")
+    if (
+        boundary.get("state") != "stopping"
+        or boundary.get("reason") != "deliberate"
+        or not isinstance(old_boot_id, str)
+        or not old_boot_id
+        or old_boot_id == _current_boot_id()
+        or not isinstance(stop_result, dict)
+        or stop_result.get("classification") != "incomplete-lifecycle-exit"
+        or stop_result.get("service_result") != "exit-code"
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: the lifecycle boundary is not an authenticated "
+            "old-boot incomplete shutdown."
+        )
+    lifecycle_pid, lifecycle_start = _identity(boundary, "lifecycle")
+    server_pid, server_start = _identity(boundary, "server")
+    if (
+        _process_start(lifecycle_pid) == lifecycle_start
+        or _process_start(server_pid) == server_start
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: an old lifecycle or SDK identity is still active."
+        )
+    return IncompleteShutdownIncident(
+        failure_raw=failure_raw,
+        boundary_raw=boundary_raw,
+        incident_reference=_incident_reference(failure_raw),
+        latch_sha256=hashlib.sha256(failure_raw).hexdigest(),
+        original_reason=message,
+        failure_time=failure_time,
+        latch_pid=latch_pid,
+        old_boot_id=old_boot_id,
+        boundary_time=boundary_time,
+        lifecycle_pid=lifecycle_pid,
+        lifecycle_start=lifecycle_start,
+        server_pid=server_pid,
+        server_start=server_start,
     )
 
 
@@ -2791,6 +2992,27 @@ def _lifecycle_recovery_candidate(failure: dict[str, object], message: str) -> b
     return True
 
 
+def _incomplete_shutdown_candidate_shape(
+    failure: dict[str, object], message: str
+) -> bool:
+    try:
+        _, state = _service_state_record()
+        old_boot = state.get("boot_id")
+        if (
+            state.get("state") != "stopping"
+            or state.get("reason") != "deliberate"
+            or not isinstance(old_boot, str)
+            or not old_boot
+            or old_boot == _current_boot_id()
+        ):
+            return False
+        if set(failure) == {"message", "pid", "state", "time"}:
+            return message in INCOMPLETE_SHUTDOWN_SIMPLE_REASONS
+        return classify_reason(message).subsystem == "sdk"
+    except RecoveryBlocked:
+        return False
+
+
 def _run_ram_tetris_status() -> dict[str, object]:
     try:
         result = subprocess.run(
@@ -2829,13 +3051,24 @@ def status_document() -> dict[str, object]:
     try:
         raw, record = _failure_record()
     except RecoveryBlocked:
-        return normal | {"failure": False}
+        outcome = _read_recovery_outcome(None)
+        if outcome is not None:
+            return normal | {
+                "failure": False,
+                "recovery_status": "completed",
+                "recovery_summary": "Recovery completed successfully.",
+                "recovery_outcome": outcome["outcome"],
+            }
+        return normal | {"failure": False, "recovery_outcome": ""}
 
     message = _failure_message(record)
     failure_class = classify_reason(message)
     _, timestamp = _timestamp(record)
     service_healthy = _service_quick_health()
     lifecycle_candidate = _lifecycle_recovery_candidate(record, message)
+    incomplete_shutdown_candidate = _incomplete_shutdown_candidate_shape(
+        record, message
+    )
     shutdown_race_candidate = False
     if message == SHUTDOWN_RACE_REASON:
         try:
@@ -2862,6 +3095,7 @@ def status_document() -> dict[str, object]:
             and service_healthy
         )
         or lifecycle_candidate
+        or incomplete_shutdown_candidate
         or shutdown_race_candidate
         or (transient_spd_candidate and service_healthy)
     )
@@ -2871,7 +3105,9 @@ def status_document() -> dict[str, object]:
         else ("manual-review" if failure_class is UNKNOWN_FAILURE else "blocked")
     )
     recovery_summary = (
-        "Reviewed old-boot shutdown recovery can be checked."
+        "Evidence-based old-boot shutdown recovery can be checked."
+        if incomplete_shutdown_candidate
+        else "Reviewed old-boot shutdown recovery can be checked."
         if shutdown_race_candidate
         else "Reviewed lifecycle recovery can be checked."
         if lifecycle_candidate
@@ -2883,6 +3119,28 @@ def status_document() -> dict[str, object]:
         if scope == "lighting"
         else "This failure requires manual review."
     )
+    persisted_outcome = _read_recovery_outcome(raw)
+    recovery_outcome = ""
+    if persisted_outcome is not None:
+        recovery_outcome = str(persisted_outcome["outcome"])
+        if recovery_outcome == "blocked-before-service-start":
+            recovery_status = "blocked"
+            recovery_summary = "Recovery blocked before service start."
+            available = False
+        elif recovery_outcome == "partial-recovery-cleaned-up":
+            recovery_status = "partial-cleaned"
+            recovery_summary = "partial recovery cleaned up"
+            available = False
+        elif recovery_outcome in {
+            "recovery-in-progress",
+            "partial-recovery-still-active",
+        }:
+            recovery_status = "partial-active"
+            recovery_summary = (
+                "partial recovery still active — ownership or writes not verified "
+                "stopped"
+            )
+            available = False
     return {
         "failure": True,
         "preference": normal.get("preference", _preference()),
@@ -2896,7 +3154,11 @@ def status_document() -> dict[str, object]:
         "scope": scope,
         "recovery_status": recovery_status,
         "recovery_summary": recovery_summary,
+        "recovery_outcome": recovery_outcome,
         "recovery_available": available,
+        "recovery_kind": (
+            "old-boot-incomplete-shutdown" if incomplete_shutdown_candidate else ""
+        ),
     }
 
 
@@ -3376,6 +3638,310 @@ def _software_interruption_journal_evidence(
     return (json.dumps(document, sort_keys=True) + "\n").encode()
 
 
+def _incomplete_shutdown_journal_slice(
+    incident: IncompleteShutdownIncident, *, kernel: bool
+) -> str:
+    command = [JOURNALCTL, "--boot", incident.old_boot_id.replace("-", "")]
+    if kernel:
+        command.append("-k")
+    command.extend(
+        (
+            f"--since=@{incident.boundary_time - 5}",
+            f"--until=@{incident.failure_time + INCOMPLETE_SHUTDOWN_JOURNAL_PADDING_SECONDS}",
+            "--output=short-unix",
+            "--no-pager",
+        )
+    )
+    result = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0 or result.stderr.strip():
+        raise RecoveryBlocked(
+            "Recovery blocked: historical shutdown journal is unreadable."
+        )
+    return result.stdout
+
+
+def _journal_marker_time(journal: str, marker: str) -> float | None:
+    for line in journal.splitlines():
+        if marker not in line:
+            continue
+        token = line.partition(" ")[0]
+        try:
+            return float(token)
+        except ValueError:
+            return None
+    return None
+
+
+def _incomplete_shutdown_historical_evidence(
+    incident: IncompleteShutdownIncident,
+) -> bytes:
+    journal = _incomplete_shutdown_journal_slice(incident, kernel=False)
+    kernel = _incomplete_shutdown_journal_slice(incident, kernel=True)
+    if not all(
+        marker in journal for marker in INCOMPLETE_SHUTDOWN_REQUIRED_JOURNAL_MARKERS
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: authenticated incomplete-shutdown history is missing."
+        )
+    if not any(marker in journal for marker in INCOMPLETE_SHUTDOWN_TEARDOWN_MARKERS):
+        raise RecoveryBlocked(
+            "Recovery blocked: SDK shutdown disposition is missing from history."
+        )
+    if not any(
+        marker in journal
+        for marker in (
+            "System is rebooting",
+            "The system will reboot now!",
+            "/usr/bin/systemctl reboot --no-wall",
+        )
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: historical journal does not authenticate a shutdown."
+        )
+    stopping_time = _journal_marker_time(journal, "Stopping Omarchy+ OpenRGB lifecycle")
+    gate_time = _journal_marker_time(
+        journal, "Timed out acquiring the RAM Tetris write gate for shutdown"
+    )
+    exit_time = _journal_marker_time(
+        journal,
+        "omarchy-plus-openrgb-presets.service: Main process exited, code=exited, status=1/FAILURE",
+    )
+    latch_time = _journal_marker_time(
+        journal, "OpenRGB lifecycle stop incomplete: incomplete-lifecycle-exit"
+    )
+    if (
+        None in {stopping_time, gate_time, exit_time, latch_time}
+        or not stopping_time
+        <= incident.boundary_time
+        <= gate_time
+        <= exit_time
+        <= latch_time
+        or abs(latch_time - incident.failure_time) > 1.0
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: historical shutdown timestamps do not correlate."
+        )
+    simple_latch = incident.original_reason in INCOMPLETE_SHUTDOWN_SIMPLE_REASONS
+    if (
+        simple_latch
+        and (
+            f"omarchy-plus-openrgb-presets[{incident.latch_pid}]: "
+            "OpenRGB lifecycle stop incomplete: incomplete-lifecycle-exit"
+        )
+        not in journal
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: failure-latch process identity is not in the shutdown journal."
+        )
+    combined = journal + "\n" + kernel
+    if OPENRGB_CRASH_HISTORY.search(combined):
+        raise RecoveryBlocked(
+            "Recovery blocked: historical OpenRGB crash or resource failure exists."
+        )
+    if INCOMPLETE_SHUTDOWN_UNSAFE_HISTORY.search(combined):
+        raise RecoveryBlocked(
+            "Recovery blocked: historical hardware, SDK, or ownership failure exists."
+        )
+    if any(RELEVANT_KERNEL_ERROR.search(line) for line in kernel.splitlines()):
+        raise RecoveryBlocked(
+            "Recovery blocked: historical protected-transport failure exists."
+        )
+    document = {
+        "schema_version": 2,
+        "category": "old-boot-incomplete-lifecycle-shutdown",
+        "boot_id": incident.old_boot_id,
+        "boundary_time": incident.boundary_time,
+        "failure_time": incident.failure_time,
+        "lifecycle_identity": [incident.lifecycle_pid, incident.lifecycle_start],
+        "server_identity": [incident.server_pid, incident.server_start],
+        "journal": journal,
+        "kernel": kernel,
+    }
+    return (json.dumps(document, sort_keys=True) + "\n").encode()
+
+
+def _unprotected_ite_registration(message: str) -> dict[str, object] | None:
+    match = I2C_CLIENT_REGISTRATION_FAILURE.fullmatch(message)
+    if match is None:
+        return None
+    bus = int(match.group("bus"))
+    address = int(match.group("address"), 16)
+    if (bus, address) in PROTECTED_I2C_TRANSPORTS:
+        return None
+    return {
+        "bus": bus,
+        "address": address,
+        "client": match.group("client"),
+        "errno": int(match.group("errno")),
+        "classification": "unprotected-transport-registration-failure",
+    }
+
+
+def _incomplete_shutdown_current_kernel_records(
+    boot_id: str,
+) -> tuple[tuple[dict[str, object], dict[str, object]], ...]:
+    command = [
+        JOURNALCTL,
+        "--boot",
+        boot_id.replace("-", ""),
+        "-k",
+        "--output=json",
+        "--no-pager",
+    ]
+    result = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0 or result.stderr.strip():
+        raise RecoveryBlocked(
+            "Recovery blocked: current-boot kernel history is unreadable."
+        )
+    expected_boot = boot_id.replace("-", "").lower()
+    retained: list[tuple[dict[str, object], dict[str, object]]] = []
+    for raw in result.stdout.splitlines():
+        try:
+            record = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise RecoveryBlocked(
+                "Recovery blocked: current-boot kernel history is malformed."
+            ) from error
+        if not isinstance(record, dict):
+            raise RecoveryBlocked(
+                "Recovery blocked: current-boot kernel history is malformed."
+            )
+        message = record.get("MESSAGE")
+        if not isinstance(message, str) or not RELEVANT_KERNEL_ERROR.search(message):
+            continue
+        record_boot = record.get("_BOOT_ID")
+        if not isinstance(record_boot, str) or record_boot.lower() != expected_boot:
+            raise RecoveryBlocked(
+                "Recovery blocked: current kernel evidence belongs to another boot."
+            )
+        exclusion = _unprotected_ite_registration(message)
+        if exclusion is None:
+            raise RecoveryBlocked(
+                "Recovery blocked: current-boot protected-transport or kernel error exists."
+            )
+        retained.append((record, exclusion))
+    return tuple(retained)
+
+
+def _incomplete_shutdown_current_service_journal(boot_id: str) -> str:
+    command = [
+        JOURNALCTL,
+        "--boot",
+        boot_id.replace("-", ""),
+        "--user",
+        "--unit",
+        SERVICE_NAME,
+        "--output=short-unix",
+        "--no-pager",
+    ]
+    result = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0 or result.stderr.strip():
+        raise RecoveryBlocked(
+            "Recovery blocked: current-boot service history is unreadable."
+        )
+    return result.stdout
+
+
+def _incomplete_shutdown_current_qualification(
+    config_raw: bytes,
+    *,
+    boot_id: str,
+    journal_cursor: str | None = None,
+) -> IncompleteShutdownCurrentQualification:
+    if _current_boot_id() != boot_id:
+        raise RecoveryBlocked("Recovery blocked: current boot identity changed.")
+    policy = _shutdown_race_detector_policy(config_raw)
+    cursor = journal_cursor if journal_cursor is not None else _capture_kernel_cursor()
+    records = _incomplete_shutdown_current_kernel_records(boot_id)
+    service_journal = _incomplete_shutdown_current_service_journal(boot_id)
+    document = {
+        "schema_version": 1,
+        "category": "current-boot-incomplete-shutdown-qualification",
+        "boot_id": boot_id,
+        "controller_contract": SHUTDOWN_RACE_CONTROLLER_CONTRACT,
+        "detector_policy": policy,
+        "detector_policy_sha256": hashlib.sha256(config_raw).hexdigest(),
+        "journal_cursor": cursor,
+        "excluded_kernel_records": [
+            {"record": record, "transport_classification": exclusion}
+            for record, exclusion in records
+        ],
+        "service_journal": service_journal,
+    }
+    return IncompleteShutdownCurrentQualification(
+        evidence_raw=(json.dumps(document, sort_keys=True) + "\n").encode(),
+        journal_cursor=cursor,
+    )
+
+
+def _incomplete_shutdown_recovery_preflight(
+    *,
+    require_preference_off: bool,
+    current_qualification: IncompleteShutdownCurrentQualification | None = None,
+) -> IncompleteShutdownRecoveryBinding:
+    incident = _classify_incomplete_shutdown_incident()
+    installed_source_revision = _verify_shutdown_race_corrected_source()
+    current_boot_id = _current_boot_id()
+    config_raw = _verify_lifecycle_environment(
+        incident.failure_time, check_kernel_history=False
+    )
+    qualification = _incomplete_shutdown_current_qualification(
+        config_raw,
+        boot_id=current_boot_id,
+        journal_cursor=(
+            current_qualification.journal_cursor
+            if current_qualification is not None
+            else None
+        ),
+    )
+    if current_qualification is not None and qualification != current_qualification:
+        raise RecoveryBlocked(
+            "Recovery blocked: current-boot qualification changed during recovery."
+        )
+    _verify_four_spd_endpoints()
+    if require_preference_off and _preference():
+        raise RecoveryBlocked("Recovery blocked: RAM Tetris preference is not OFF.")
+    historical_journal_raw = _incomplete_shutdown_historical_evidence(incident)
+    if (
+        _protected_failure_record()[0] != incident.failure_raw
+        or _read_protected_bytes(
+            state_root() / "lifecycle-service-state.json", "lifecycle boundary"
+        )
+        != incident.boundary_raw
+        or _detector_policy_is_reviewed() != config_raw
+        or _current_boot_id() != current_boot_id
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: incomplete-shutdown evidence changed during review."
+        )
+    return IncompleteShutdownRecoveryBinding(
+        incident=incident,
+        config_raw=config_raw,
+        historical_journal_raw=historical_journal_raw,
+        current_qualification=qualification,
+        current_boot_id=current_boot_id,
+        installed_source_revision=installed_source_revision,
+    )
+
+
 def _shutdown_race_journal_slice(*, kernel: bool) -> str:
     command = [JOURNALCTL, "--boot", SHUTDOWN_RACE_OLD_BOOT_ID.replace("-", "")]
     if kernel:
@@ -3708,8 +4274,7 @@ def _shutdown_race_confirmation_kernel_evidence(
         or not document["journal_cursor"]
         or document["journal_cursor"] != qualification.journal_cursor
         or not isinstance(parsed_journal_record, dict)
-        or parsed_journal_record.get("MESSAGE")
-        != SHUTDOWN_RACE_REVIEWED_KERNEL_MESSAGE
+        or parsed_journal_record.get("MESSAGE") != SHUTDOWN_RACE_REVIEWED_KERNEL_MESSAGE
         or not isinstance(parsed_journal_record.get("_BOOT_ID"), str)
         or parsed_journal_record["_BOOT_ID"].lower() != expected_boot
     ):
@@ -4190,6 +4755,24 @@ def prepare_document() -> dict[str, object]:
     message = _failure_message(record)
     failure_class = classify_reason(message)
     failure_time, _ = _timestamp(record)
+    if _incomplete_shutdown_candidate_shape(record, message):
+        try:
+            binding = _incomplete_shutdown_recovery_preflight(
+                require_preference_off=False
+            )
+        except RecoveryBlocked:
+            if message != SHUTDOWN_RACE_REASON:
+                raise
+        else:
+            return {
+                "state": "recovery-ready",
+                "incident_reference": binding.incident.incident_reference,
+                "recovery_kind": "old-boot-incomplete-shutdown",
+                "message": (
+                    "Run one evidence-qualified lifecycle recovery. "
+                    "RAM Tetris will remain OFF."
+                ),
+            }
     if message == SHUTDOWN_RACE_REASON:
         binding = _shutdown_race_recovery_preflight(require_preference_off=False)
         return {
@@ -4281,6 +4864,67 @@ def _atomic_text(path: Path, text: str) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def _recovery_outcome_path() -> Path:
+    return state_root() / RECOVERY_OUTCOME_FILE
+
+
+def _write_recovery_outcome(
+    failure_raw: bytes, outcome: str, message: str
+) -> None:
+    if outcome not in RECOVERY_OUTCOMES:
+        raise ValueError(f"unknown recovery outcome: {outcome}")
+    if outcome != "recovery-completed":
+        current_raw, _ = _protected_failure_record()
+        if current_raw != failure_raw:
+            raise RecoveryBlocked(
+                "Recovery blocked: the failure latch changed before outcome persistence."
+            )
+    document = {
+        "schema_version": 1,
+        "incident_reference": _incident_reference(failure_raw),
+        "latch_sha256": hashlib.sha256(failure_raw).hexdigest(),
+        "outcome": outcome,
+        "message": message[:500],
+        "time": time.time(),
+    }
+    _atomic_text(
+        _recovery_outcome_path(),
+        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n",
+    )
+
+
+def _read_recovery_outcome(failure_raw: bytes | None) -> dict[str, object] | None:
+    try:
+        raw = _read_protected_bytes(
+            _recovery_outcome_path(), "recovery outcome"
+        )
+    except RecoveryBlocked:
+        return None
+    try:
+        document = _json_record(raw, "recovery outcome")
+    except RecoveryBlocked:
+        return None
+    outcome = document.get("outcome")
+    latch_sha256 = document.get("latch_sha256")
+    reference = document.get("incident_reference")
+    if (
+        document.get("schema_version") != 1
+        or outcome not in RECOVERY_OUTCOMES
+        or not isinstance(latch_sha256, str)
+        or not isinstance(reference, str)
+    ):
+        return None
+    if failure_raw is not None:
+        if (
+            latch_sha256 != hashlib.sha256(failure_raw).hexdigest()
+            or reference != _incident_reference(failure_raw)
+        ):
+            return None
+    elif outcome != "recovery-completed":
+        return None
+    return document
 
 
 def _fsync_directory(path: Path) -> None:
@@ -4545,6 +5189,292 @@ def _verify_shutdown_race_running_continuity(
     return ready_raw
 
 
+def _verify_incomplete_shutdown_running_continuity(
+    binding: IncompleteShutdownRecoveryBinding,
+) -> bytes:
+    if (
+        _verify_shutdown_race_corrected_source() != binding.installed_source_revision
+        or _current_boot_id() != binding.current_boot_id
+        or _preference()
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: recovery policy source, boot, or preference changed."
+        )
+    if _protected_failure_record()[0] != binding.incident.failure_raw:
+        raise RecoveryBlocked(
+            "Recovery blocked: the incomplete-shutdown latch changed during restoration."
+        )
+    if _detector_policy_is_reviewed() != binding.config_raw:
+        raise RecoveryBlocked(
+            "Recovery blocked: OpenRGB configuration changed during restoration."
+        )
+    if (
+        _incomplete_shutdown_historical_evidence(binding.incident)
+        != binding.historical_journal_raw
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: historical shutdown evidence changed during restoration."
+        )
+    _kernel_history_after_observation(binding.current_qualification.journal_cursor)
+    ready_raw, ready = _service_state_record()
+    if (
+        ready.get("state") != "ready"
+        or ready.get("reason") != HISTORICAL_READY_REASON
+        or ready.get("boot_id") != binding.current_boot_id
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: the single service start is not authoritatively ready."
+        )
+    _verify_service_and_hardware(None)
+    return ready_raw
+
+
+def _authenticate_recovery_stop_unit() -> None:
+    """Bind cleanup to the reviewed user unit and its bounded stop contract."""
+
+    _unit_is_reviewed()
+    properties = _service_properties(
+        SERVICE_NAME,
+        (
+            "LoadState",
+            "FragmentPath",
+            "Type",
+            "Restart",
+            "KillMode",
+            "TimeoutStopUSec",
+        ),
+    )
+    try:
+        fragment = Path(properties["FragmentPath"]).resolve(strict=True)
+        installed = INSTALLED_UNIT.resolve(strict=True)
+    except OSError as error:
+        raise RecoveryBlocked(
+            "Recovery blocked: the installed lighting unit identity is unreadable."
+        ) from error
+    if (
+        properties["LoadState"] != "loaded"
+        or fragment != installed
+        or properties["Type"] != "notify"
+        or properties["Restart"] != "no"
+        or properties["KillMode"] != "mixed"
+        or properties["TimeoutStopUSec"] != "20s"
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: the lighting service stop contract is not reviewed."
+        )
+
+
+def _verify_post_start_cleanup_quiescence(failure_raw: bytes) -> None:
+    service = _service_properties(
+        SERVICE_NAME,
+        ("LoadState", "ActiveState", "MainPID", "ControlPID"),
+    )
+    if (
+        service["LoadState"] != "loaded"
+        or service["ActiveState"] not in {"inactive", "failed"}
+        or service["MainPID"] != "0"
+        or service["ControlPID"] != "0"
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: the lighting service did not reach quiescence."
+        )
+
+    _verify_no_lighting_owners()
+    helper_paths = {ROOT / "apply-preset", ROOT / "effects-sdk", RAM_TETRIS}
+    try:
+        entries = tuple(PROC_ROOT.iterdir())
+    except OSError as error:
+        raise RecoveryBlocked(
+            "Recovery blocked: helper ownership is unreadable."
+        ) from error
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        argv = _process_argv(int(entry.name))
+        if any(Path(argument) in helper_paths for argument in argv):
+            raise RecoveryBlocked(
+                "Recovery blocked: a lighting preset, Effects, or writer helper is active."
+            )
+
+    if _lock_is_owned(state_root() / "apply.flock"):
+        raise RecoveryBlocked(
+            "Recovery blocked: the lighting preset operation lock is owned."
+        )
+    if _protected_failure_record()[0] != failure_raw:
+        raise RecoveryBlocked(
+            "Recovery blocked: the failure latch changed during cleanup."
+        )
+    if _preference():
+        raise RecoveryBlocked(
+            "Recovery blocked: RAM Tetris preference changed during cleanup."
+        )
+
+
+def _cleanup_failed_incomplete_shutdown_recovery(failure_raw: bytes) -> bool:
+    """Issue at most one authenticated bounded stop and prove full quiescence."""
+
+    try:
+        _authenticate_recovery_stop_unit()
+    except (RecoveryBlocked, OSError, subprocess.SubprocessError, ValueError):
+        return False
+
+    try:
+        subprocess.run(
+            [SYSTEMCTL, "--user", "stop", SERVICE_NAME],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=RECOVERY_STOP_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    try:
+        _verify_post_start_cleanup_quiescence(failure_raw)
+    except (RecoveryBlocked, OSError, subprocess.SubprocessError, ValueError):
+        return False
+    return True
+
+
+def _recover_incomplete_shutdown() -> dict[str, object]:
+    """Run one internally double-checked old-boot lifecycle recovery."""
+
+    failure_raw, _ = _protected_failure_record()
+    existing_outcome = _read_recovery_outcome(failure_raw)
+    if existing_outcome is not None and existing_outcome.get("outcome") in {
+        "recovery-in-progress",
+        "partial-recovery-cleaned-up",
+        "partial-recovery-still-active",
+    }:
+        raise RecoveryBlocked(
+            "Recovery blocked: a prior service-start attempt requires owner review."
+        )
+    start_attempted = False
+    try:
+        binding = _incomplete_shutdown_recovery_preflight(
+            require_preference_off=False
+        )
+        incident = binding.incident
+        if incident.failure_raw != failure_raw:
+            raise RecoveryBlocked(
+                "Recovery blocked: the failure latch changed during initial review."
+            )
+        for raw, kind in (
+            (incident.failure_raw, "failure"),
+            (incident.boundary_raw, "lifecycle-state"),
+            (binding.config_raw, "openrgb-config"),
+            (binding.historical_journal_raw, "incomplete-shutdown-journal"),
+            (
+                binding.current_qualification.evidence_raw,
+                "current-boot-qualification",
+            ),
+        ):
+            _preserve_evidence(raw, incident.incident_reference, kind)
+        _atomic_text(state_root() / "ram-tetris-enabled", "off\n")
+
+        second = _incomplete_shutdown_recovery_preflight(
+            require_preference_off=True,
+            current_qualification=binding.current_qualification,
+        )
+        if second != binding:
+            raise RecoveryBlocked(
+                "Recovery blocked: incomplete-shutdown evidence changed before "
+                "acknowledgment."
+            )
+
+        acknowledgement = subprocess.run(
+            [
+                SERVICE_GUARD,
+                "acknowledge-reviewed-recovery",
+                "--acknowledge-reviewed-recovery",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if acknowledgement.returncode != 0:
+            raise RecoveryBlocked(
+                "Recovery blocked: the qualified stale-boundary acknowledgment failed."
+            )
+        acknowledged = _read_service_state()
+        if (
+            acknowledged.get("state") != "clean-stopped"
+            or acknowledged.get("reason") != "acknowledged-reviewed-recovery"
+            or acknowledged.get("boot_id") != binding.current_boot_id
+            or _protected_failure_record()[0] != incident.failure_raw
+            or _preference()
+        ):
+            raise RecoveryBlocked(
+                "Recovery blocked: stale-boundary acknowledgment was not isolated."
+            )
+
+        _write_recovery_outcome(
+            incident.failure_raw,
+            "recovery-in-progress",
+            "The guarded lifecycle start is awaiting complete acceptance.",
+        )
+        start_deadline = time.monotonic() + SERVICE_START_TIMEOUT
+        start_attempted = True
+        start = subprocess.run(
+            [SYSTEMCTL, "--user", "start", SERVICE_NAME],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=SERVICE_START_TIMEOUT,
+        )
+        if start.returncode != 0:
+            raise RecoveryBlocked(
+                "Recovery blocked: the single service start failed; manual review is "
+                "required."
+            )
+        _wait_for_authoritative_lifecycle_ready(start_deadline)
+        ready_raw = _verify_incomplete_shutdown_running_continuity(binding)
+        if _verify_incomplete_shutdown_running_continuity(binding) != ready_raw:
+            raise RecoveryBlocked(
+                "Recovery blocked: service identity changed during final acceptance."
+            )
+        if _preference():
+            raise RecoveryBlocked(
+                "Recovery blocked: RAM Tetris preference changed before clearance."
+            )
+        _write_recovery_outcome(
+            incident.failure_raw,
+            "recovery-completed",
+            "Recovery completed successfully.",
+        )
+        _unlink_unchanged_latch(incident.failure_raw)
+        return {
+            "state": "recovered",
+            "incident_reference": incident.incident_reference,
+            "message": "Incomplete-shutdown recovery complete. RAM Tetris remains OFF.",
+        }
+    except Exception as error:
+        if not start_attempted:
+            _write_recovery_outcome(
+                failure_raw,
+                "blocked-before-service-start",
+                "Recovery blocked before service start.",
+            )
+            raise
+
+        try:
+            cleaned = _cleanup_failed_incomplete_shutdown_recovery(failure_raw)
+        except (RecoveryBlocked, OSError, subprocess.SubprocessError, ValueError):
+            cleaned = False
+        if cleaned:
+            outcome = "partial-recovery-cleaned-up"
+            summary = "partial recovery cleaned up"
+        else:
+            outcome = "partial-recovery-still-active"
+            summary = (
+                "partial recovery still active — ownership or writes not verified "
+                "stopped"
+            )
+        _write_recovery_outcome(failure_raw, outcome, summary)
+        raise RecoveryBlocked(f"{error} {summary}") from error
+
+
 def _recover_shutdown_race(confirmation_token: str) -> dict[str, object]:
     binding = _shutdown_race_recovery_preflight(require_preference_off=False)
     expected_token = _shutdown_race_confirmation_token(binding)
@@ -4695,9 +5625,26 @@ def _recover_transient_spd(confirmation_token: str) -> dict[str, object]:
     return result
 
 
-def recover(confirmation_token: str) -> dict[str, object]:
+def recover(confirmation_token: str = "") -> dict[str, object]:
     _, initial_record = _failure_record()
-    if _failure_message(initial_record) == SHUTDOWN_RACE_REASON:
+    initial_message = _failure_message(initial_record)
+    if _incomplete_shutdown_candidate_shape(initial_record, initial_message):
+        root = runtime_root()
+        _private_directory(root)
+        lock_fd = os.open(
+            root / "lighting-recovery.lock", os.O_WRONLY | os.O_CREAT, 0o600
+        )
+        try:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise RecoveryBlocked(
+                    "Recovery blocked: another recovery is active."
+                ) from error
+            return _recover_incomplete_shutdown()
+        finally:
+            os.close(lock_fd)
+    if initial_message == SHUTDOWN_RACE_REASON:
         root = runtime_root()
         _private_directory(root)
         lock_fd = os.open(
@@ -4713,7 +5660,7 @@ def recover(confirmation_token: str) -> dict[str, object]:
             return _recover_shutdown_race(confirmation_token)
         finally:
             os.close(lock_fd)
-    if TRANSIENT_SPD_REASON.fullmatch(_failure_message(initial_record)):
+    if TRANSIENT_SPD_REASON.fullmatch(initial_message):
         return _recover_transient_spd(confirmation_token)
 
     root = runtime_root()
@@ -5153,7 +6100,7 @@ def build_parser() -> argparse.ArgumentParser:
     actions.add_parser("status")
     actions.add_parser("prepare")
     recover_parser = actions.add_parser("recover")
-    recover_parser.add_argument("--confirm", required=True)
+    recover_parser.add_argument("--confirm", default="")
     historical = actions.add_parser("clear-resolved-lifecycle")
     historical.add_argument("--incident-reference", required=True)
     historical.add_argument("--latch-sha256", required=True)

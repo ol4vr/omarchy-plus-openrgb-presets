@@ -256,6 +256,74 @@ def unpack_rgbcolor(packed_rgbcolor: int) -> str:
 
 
 class PresetTests(unittest.TestCase):
+    def test_latched_preset_application_is_blocked_before_any_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_home = Path(temporary) / "state"
+            state_root = state_home / "omarchy-plus/openrgb-presets"
+            state_root.mkdir(parents=True, mode=0o700)
+            latch = state_root / "ram-tetris-failure.json"
+            latch.write_text('{"message":"test latch"}\n', encoding="utf-8")
+            environment = os.environ | {"XDG_STATE_HOME": str(state_home)}
+            result = subprocess.run(
+                [APPLY, "deep-red"],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=5,
+            )
+            self.assertEqual(result.returncode, 75)
+            self.assertIn("active lighting failure", result.stderr)
+            self.assertFalse((state_root / "active-preset").exists())
+            self.assertFalse((state_root / "apply.flock").exists())
+
+            restore = subprocess.run(
+                [APPLY, "--restore"],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=5,
+            )
+            self.assertEqual(restore.returncode, 75)
+            self.assertIn("active lighting failure", restore.stderr)
+
+            for arguments in (("--list",), ("--current",), ("--dry-run", "deep-red")):
+                with self.subTest(arguments=arguments):
+                    read_only = subprocess.run(
+                        [APPLY, *arguments],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        env=environment,
+                        timeout=5,
+                    )
+                    self.assertEqual(read_only.returncode, 0, read_only.stderr)
+
+    def test_panel_disables_all_preset_entry_points_while_latched(self) -> None:
+        panel = PANEL.read_text(encoding="utf-8")
+        self.assertIn(
+            "if (lightingFailure || actionProc.running || currentProc.running) return",
+            panel,
+        )
+        self.assertIn(
+            "enabled: !root.lightingFailure\n"
+            "                  && !actionProc.running && !currentProc.running",
+            panel,
+        )
+        self.assertIn("opacity: root.lightingFailure ? 0.46 : 1", panel)
+        self.assertIn('root.recoveryStatus === "partial-cleaned"', panel)
+        self.assertIn('root.recoveryStatus === "partial-active"', panel)
+        self.assertIn('root.recoveryStatus === "completed"', panel)
+        apply_source = APPLY.read_text(encoding="utf-8")
+        self.assertIn("is_guarded_recovery_restore", apply_source)
+        self.assertIn('"outcome":"recovery-in-progress"', apply_source)
+        self.assertIn(
+            r'\"latch_sha256\":\"${latch_sha256}\"', apply_source
+        )
+        self.assertIn('exec 7>"${RECOVERY_LOCK_FILE}"', apply_source)
+        self.assertIn('"${argument}" == "${LIFECYCLE}"', apply_source)
+
     def test_effects_profiles_exclude_ddr5_and_preserve_non_ram_zones(self) -> None:
         for name, expected_hash in PROFILE_HASHES.items():
             profile = load_profile(name)
@@ -326,7 +394,7 @@ class PresetTests(unittest.TestCase):
 
     def test_manifest_and_panel_order(self) -> None:
         manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.4.39")
+        self.assertEqual(manifest["version"], "0.4.40")
         self.assertEqual(manifest["kinds"], ["bar-widget"])
         self.assertNotIn("service", manifest["entryPoints"])
         self.assertFalse((ROOT / "Service.qml").exists())

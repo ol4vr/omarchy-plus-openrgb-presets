@@ -17,14 +17,19 @@ readonly STATE_ROOT="${XDG_STATE_HOME:-${HOME}/.local/state}/omarchy-plus/openrg
 readonly STATE_FILE="${STATE_ROOT}/active-preset"
 readonly LAST_LOG="${STATE_ROOT}/last-openrgb.log"
 readonly LOCK_FILE="${STATE_ROOT}/apply.flock"
+readonly FAILURE_FILE="${STATE_ROOT}/ram-tetris-failure.json"
+readonly RECOVERY_OUTCOME_FILE="${STATE_ROOT}/lighting-recovery-outcome.json"
 readonly USER_ID="$(/usr/bin/id -u)"
 readonly RUNTIME_ROOT="${OPENRGB_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/run/user/${USER_ID}}/omarchy-plus/openrgb-presets}"
 readonly TETRIS_LOCK_FILE="${RUNTIME_ROOT}/ram-tetris.lock"
+readonly RECOVERY_LOCK_FILE="${RUNTIME_ROOT}/lighting-recovery.lock"
+readonly LIFECYCLE="${SCRIPT_DIR}/openrgb-lifecycle"
 readonly PROBE_TIMEOUT="2s"
 readonly COMMAND_TIMEOUT="15s"
 readonly PROBE_ATTEMPTS=15
 
 dry_run=false
+restore=false
 
 usage() {
   /usr/bin/printf '%s\n' \
@@ -70,6 +75,54 @@ is_preset() {
     deep-red|bright-white|deep-blue|animated-rainbow|neon-rain|aurora-comet|spectrum-wave|matte-black-orange|electric-sunrise|horde-red|alliance-blue|black) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+is_guarded_recovery_restore() {
+  local current_pid="${PPID}"
+  local parent_pid=''
+  local argument=''
+  local latch_sha256=''
+  local depth=0
+  local lifecycle_ancestor=false
+
+  if [[ "${restore}" != true || ! -r "${RECOVERY_OUTCOME_FILE}" \
+    || ! -e "${RECOVERY_LOCK_FILE}" ]]; then
+    return 1
+  fi
+  if ! /usr/bin/grep -Fq '"outcome":"recovery-in-progress"' \
+    "${RECOVERY_OUTCOME_FILE}"; then
+    return 1
+  fi
+  latch_sha256="$(/usr/bin/sha256sum "${FAILURE_FILE}" 2>/dev/null \
+    | /usr/bin/awk '{ print $1; exit }' || true)"
+  if [[ ! "${latch_sha256}" =~ ^[0-9a-f]{64}$ ]] \
+    || ! /usr/bin/grep -Fq "\"latch_sha256\":\"${latch_sha256}\"" \
+      "${RECOVERY_OUTCOME_FILE}"; then
+    return 1
+  fi
+
+  exec 7>"${RECOVERY_LOCK_FILE}"
+  if /usr/bin/flock --nonblock 7; then
+    /usr/bin/flock --unlock 7
+    exec 7>&-
+    return 1
+  fi
+
+  while [[ "${current_pid}" =~ ^[0-9]+$ && "${current_pid}" -gt 1 \
+    && "${depth}" -lt 8 ]]; do
+    while IFS= read -r argument; do
+      if [[ "${argument}" == "${LIFECYCLE}" ]]; then
+        lifecycle_ancestor=true
+        break 2
+      fi
+    done < <(/usr/bin/tr '\0' '\n' <"/proc/${current_pid}/cmdline" 2>/dev/null || true)
+    parent_pid="$(/usr/bin/awk '/^PPid:/ { print $2; exit }' \
+      "/proc/${current_pid}/status" 2>/dev/null || true)"
+    current_pid="${parent_pid}"
+    ((depth += 1))
+  done
+  exec 7>&-
+  [[ "${lifecycle_ancestor}" == true ]]
 }
 
 static_ram_pattern() {
@@ -361,6 +414,7 @@ main() {
       return 0
       ;;
     --restore)
+      restore=true
       /usr/bin/mkdir -p "${STATE_ROOT}"
       if [[ -r "${STATE_FILE}" ]]; then
         preset="$(normalize_preset "$(/usr/bin/head -n 1 "${STATE_FILE}")")"
@@ -380,6 +434,16 @@ main() {
   if ! is_preset "${preset}"; then
     /usr/bin/printf 'Unknown preset: %s\n' "${preset}" >&2
     return 64
+  fi
+
+  if [[ -e "${FAILURE_FILE}" || -L "${FAILURE_FILE}" ]]; then
+    # The only latch exception is the lifecycle child used by the single guarded
+    # recovery start. It must share the exclusive recovery owner and outcome.
+    if ! is_guarded_recovery_restore; then
+      /usr/bin/printf '%s\n' \
+        'Preset application blocked: an active lighting failure requires recovery review.' >&2
+      return 75
+    fi
   fi
 
   if [[ ! -x "${OPENRGB_BIN}" ]]; then
