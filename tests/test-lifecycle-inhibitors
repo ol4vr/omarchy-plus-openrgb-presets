@@ -217,6 +217,9 @@ test_suspend_resume_preserves_monitor_and_reacquires() {
   local original_monitor="${monitor_pid}"
   local server_stop_requests=0
   local server_start_requests=0
+  stop_tetris() { return 0; }
+  stop_preset_operation() { return 0; }
+  verify_hardware_clients_quiesced() { return 0; }
   stop_server() {
     server_stop_requests=$((server_stop_requests + 1))
     clear_server_identity

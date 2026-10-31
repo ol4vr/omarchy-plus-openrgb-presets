@@ -599,6 +599,29 @@ lifecycle child during the single guarded recovery start; it must be descended
 from that lifecycle, share the exclusive recovery lock, and match the protected
 in-progress outcome. Diagnostics and recovery review remain available.
 
+Version 0.4.41 replaces the broad RAM-Tetris write gate with one exclusive
+`hardware-operation.lock` shared by writer frames, static DDR5 restoration,
+preset mutations, Effects changes, and controller-mode changes. Health,
+SPD5118, kernel-journal, controller, Effects, and frame work completes before
+the lock is requested. The lock covers only a final checkpoint (at most 250
+ms old), lifecycle/SDK/controller/preset/preference/latch qualification and
+one bounded mutation. `apply.flock` continues to serialize a whole preset and
+`ram-tetris.lock` remains the lifetime writer singleton.
+
+Shutdown now publishes authenticated intent atomically without acquiring the
+hardware lock. A separate bounded metadata mutex serializes marker replacement
+and compare-and-remove only: lifecycle intent may replace a preset marker, but
+a preset can clear only its own PID/start-bound marker and can never replace or
+remove lifecycle intent. The lifecycle waits for cooperative writer and preset-helper
+exit, escalates only against their revalidated PID/start/command identities,
+verifies the writer, preset, and hardware locks are unowned, and only then
+stops the authenticated SDK server and verifies listener absence. The old
+five-second write-gate wait and `ram-tetris-write.lock` are retired. The
+15-second lifecycle cleanup budget and 20-second systemd limit remain. The
+v0.4.40 generic recovery policy is unchanged except that its ownership checks
+now recognize `hardware-operation.lock`; its guarded restore exception is
+authenticated again at the new final mutation boundary.
+
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
 The experimental orange, blue, and red Sunrise gradients are therefore stored
@@ -1171,6 +1194,17 @@ shutdown ordering and the exact `LR-D9EEF3E29A1F07C9` recovery qualification.
 Preserve the old-boot latch and every retained evidence artifact. Rollback does
 not authorize a service operation, latch clearance, RGB write, preset change,
 or Tetris activation.
+
+## Roll back the 0.4.41 unified hardware-operation lock
+
+Redeploy exact published v0.4.40 commit
+`84a16b03a555af5e1cef967e4aa4c43f108d73fd`. Roll back only with the service
+stopped, the lifecycle, SDK, listener, writer, preset helper, and both old/new
+hardware-operation locks verified absent, and the current preset and Tetris
+preference preserved. Do not translate or remove a failure latch during the
+rollback. The v0.4.40 generic recovery remains available after rollback, but
+rollback itself does not authorize recovery, a service start, or any RGB
+mutation.
 
 ## Remove
 

@@ -236,7 +236,7 @@ def _run_checkpoint_boundary_process(result_queue) -> None:
     }
     _seed_checkpoint(writer, sdk)
     monotonic_samples = iter(
-        (0.249999, 0.250016, 0.250020, 0.304761, 0.304778, 0.304800)
+        (0.249999, 0.250016, 0.250020, 0.304761, 0.304778, 0.304800, 0.304801)
     )
     with (
         mock.patch.object(runtime, "_preference", return_value=True),
@@ -252,6 +252,108 @@ def _run_checkpoint_boundary_process(result_queue) -> None:
             "status_updates": tuple(control.states),
         }
     )
+
+
+def _run_blocked_writer_stage(
+    stage: str,
+    state_home: str,
+    runtime_root: str,
+    ready,
+    release,
+    result_queue,
+) -> None:
+    class BlockingHealth(FakeHealth):
+        def block(self, name):
+            if stage == name:
+                ready.set()
+                if not release.wait(3):
+                    raise runtime.SafetyStop("stage fixture timed out")
+
+        def verify_processes(self):
+            self.block("health")
+            self.block("static")
+            super().verify_processes()
+
+        def temperatures(self):
+            self.block("spd")
+            return super().temperatures()
+
+        def no_new_kernel_errors(self):
+            self.block("journal")
+            super().no_new_kernel_errors()
+
+    class BlockingSDK(FakeSDK):
+        def inventory(self):
+            if stage == "controller":
+                ready.set()
+                release.wait(3)
+            return super().inventory()
+
+        def active_effects(self):
+            if stage == "effects":
+                ready.set()
+                release.wait(3)
+            return super().active_effects()
+
+        def update_leds(self, index, colors):
+            if stage == "send":
+                ready.set()
+                release.wait(3)
+            super().update_leds(index, colors)
+
+    with mock.patch.dict(
+        os.environ,
+        {"XDG_STATE_HOME": state_home, "OPENRGB_RUNTIME_DIR": runtime_root},
+        clear=False,
+    ), mock.patch.object(runtime, "_preference", return_value=stage != "static"), mock.patch.object(
+        runtime, "_selected_preset", return_value="horde-red"
+    ):
+        control = runtime.RuntimeControl()
+        writer_fd = os.open(
+            control.root / "ram-tetris.lock", os.O_WRONLY | os.O_CREAT, 0o600
+        )
+        hardware_fd = os.open(
+            control.hardware_lock_path, os.O_WRONLY | os.O_CREAT, 0o600
+        )
+        fcntl.flock(writer_fd, fcntl.LOCK_EX)
+        sdk = BlockingSDK("#180000")
+        writer = runtime.TetrisWriter(
+            sdk,
+            BlockingHealth(),
+            FakeEffects(),
+            control,
+            "horde-red",
+            hardware_fd,
+            writer_fd,
+        )
+        writer.expected = {
+            identity: sdk.controllers[index].colors
+            for index, identity in enumerate(core.VERIFIED_DIMMS)
+        }
+        try:
+            if stage == "static":
+                control.publish_stop(runtime.StopRequest("user-off"))
+                first = writer._restore_static()
+                second = False
+            else:
+                first = writer._write(core.VERIFIED_DIMMS[0], ("#000001",) * 12)
+                second = writer._write(core.VERIFIED_DIMMS[1], ("#000002",) * 12)
+            result_queue.put((first, second, len(sdk.writes), None))
+        except Exception as error:  # noqa: BLE001 - child reports to parent
+            result_queue.put((False, False, len(sdk.writes), str(error)))
+        finally:
+            os.close(hardware_fd)
+            os.close(writer_fd)
+
+
+def _hold_exclusive_lock(path: str, ready, release) -> None:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        ready.set()
+        release.wait(3)
+    finally:
+        os.close(descriptor)
 
 
 class PaletteAndFrames(unittest.TestCase):
@@ -580,7 +682,7 @@ class CheckpointTests(unittest.TestCase):
         writer, sdk, health, control = self.writer(checkpoint_timeout=2.0)
         _seed_checkpoint(writer, sdk)
         monotonic_samples = iter(
-            (0.249999, 0.250016, 0.250020, 0.304761, 0.304778, 0.304800)
+            (0.249999, 0.250016, 0.250020, 0.304761, 0.304778, 0.304800, 0.304801)
         )
 
         with mock.patch.object(
@@ -834,7 +936,7 @@ class CheckpointTests(unittest.TestCase):
 
     @mock.patch.object(runtime, "_preference", return_value=True)
     @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
-    def test_checkpoint_timeout_releases_write_lock_and_restores_alarm_state(
+    def test_checkpoint_timeout_never_owns_hardware_lock_and_restores_alarm_state(
         self, _preset, _preference
     ):
         class BlockingHealth(FakeHealth):
@@ -852,8 +954,8 @@ class CheckpointTests(unittest.TestCase):
                 control = runtime.RuntimeControl()
                 writer_path = control.root / "ram-tetris.lock"
                 writer_fd = os.open(writer_path, os.O_WRONLY | os.O_CREAT, 0o600)
-                write_fd = os.open(
-                    control.write_lock_path, os.O_WRONLY | os.O_CREAT, 0o600
+                hardware_fd = os.open(
+                    control.hardware_lock_path, os.O_WRONLY | os.O_CREAT, 0o600
                 )
                 previous_handler = signal.getsignal(signal.SIGALRM)
                 try:
@@ -863,7 +965,7 @@ class CheckpointTests(unittest.TestCase):
                         checkpoint_timeout=0.02,
                     )
                     writer.writer_lock_fd = writer_fd
-                    writer.write_lock_fd = write_fd
+                    writer.hardware_lock_fd = hardware_fd
                     with self.assertRaisesRegex(runtime.SafetyStop, "exceeded"):
                         writer._write(core.VERIFIED_DIMMS[0], self.color(0))
                     with self.assertRaisesRegex(
@@ -871,7 +973,7 @@ class CheckpointTests(unittest.TestCase):
                     ):
                         writer._write(core.VERIFIED_DIMMS[0], self.color(1))
                     self.assertEqual(sdk.writes, [])
-                    probe_fd = os.open(control.write_lock_path, os.O_WRONLY)
+                    probe_fd = os.open(control.hardware_lock_path, os.O_WRONLY)
                     try:
                         fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     finally:
@@ -880,7 +982,7 @@ class CheckpointTests(unittest.TestCase):
                     self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
                     self.assertIs(signal.getsignal(signal.SIGALRM), previous_handler)
                 finally:
-                    os.close(write_fd)
+                    os.close(hardware_fd)
                     os.close(writer_fd)
 
     @mock.patch.object(runtime, "_preference", return_value=True)
@@ -1126,33 +1228,319 @@ class CheckpointTests(unittest.TestCase):
                 control = runtime.RuntimeControl()
                 writer_path = control.root / "ram-tetris.lock"
                 writer_fd = os.open(writer_path, os.O_WRONLY | os.O_CREAT, 0o600)
-                write_fd = os.open(
-                    control.write_lock_path, os.O_WRONLY | os.O_CREAT, 0o600
+                hardware_fd = os.open(
+                    control.hardware_lock_path, os.O_WRONLY | os.O_CREAT, 0o600
                 )
                 try:
-                    control.verify_runtime_ownership(writer_fd, write_fd)
+                    control.verify_runtime_ownership(writer_fd, hardware_fd)
                     writer_path.unlink()
                     writer_path.touch(mode=0o600)
                     with self.assertRaisesRegex(
                         runtime.SafetyStop, "ownership changed"
                     ):
-                        control.verify_runtime_ownership(writer_fd, write_fd)
+                        control.verify_runtime_ownership(writer_fd, hardware_fd)
                 finally:
-                    os.close(write_fd)
+                    os.close(hardware_fd)
                     os.close(writer_fd)
 
                 control.failure_path.parent.mkdir(parents=True, exist_ok=True)
                 control.failure_path.write_text("{}\n", encoding="utf-8")
                 writer_fd = os.open(writer_path, os.O_WRONLY)
-                write_fd = os.open(control.write_lock_path, os.O_WRONLY)
+                hardware_fd = os.open(control.hardware_lock_path, os.O_WRONLY)
                 try:
                     with self.assertRaisesRegex(
                         runtime.SafetyStop, "failure is active"
                     ):
-                        control.verify_runtime_ownership(writer_fd, write_fd)
+                        control.verify_runtime_ownership(writer_fd, hardware_fd)
                 finally:
-                    os.close(write_fd)
+                    os.close(hardware_fd)
                     os.close(writer_fd)
+
+
+class StageTwoProcessCoordinationTests(unittest.TestCase):
+    def run_stage(self, stage: str):
+        context = multiprocessing.get_context("fork")
+        with tempfile.TemporaryDirectory() as directory:
+            state_home = str(Path(directory, "state"))
+            runtime_root = str(Path(directory, "runtime"))
+            ready = context.Event()
+            release = context.Event()
+            result_queue = context.Queue()
+            process = context.Process(
+                target=_run_blocked_writer_stage,
+                args=(
+                    stage,
+                    state_home,
+                    runtime_root,
+                    ready,
+                    release,
+                    result_queue,
+                ),
+            )
+            process.start()
+            self.assertTrue(ready.wait(2), f"{stage} fixture did not reach boundary")
+            with mock.patch.dict(
+                os.environ,
+                {"XDG_STATE_HOME": state_home, "OPENRGB_RUNTIME_DIR": runtime_root},
+                clear=False,
+            ):
+                control = runtime.RuntimeControl()
+                probe = os.open(control.hardware_lock_path, os.O_WRONLY)
+                try:
+                    if stage == "send":
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    else:
+                        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fcntl.flock(probe, fcntl.LOCK_UN)
+                    started = runtime.time.monotonic()
+                    control.publish_stop(
+                        runtime.StopRequest(
+                            "shutdown",
+                            300,
+                            "lifecycle-start",
+                            200,
+                            "server-start",
+                        )
+                    )
+                    self.assertLess(runtime.time.monotonic() - started, 0.2)
+                finally:
+                    os.close(probe)
+            release.set()
+            process.join(timeout=5)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=1)
+                self.fail(f"{stage} fixture did not exit")
+            self.assertEqual(process.exitcode, 0)
+            result = result_queue.get(timeout=1)
+            return result
+
+    def test_shutdown_interrupts_all_expensive_checkpoint_phases(self):
+        for stage in ("health", "spd", "journal", "controller", "effects"):
+            with self.subTest(stage=stage):
+                first, second, writes, error = self.run_stage(stage)
+                self.assertIsNone(error)
+                self.assertFalse(first)
+                self.assertFalse(second)
+                self.assertEqual(writes, 0)
+
+    def test_send_already_admitted_finishes_but_no_later_write_begins(self):
+        first, second, writes, error = self.run_stage("send")
+        self.assertIsNone(error)
+        self.assertTrue(first)
+        self.assertFalse(second)
+        self.assertEqual(writes, 1)
+
+    def test_shutdown_during_static_restoration_stops_before_mutation(self):
+        first, second, writes, error = self.run_stage("static")
+        if error is not None:
+            self.assertIn("refused after stop intent", error)
+        self.assertFalse(first)
+        self.assertFalse(second)
+        self.assertEqual(writes, 0)
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_contended_hardware_lock_times_out_without_a_write(
+        self, _preset, _preference
+    ):
+        context = multiprocessing.get_context("fork")
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {
+                "XDG_STATE_HOME": str(Path(directory, "state")),
+                "OPENRGB_RUNTIME_DIR": str(Path(directory, "runtime")),
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                control = runtime.RuntimeControl()
+                writer_path = control.root / "ram-tetris.lock"
+                writer_fd = os.open(
+                    writer_path, os.O_WRONLY | os.O_CREAT, 0o600
+                )
+                hardware_fd = os.open(
+                    control.hardware_lock_path, os.O_WRONLY | os.O_CREAT, 0o600
+                )
+                holder_ready = context.Event()
+                holder_release = context.Event()
+                holder = context.Process(
+                    target=_hold_exclusive_lock,
+                    args=(str(control.hardware_lock_path), holder_ready, holder_release),
+                )
+                holder.start()
+                self.assertTrue(holder_ready.wait(2))
+                sdk = FakeSDK()
+                writer = runtime.TetrisWriter(
+                    sdk,
+                    FakeHealth(),
+                    FakeEffects(),
+                    control,
+                    "horde-red",
+                    hardware_fd,
+                    writer_fd,
+                )
+                writer.expected = {
+                    identity: sdk.controllers[index].colors
+                    for index, identity in enumerate(core.VERIFIED_DIMMS)
+                }
+                try:
+                    with self.assertRaisesRegex(
+                        runtime.SafetyStop, "lock acquisition timed out"
+                    ):
+                        writer._write(
+                            core.VERIFIED_DIMMS[0], ("#000001",) * core.LED_COUNT
+                        )
+                    self.assertEqual(sdk.writes, [])
+                finally:
+                    holder_release.set()
+                    holder.join(timeout=2)
+                    os.close(hardware_fd)
+                    os.close(writer_fd)
+
+    @mock.patch.object(runtime, "_preference", return_value=False)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_guarded_mutation_preserves_exact_external_command_contract(
+        self, _preset, _preference
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {
+                "XDG_STATE_HOME": str(Path(directory, "state")),
+                "OPENRGB_RUNTIME_DIR": str(Path(directory, "runtime")),
+            }
+            completed = subprocess.CompletedProcess([], 0)
+            lifecycle = runtime.LifecycleIdentity(
+                300, "lifecycle-start", "boot", 0
+            )
+            server = runtime.ServerIdentity(200, "server-start")
+            with (
+                mock.patch.dict(os.environ, environment, clear=False),
+                mock.patch.object(
+                    runtime, "_current_service_identity",
+                    return_value=(300, "lifecycle-start", 200, "server-start"),
+                ),
+                mock.patch.object(
+                    runtime, "_hardware_health",
+                    return_value=(
+                        lifecycle,
+                        server,
+                        {endpoint: 40_000 for endpoint in runtime.SPD_ENDPOINTS},
+                        4,
+                    ),
+                ),
+                mock.patch.object(runtime, "OpenRGBSDK", return_value=FakeSDK()),
+                mock.patch.object(
+                    runtime.LinuxHealth, "verify_immediate_identity"
+                ),
+                mock.patch.object(
+                    runtime.subprocess, "run", return_value=completed
+                ) as run,
+            ):
+                result = runtime._guarded_mutation(
+                    SimpleNamespace(
+                        command=(
+                            "--",
+                            "/usr/bin/openrgb",
+                            "--nodetect",
+                            "--device",
+                            "Corsair Dominator Platinum RGB DDR5",
+                            "--mode",
+                            "direct",
+                        ),
+                    )
+                )
+            self.assertEqual(result, 0)
+            self.assertEqual(
+                run.call_args.args[0],
+                (
+                    "/usr/bin/setpriv",
+                    "--pdeathsig",
+                    "TERM",
+                    "/usr/bin/openrgb",
+                    "--nodetect",
+                    "--device",
+                    "Corsair Dominator Platinum RGB DDR5",
+                    "--mode",
+                    "direct",
+                ),
+            )
+
+    def test_guarded_mutation_rejects_unapproved_helper_before_execution(self):
+        with self.assertRaisesRegex(runtime.SafetyStop, "not approved"):
+            runtime._guarded_mutation(
+                SimpleNamespace(
+                    command=("--", "/usr/bin/false")
+                )
+            )
+
+    def test_guarded_mutation_rejects_latch_before_health_or_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {
+                "XDG_STATE_HOME": str(Path(directory, "state")),
+                "OPENRGB_RUNTIME_DIR": str(Path(directory, "runtime")),
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                control = runtime.RuntimeControl()
+                control.failure_path.parent.mkdir(parents=True, exist_ok=True)
+                control.failure_path.write_text("{}\n", encoding="utf-8")
+                with (
+                    mock.patch.object(
+                        runtime, "_guarded_recovery_mutation_allowed",
+                        return_value=False,
+                    ),
+                    mock.patch.object(runtime, "_hardware_health") as health,
+                    mock.patch.object(runtime.subprocess, "run") as run,
+                    self.assertRaisesRegex(
+                        runtime.SafetyStop, "persistent RAM Tetris failure"
+                    ),
+                ):
+                    runtime._guarded_mutation(
+                        SimpleNamespace(
+                            command=("--", "/usr/bin/openrgb", "--nodetect")
+                        )
+                    )
+                health.assert_not_called()
+                run.assert_not_called()
+
+    def test_guarded_recovery_exception_binds_latch_owner_and_lifecycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {
+                "XDG_STATE_HOME": str(Path(directory, "state")),
+                "OPENRGB_RUNTIME_DIR": str(Path(directory, "runtime")),
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                control = runtime.RuntimeControl()
+                control.failure_path.parent.mkdir(parents=True, exist_ok=True)
+                control.failure_path.write_bytes(b"preserved-latch\n")
+                latch_hash = runtime.hashlib.sha256(
+                    control.failure_path.read_bytes()
+                ).hexdigest()
+                (runtime._state_root() / "lighting-recovery-outcome.json").write_text(
+                    json.dumps(
+                        {
+                            "outcome": "recovery-in-progress",
+                            "latch_sha256": latch_hash,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                lock_path = control.root / "lighting-recovery.lock"
+                owner_fd = os.open(
+                    lock_path, os.O_WRONLY | os.O_CREAT, 0o600
+                )
+                fcntl.flock(owner_fd, fcntl.LOCK_EX)
+                try:
+                    with (
+                        mock.patch.object(runtime.os, "getppid", return_value=300),
+                        mock.patch.object(
+                            runtime, "_process_argv", return_value=runtime.LIFECYCLE_ARGV
+                        ),
+                    ):
+                        self.assertTrue(
+                            runtime._guarded_recovery_mutation_allowed(control)
+                        )
+                finally:
+                    fcntl.flock(owner_fd, fcntl.LOCK_UN)
+                    os.close(owner_fd)
+                self.assertFalse(runtime._guarded_recovery_mutation_allowed(control))
 
 
 class ProcessIdentityTests(unittest.TestCase):
@@ -1356,9 +1744,9 @@ class RuntimeSafetyTests(unittest.TestCase):
             with mock.patch.dict(os.environ, environment, clear=False):
                 control = runtime.RuntimeControl()
                 gate_fd = os.open(
-                    control.write_lock_path, os.O_WRONLY | os.O_CREAT, 0o600
+                    control.hardware_lock_path, os.O_WRONLY | os.O_CREAT, 0o600
                 )
-                fcntl.flock(gate_fd, fcntl.LOCK_SH)
+                fcntl.flock(gate_fd, fcntl.LOCK_EX)
                 published = threading.Event()
                 request = runtime.StopRequest(
                     "handoff", 300, "lifecycle-start", 200, "server-start"
@@ -1370,15 +1758,15 @@ class RuntimeSafetyTests(unittest.TestCase):
 
                 publisher = threading.Thread(target=publish)
                 publisher.start()
-                self.assertFalse(published.wait(0.05))
-                self.assertFalse(control.stop_path.exists())
+                self.assertTrue(published.wait(0.05))
+                self.assertTrue(control.stop_path.exists())
                 fcntl.flock(gate_fd, fcntl.LOCK_UN)
                 os.close(gate_fd)
                 publisher.join(timeout=1)
                 self.assertTrue(published.is_set())
 
                 sdk = FakeSDK("#8B0000")
-                writer_fd = os.open(control.write_lock_path, os.O_WRONLY)
+                writer_fd = os.open(control.hardware_lock_path, os.O_WRONLY)
                 try:
                     writer = runtime.TetrisWriter(
                         sdk,
@@ -1642,7 +2030,13 @@ class RuntimeSafetyTests(unittest.TestCase):
                 ("request-stop", "user-off"),
                 ("completed-local-stop", "--pid", "1", "--start", "1"),
                 ("writer-started", "--pid", "1", "--start", "1"),
-                ("clear-stop",),
+                (
+                    "clear-local-stop",
+                    "--operation-pid",
+                    "1",
+                    "--operation-start",
+                    "1",
+                ),
                 ("fail", "simulated communication failure"),
                 ("clear-failure", "--acknowledge-reviewed-recovery"),
                 (
@@ -1664,6 +2058,7 @@ class RuntimeSafetyTests(unittest.TestCase):
                     check=command[0]
                     not in {
                         "clear-failure",
+                        "clear-local-stop",
                         "completed-local-stop",
                         "writer-started",
                     },
@@ -1721,7 +2116,15 @@ class RuntimeSafetyTests(unittest.TestCase):
                 "XDG_RUNTIME_DIR": str(Path(directory, "runtime")),
             }
             subprocess.run(
-                [ROOT / "ram-tetris", "request-stop", "preset-change"],
+                [
+                    ROOT / "ram-tetris",
+                    "request-stop",
+                    "preset-change",
+                    "--operation-pid",
+                    "1",
+                    "--operation-start",
+                    "1",
+                ],
                 env=env,
                 check=True,
             )
@@ -1840,6 +2243,270 @@ class RuntimeSafetyTests(unittest.TestCase):
                     "omarchy-plus/openrgb-presets/ram-tetris.stop"
                 ).exists()
             )
+
+    def test_shutdown_replacement_survives_preset_cleanup_and_blocks_mutations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory, "state/omarchy-plus/openrgb-presets")
+            runtime_root = Path(directory, "runtime/omarchy-plus/openrgb-presets")
+            state.mkdir(parents=True)
+            runtime_root.mkdir(parents=True)
+            (state / "active-preset").write_text("electric-sunrise\n")
+            (state / "ram-tetris-enabled").write_text("on\n")
+            env = os.environ | {
+                "XDG_STATE_HOME": str(Path(directory, "state")),
+                "XDG_RUNTIME_DIR": str(Path(directory, "runtime")),
+            }
+            preset_identity = (
+                "--operation-pid",
+                str(os.getpid()),
+                "--operation-start",
+                "preset-operation-start",
+            )
+            subprocess.run(
+                [
+                    ROOT / "ram-tetris",
+                    "request-stop",
+                    "preset-change",
+                    *preset_identity,
+                ],
+                env=env,
+                check=True,
+            )
+            subprocess.run(
+                [
+                    ROOT / "ram-tetris",
+                    "request-stop",
+                    "shutdown",
+                    "--lifecycle-pid",
+                    str(os.getpid()),
+                    "--lifecycle-start",
+                    "lifecycle-start",
+                    "--server-pid",
+                    str(os.getpid() + 1),
+                    "--server-start",
+                    "server-start",
+                ],
+                env=env,
+                check=True,
+            )
+            cleanup = subprocess.run(
+                [
+                    ROOT / "ram-tetris",
+                    "clear-local-stop",
+                    *preset_identity,
+                ],
+                env=env,
+                check=False,
+            )
+
+            self.assertEqual(cleanup.returncode, 1)
+            marker = json.loads((runtime_root / "ram-tetris.stop").read_text())
+            self.assertEqual(marker["reason"], "shutdown")
+            self.assertEqual(marker["lifecycle_pid"], os.getpid())
+
+            mutation_commands = (
+                (
+                    "guarded-mutation",
+                    "/usr/bin/openrgb",
+                    "--nodetect",
+                    "--profile",
+                    "fixture",
+                ),
+                ("guarded-mutation", str(ROOT / "effects-sdk"), "stop-all"),
+                (
+                    "run",
+                    "--server-pid",
+                    "1",
+                    "--server-start",
+                    "1",
+                    "--lifecycle-pid",
+                    "1",
+                    "--lifecycle-start",
+                    "1",
+                ),
+            )
+            for command in mutation_commands:
+                result = subprocess.run(
+                    [ROOT / "ram-tetris", *command],
+                    env=env,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(result.returncode, 0, command)
+
+            self.assertEqual(
+                json.loads((runtime_root / "ram-tetris.stop").read_text())["reason"],
+                "shutdown",
+            )
+
+    def test_preset_cleanup_removes_only_its_exact_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = os.environ | {
+                "XDG_STATE_HOME": str(Path(directory, "state")),
+                "XDG_RUNTIME_DIR": str(Path(directory, "runtime")),
+            }
+            runtime_root = Path(
+                directory, "runtime/omarchy-plus/openrgb-presets"
+            )
+            exact = (
+                "--operation-pid",
+                str(os.getpid()),
+                "--operation-start",
+                "exact-start",
+            )
+            subprocess.run(
+                [ROOT / "ram-tetris", "request-stop", "preset-change", *exact],
+                env=env,
+                check=True,
+            )
+            changed = subprocess.run(
+                [
+                    ROOT / "ram-tetris",
+                    "clear-local-stop",
+                    "--operation-pid",
+                    str(os.getpid()),
+                    "--operation-start",
+                    "changed-start",
+                ],
+                env=env,
+                check=False,
+            )
+            self.assertEqual(changed.returncode, 1)
+            self.assertTrue((runtime_root / "ram-tetris.stop").exists())
+
+            subprocess.run(
+                [ROOT / "ram-tetris", "clear-local-stop", *exact],
+                env=env,
+                check=True,
+            )
+            self.assertFalse((runtime_root / "ram-tetris.stop").exists())
+
+    def test_local_marker_cannot_replace_authenticated_shutdown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = os.environ | {
+                "XDG_STATE_HOME": str(Path(directory, "state")),
+                "XDG_RUNTIME_DIR": str(Path(directory, "runtime")),
+            }
+            marker_path = Path(
+                directory,
+                "runtime/omarchy-plus/openrgb-presets/ram-tetris.stop",
+            )
+            subprocess.run(
+                [
+                    ROOT / "ram-tetris",
+                    "request-stop",
+                    "shutdown",
+                    "--lifecycle-pid",
+                    "300",
+                    "--lifecycle-start",
+                    "lifecycle-start",
+                    "--server-pid",
+                    "200",
+                    "--server-start",
+                    "server-start",
+                ],
+                env=env,
+                check=True,
+            )
+            local = subprocess.run(
+                [
+                    ROOT / "ram-tetris",
+                    "request-stop",
+                    "preset-change",
+                    "--operation-pid",
+                    str(os.getpid()),
+                    "--operation-start",
+                    "preset-start",
+                ],
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(local.returncode, 0)
+            self.assertIn("lifecycle stop intent takes precedence", local.stderr)
+            self.assertEqual(
+                json.loads(marker_path.read_text())["reason"], "shutdown"
+            )
+
+    def test_stop_intent_lock_contention_is_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = os.environ | {
+                "XDG_STATE_HOME": str(Path(directory, "state")),
+                "XDG_RUNTIME_DIR": str(Path(directory, "runtime")),
+            }
+            runtime_root = Path(
+                directory, "runtime/omarchy-plus/openrgb-presets"
+            )
+            runtime_root.mkdir(parents=True)
+            with (runtime_root / "stop-intent.lock").open("w") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                result = subprocess.run(
+                    [ROOT / "ram-tetris", "request-stop", "user-off"],
+                    env=env,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=1,
+                )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("stop-intent lock acquisition timed out", result.stderr)
+
+    def test_inherited_startup_identity_cannot_bypass_stopping_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory, "state/omarchy-plus/openrgb-presets")
+            state_root.mkdir(parents=True)
+            state_root.joinpath("lifecycle-service-state.json").write_text(
+                json.dumps(
+                    {
+                        "state": "stopping",
+                        "lifecycle_pid": 300,
+                        "lifecycle_start": "lifecycle-start",
+                        "server_pid": 200,
+                        "server_start": "server-start",
+                    }
+                )
+            )
+            environment = {
+                "XDG_STATE_HOME": str(Path(directory, "state")),
+                "OPENRGB_LIFECYCLE_PID": "300",
+                "OPENRGB_LIFECYCLE_START": "lifecycle-start",
+                "OPENRGB_SERVER_PID": "200",
+                "OPENRGB_SERVER_START": "server-start",
+            }
+            with (
+                mock.patch.dict(os.environ, environment, clear=False),
+                self.assertRaisesRegex(runtime.SafetyStop, "lifecycle is stopping"),
+            ):
+                runtime._current_service_identity()
+
+    def test_matching_inherited_startup_identity_remains_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory, "state/omarchy-plus/openrgb-presets")
+            state_root.mkdir(parents=True)
+            state_root.joinpath("lifecycle-service-state.json").write_text(
+                json.dumps(
+                    {
+                        "state": "starting",
+                        "lifecycle_pid": 300,
+                        "lifecycle_start": "lifecycle-start",
+                    }
+                )
+            )
+            environment = {
+                "XDG_STATE_HOME": str(Path(directory, "state")),
+                "OPENRGB_LIFECYCLE_PID": "300",
+                "OPENRGB_LIFECYCLE_START": "lifecycle-start",
+                "OPENRGB_SERVER_PID": "200",
+                "OPENRGB_SERVER_START": "server-start",
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                self.assertEqual(
+                    runtime._current_service_identity(),
+                    (300, "lifecycle-start", 200, "server-start"),
+                )
 
     def test_failure_latch_persists_and_toggle_cannot_clear_it(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2487,19 +3154,17 @@ class IntegrationSourceTests(unittest.TestCase):
         stop = lifecycle.split("stop_tetris() {", 1)[1].split(
             "reconcile_tetris() {", 1
         )[0]
+        self.assertNotIn("stop_lock_fd", stop)
+        self.assertNotIn("TETRIS_WRITE_LOCK_FILE", stop)
         self.assertLess(
-            stop.index("TETRIS_STOP_FILE"),
-            stop.index('"${FLOCK_BIN}" --wait "${lock_wait}" "${stop_lock_fd}"'),
-        )
-        self.assertLess(
-            stop.index("TETRIS_STOP_FILE"),
+            stop.index('"${RAM_TETRIS}" request-stop'),
             stop.index('wait_for_process_exit "${tetris_pid}"'),
         )
         for field in (
-            "lifecycle_pid",
-            "lifecycle_start",
-            "server_pid",
-            "server_start",
+            "--lifecycle-pid",
+            "--lifecycle-start",
+            "--server-pid",
+            "--server-start",
         ):
             self.assertIn(field, stop)
         self.assertIn("self.health.verify_processes()", runner)
@@ -2537,19 +3202,21 @@ class IntegrationSourceTests(unittest.TestCase):
             '! is_server_listener "${server_pid}" "${server_start_time}"', loop
         )
 
-    def test_preset_transition_owns_stop_marker_until_static_apply_finishes(self):
+    def test_preset_transition_closes_writer_before_clearing_local_marker(self):
         apply = (ROOT / "apply-preset").read_text()
         lifecycle = (ROOT / "openrgb-lifecycle").read_text()
         runner = (ROOT / "ram-tetris").read_text()
         request = apply.index('"${RAM_TETRIS}" request-stop preset-change')
         tetris_lock = apply.index('exec 8>"${TETRIS_LOCK_FILE}"')
         quiesced = apply.index("/usr/bin/flock --wait 10 8")
-        apply_call = apply.index('apply_preset "${preset}"', quiesced)
-        clear = apply.index('"${RAM_TETRIS}" clear-stop', apply_call)
+        clear = apply.index('"${RAM_TETRIS}" clear-local-stop', quiesced)
+        apply_call = apply.index('apply_preset "${preset}"', clear)
         self.assertLess(request, tetris_lock)
         self.assertLess(tetris_lock, quiesced)
-        self.assertLess(quiesced, apply_call)
-        self.assertLess(apply_call, clear)
+        self.assertLess(quiesced, clear)
+        self.assertLess(clear, apply_call)
+        self.assertIn("guarded_hardware_mutation", apply)
+        self.assertIn("hardware-operation.lock", runner)
         quiescence_failure = apply.split("if ! /usr/bin/flock --wait 10 8; then", 1)[
             1
         ].split("fi", 1)[0]
@@ -2559,7 +3226,7 @@ class IntegrationSourceTests(unittest.TestCase):
         start_function = lifecycle.split("start_tetris() {", 1)[1].split(
             "stop_tetris() {", 1
         )[0]
-        self.assertNotIn("clear-stop", start_function)
+        self.assertNotIn("clear-local-stop", start_function)
         self.assertIn('"${PRESET_OPERATION_LOCK_FILE}"', start_function)
         locked_start = lifecycle.split("start_tetris_locked() {", 1)[1].split(
             "start_tetris() {", 1

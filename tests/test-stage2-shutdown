@@ -1,0 +1,131 @@
+#!/usr/bin/bash
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+readonly REPOSITORY_ROOT="$(/usr/bin/readlink -f "$(/usr/bin/dirname "${BASH_SOURCE[0]}")/..")"
+readonly TEST_ROOT="$(/usr/bin/mktemp -d)"
+readonly FAKE_APPLY="${TEST_ROOT}/apply-preset"
+
+cleanup_test() {
+  local child
+  while read -r child; do
+    [[ -z "${child}" ]] || kill -KILL "${child}" 2>/dev/null || true
+  done < <(jobs -pr)
+  wait 2>/dev/null || true
+  /usr/bin/rm -rf -- "${TEST_ROOT}"
+}
+trap cleanup_test EXIT
+
+/usr/bin/mkdir -p \
+  "${TEST_ROOT}/runtime" \
+  "${TEST_ROOT}/state/omarchy-plus/openrgb-presets"
+export OPENRGB_RUNTIME_DIR="${TEST_ROOT}/runtime"
+export XDG_STATE_HOME="${TEST_ROOT}/state"
+export APPLY_PRESET="${FAKE_APPLY}"
+
+/usr/bin/printf '%s\n' \
+  '#!/usr/bin/bash' \
+  'set -o errexit' \
+  'set -o nounset' \
+  'exec 9>"${XDG_STATE_HOME}/omarchy-plus/openrgb-presets/apply.flock"' \
+  '/usr/bin/flock 9' \
+  'exec 8>"${OPENRGB_RUNTIME_DIR}/hardware-operation.lock"' \
+  '/usr/bin/flock 8' \
+  'start="$(/usr/bin/awk '\''{print $22}'\'' "/proc/$$/stat")"' \
+  '/usr/bin/printf "%s %s\n" "$$" "${start}" >"${OPENRGB_RUNTIME_DIR}/preset-operation.state.$$"' \
+  '/usr/bin/mv -f -- "${OPENRGB_RUNTIME_DIR}/preset-operation.state.$$" "${OPENRGB_RUNTIME_DIR}/preset-operation.state"' \
+  'if [[ "${1}" == cooperative ]]; then' \
+  '  while [[ ! -e "${OPENRGB_RUNTIME_DIR}/ram-tetris.stop" ]]; do /usr/bin/sleep 0.01; done' \
+  '  exit 0' \
+  'fi' \
+  'trap "" TERM' \
+  'while true; do /usr/bin/sleep 0.1 9>&- 8>&-; done' >"${FAKE_APPLY}"
+/usr/bin/chmod 0755 "${FAKE_APPLY}"
+
+# shellcheck source=../openrgb-lifecycle
+source "${REPOSITORY_ROOT}/openrgb-lifecycle"
+
+wait_for_owner() {
+  local attempt
+  for attempt in {1..100}; do
+    [[ -s "${PRESET_OWNER_FILE}" ]] && return 0
+    /usr/bin/sleep 0.02
+  done
+  return 1
+}
+
+assert_locks_free() {
+  local apply_fd hardware_fd
+  exec {apply_fd}>"${PRESET_OPERATION_LOCK_FILE}"
+  "${FLOCK_BIN}" -n "${apply_fd}"
+  close_fd "${apply_fd}"
+  exec {hardware_fd}>"${HARDWARE_LOCK_FILE}"
+  "${FLOCK_BIN}" -n "${hardware_fd}"
+  close_fd "${hardware_fd}"
+}
+
+"${FAKE_APPLY}" cooperative &
+helper_pid=$!
+wait_for_owner
+/usr/bin/printf '%s\n' stop >"${TETRIS_STOP_FILE}"
+stop_preset_operation
+! kill -0 "${helper_pid}" 2>/dev/null
+assert_locks_free
+/usr/bin/printf '%s\n' \
+  'PASS: authenticated preset helper cooperates and releases both locks'
+
+/usr/bin/rm -f -- "${TETRIS_STOP_FILE}"
+"${FAKE_APPLY}" ignore &
+helper_pid=$!
+wait_for_owner
+/usr/bin/printf '%s\n' stop >"${TETRIS_STOP_FILE}"
+shutdown_deadline=$((SECONDS + 8))
+stop_preset_operation
+! kill -0 "${helper_pid}" 2>/dev/null
+assert_locks_free
+/usr/bin/printf '%s\n' \
+  'PASS: authenticated preset helper ignoring SIGTERM is killed boundedly'
+
+/usr/bin/rm -f -- "${TETRIS_STOP_FILE}"
+/usr/bin/sleep 30 &
+foreign_pid=$!
+foreign_start="$(process_start_time "${foreign_pid}")"
+/usr/bin/printf '%s %s\n' "${foreign_pid}" "${foreign_start}" >"${PRESET_OWNER_FILE}"
+if stop_preset_operation; then
+  /usr/bin/printf '%s\n' 'FAIL: foreign helper identity was accepted' >&2
+  exit 1
+fi
+kill -0 "${foreign_pid}"
+kill -TERM "${foreign_pid}"
+wait "${foreign_pid}" 2>/dev/null || true
+/usr/bin/rm -f -- "${PRESET_OWNER_FILE}"
+/usr/bin/printf '%s\n' \
+  'PASS: unauthenticated foreign process is never signaled'
+
+/usr/bin/rm -f -- "${TETRIS_STOP_FILE}"
+"${FAKE_APPLY}" cooperative &
+helper_pid=$!
+wait_for_owner
+sdk_stop_observed=false
+stop_tetris() {
+  /usr/bin/printf '%s\n' stop >"${TETRIS_STOP_FILE}"
+}
+stop_server() {
+  ! kill -0 "${helper_pid}" 2>/dev/null
+  assert_locks_free
+  sdk_stop_observed=true
+}
+mark_service_state() { return 0; }
+notify_service_status() { return 0; }
+release_inhibitor() { return 0; }
+stop_monitor() { return 0; }
+shutting_down=false
+shutdown_deadline=0
+cleanup deliberate
+[[ "${sdk_stop_observed}" == true ]]
+/usr/bin/printf '%s\n' \
+  'PASS: SDK teardown is called only after authenticated clients and locks exit'
+
+/usr/bin/printf '%s\n' 'Stage 2 shutdown process tests: PASS (4 cases)'

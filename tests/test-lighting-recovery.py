@@ -3186,8 +3186,8 @@ class LightingRecoveryTests(unittest.TestCase):
         ):
             recovery._verify_service_and_hardware(1_792_000_000.0)
 
-    def test_active_writer_or_write_lock_blocks_recovery(self):
-        for owned_name in ("ram-tetris.lock", "ram-tetris-write.lock"):
+    def test_active_writer_or_hardware_lock_blocks_recovery(self):
+        for owned_name in ("ram-tetris.lock", "hardware-operation.lock"):
             patches = self.healthy_verification_patches()
             with (
                 self.patched_environment(),

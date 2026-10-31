@@ -17,7 +17,6 @@ trap test_cleanup EXIT
 
 /usr/bin/mkdir -p "${TEST_ROOT}/runtime"
 export OPENRGB_RUNTIME_DIR="${TEST_ROOT}/runtime"
-export OPENRGB_TETRIS_WRITE_GATE_WAIT_SECONDS=1
 
 # shellcheck source=../openrgb-lifecycle
 source "${REPOSITORY_ROOT}/openrgb-lifecycle"
@@ -69,6 +68,8 @@ stop_tetris handoff >/dev/null
 ! kill -0 "${writer_pid}" 2>/dev/null
 exec 8>"${RUNTIME_DIR}/ram-tetris.lock"
 "${FLOCK_BIN}" -n 8
+"${FLOCK_BIN}" -u 8
+close_fd 8
 
 /usr/bin/python3 - "${TETRIS_STOP_FILE}" "$$" <<'PY'
 import json
@@ -94,26 +95,23 @@ PY
 (
   exec 9>"${RUNTIME_DIR}/ram-tetris.lock"
   "${FLOCK_BIN}" 9
-  exec 10>"${RUNTIME_DIR}/ram-tetris-write.lock"
-  "${FLOCK_BIN}" -s 10
+  trap '' TERM
   while [[ ! -e "${TETRIS_STOP_FILE}" ]]; do
     "${SLEEP_BIN}" 0.01
   done
-  "${SLEEP_BIN}" 2
+  while true; do "${SLEEP_BIN}" 1 9>&-; done
 ) &
 writer_pid=$!
 tetris_pid="${writer_pid}"
 tetris_start_time=writer-start
 shutdown_deadline=$((SECONDS + 4))
 
-if stop_tetris shutdown >/dev/null; then
-  /usr/bin/printf '%s\n' 'FAIL: write-gate timeout was accepted as quiescence' >&2
-  exit 1
-fi
+stop_tetris shutdown >/dev/null
 [[ -s "${TETRIS_STOP_FILE}" ]]
-kill -TERM "${writer_pid}" 2>/dev/null || true
-wait "${writer_pid}" 2>/dev/null || true
+! kill -0 "${writer_pid}" 2>/dev/null
+exec 7>"${RUNTIME_DIR}/ram-tetris.lock"
+"${FLOCK_BIN}" -n 7
 writer_pid=''
 
 /usr/bin/printf '%s\n' \
-  'PASS: bounded write-gate timeout retains authenticated shutdown intent and fails closed'
+  'PASS: writer ignoring cooperative stop and SIGTERM receives authenticated SIGKILL'

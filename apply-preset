@@ -5,6 +5,7 @@ set -o nounset
 set -o pipefail
 
 readonly OPENRGB_BIN="/usr/bin/openrgb"
+readonly SETPRIV_BIN="/usr/bin/setpriv"
 readonly SCRIPT_DIR="$(/usr/bin/readlink -f "$(/usr/bin/dirname "${BASH_SOURCE[0]}")")"
 readonly EFFECTS_SDK="${SCRIPT_DIR}/effects-sdk"
 readonly RAM_TETRIS="${RAM_TETRIS:-${SCRIPT_DIR}/ram-tetris}"
@@ -22,14 +23,15 @@ readonly RECOVERY_OUTCOME_FILE="${STATE_ROOT}/lighting-recovery-outcome.json"
 readonly USER_ID="$(/usr/bin/id -u)"
 readonly RUNTIME_ROOT="${OPENRGB_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/run/user/${USER_ID}}/omarchy-plus/openrgb-presets}"
 readonly TETRIS_LOCK_FILE="${RUNTIME_ROOT}/ram-tetris.lock"
+readonly PRESET_OWNER_FILE="${RUNTIME_ROOT}/preset-operation.state"
 readonly RECOVERY_LOCK_FILE="${RUNTIME_ROOT}/lighting-recovery.lock"
 readonly LIFECYCLE="${SCRIPT_DIR}/openrgb-lifecycle"
 readonly PROBE_TIMEOUT="2s"
-readonly COMMAND_TIMEOUT="15s"
 readonly PROBE_ATTEMPTS=15
 
 dry_run=false
 restore=false
+operation_identity=''
 
 usage() {
   /usr/bin/printf '%s\n' \
@@ -227,6 +229,19 @@ wait_for_effects() {
   return 1
 }
 
+guarded_hardware_mutation() {
+  local command=("$@")
+
+  if ! "${SETPRIV_BIN}" --pdeathsig TERM "${RAM_TETRIS}" guarded-mutation \
+    -- "${command[@]}" \
+    >"${LAST_LOG}" 2>&1 9>&- 8>&-; then
+    /usr/bin/printf '%s\n' \
+      "OpenRGB hardware mutation was refused or failed. Report: ${LAST_LOG}" >&2
+    /usr/bin/tail -n 20 "${LAST_LOG}" >&2
+    return 1
+  fi
+}
+
 stop_effects() {
   if [[ "${dry_run}" == true ]]; then
     print_effects_command stop-all
@@ -235,8 +250,7 @@ stop_effects() {
 
   wait_for_server || return 1
   wait_for_effects || return 1
-  if ! /usr/bin/timeout --signal=TERM --kill-after=1s "${COMMAND_TIMEOUT}" \
-    "${EFFECTS_SDK}" stop-all >"${LAST_LOG}" 2>&1; then
+  if ! guarded_hardware_mutation "${EFFECTS_SDK}" stop-all; then
     /usr/bin/printf '%s\n' "OpenRGB Effects Plugin failed to stop active effects. Report: ${LAST_LOG}" >&2
     /usr/bin/tail -n 20 "${LAST_LOG}" >&2
     return 1
@@ -254,8 +268,8 @@ apply_effects_profile() {
 
   wait_for_server || return 1
   wait_for_effects || return 1
-  if ! /usr/bin/timeout --signal=TERM --kill-after=1s "${COMMAND_TIMEOUT}" \
-    "${EFFECTS_SDK}" load-profile "${profile}" "${expected_effect}" >"${LAST_LOG}" 2>&1; then
+  if ! guarded_hardware_mutation \
+    "${EFFECTS_SDK}" load-profile "${profile}" "${expected_effect}"; then
     /usr/bin/printf '%s\n' "OpenRGB Effects profile failed. Report: ${LAST_LOG}" >&2
     /usr/bin/tail -n 20 "${LAST_LOG}" >&2
     return 1
@@ -287,8 +301,7 @@ run_openrgb() {
 
   wait_for_server || return 1
 
-  if ! /usr/bin/timeout --signal=TERM --kill-after=1s "${COMMAND_TIMEOUT}" \
-    "${OPENRGB_BIN}" --nodetect "$@" >"${LAST_LOG}" 2>&1; then
+  if ! guarded_hardware_mutation "${OPENRGB_BIN}" --nodetect "$@"; then
     /usr/bin/printf '%s\n' "OpenRGB failed. Report: ${LAST_LOG}" >&2
     /usr/bin/tail -n 20 "${LAST_LOG}" >&2
     return 1
@@ -451,6 +464,11 @@ main() {
     return 69
   fi
 
+  if [[ ! -x "${SETPRIV_BIN}" ]]; then
+    /usr/bin/printf 'Process-death guard is unavailable: %s\n' "${SETPRIV_BIN}" >&2
+    return 69
+  fi
+
   if [[ ! -x "${EFFECTS_SDK}" ]]; then
     /usr/bin/printf 'Effects SDK helper is unavailable: %s\n' "${EFFECTS_SDK}" >&2
     return 69
@@ -470,7 +488,16 @@ main() {
   fi
 
   /usr/bin/mkdir -p "${RUNTIME_ROOT}"
-  "${RAM_TETRIS}" request-stop preset-change
+  operation_pid="$$"
+  operation_start="$(/usr/bin/awk '{print $22}' "/proc/$$/stat")"
+  operation_identity="${operation_pid} ${operation_start}"
+  /usr/bin/printf '%s\n' "${operation_identity}" \
+    >"${PRESET_OWNER_FILE}.$$"
+  /usr/bin/mv -f -- "${PRESET_OWNER_FILE}.$$" "${PRESET_OWNER_FILE}"
+  trap 'if [[ -r "${PRESET_OWNER_FILE}" ]] && [[ "$(/usr/bin/head -n 1 "${PRESET_OWNER_FILE}")" == "${operation_identity}" ]]; then /usr/bin/rm -f -- "${PRESET_OWNER_FILE}"; fi' EXIT
+  "${RAM_TETRIS}" request-stop preset-change \
+    --operation-pid "${operation_pid}" \
+    --operation-start "${operation_start}"
   exec 8>"${TETRIS_LOCK_FILE}"
   if ! /usr/bin/flock --wait 10 8; then
     "${RAM_TETRIS}" fail 'RAM Tetris did not quiesce before preset application'
@@ -478,10 +505,19 @@ main() {
     return 75
   fi
 
+  # The writer singleton and whole-preset lock now close writer admission.  The
+  # local marker can be removed before mutation so the same final gate used by
+  # Tetris and shutdown remains authoritative.
+  if ! "${RAM_TETRIS}" clear-local-stop \
+    --operation-pid "${operation_pid}" \
+    --operation-start "${operation_start}"; then
+    /usr/bin/printf '%s\n' \
+      'Preset application refused: a newer stop intent took precedence.' >&2
+    return 75
+  fi
   trap '"${RAM_TETRIS}" fail '\''Preset application failed while RAM Tetris was quiesced'\''' ERR
   apply_preset "${preset}"
   trap - ERR
-  "${RAM_TETRIS}" clear-stop
 }
 
 main "$@"

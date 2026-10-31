@@ -221,9 +221,9 @@ tetris_writer_started "${tetris_pid}" "${tetris_start_time}"
 exec {operation_probe_fd}>"${PRESET_OPERATION_LOCK_FILE}"
 "${FLOCK_BIN}" -n "${operation_probe_fd}"
 close_fd "${operation_probe_fd}"
-exec {write_probe_fd}>"${TETRIS_WRITE_LOCK_FILE}"
-"${FLOCK_BIN}" -n "${write_probe_fd}"
-close_fd "${write_probe_fd}"
+exec {hardware_probe_fd}>"${HARDWARE_LOCK_FILE}"
+"${FLOCK_BIN}" -n "${hardware_probe_fd}"
+close_fd "${hardware_probe_fd}"
 pass 'completed transition starts exactly one replacement writer'
 
 reset_case

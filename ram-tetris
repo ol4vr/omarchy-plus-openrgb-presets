@@ -35,13 +35,15 @@ core = importlib.import_module("ram_tetris_core")
 
 HOST = "127.0.0.1"
 PORT = 6742
-SOURCE_VERSION = "0.4.34"
+SOURCE_VERSION = "0.4.41"
 SOURCE_PATH = "ram-tetris"
 EXPECTED_CONTROLLER_COUNT = 7
 HARDWARE_GATE_ATTEMPTS = 15
 HARDWARE_GATE_RETRY_SECONDS = 1.0
 HEALTH_CHECKPOINT_INTERVAL_SECONDS = 0.25
 HEALTH_CHECKPOINT_TIMEOUT_SECONDS = 2.0
+HARDWARE_LOCK_WAIT_SECONDS = 0.10
+STOP_INTENT_LOCK_WAIT_SECONDS = 0.25
 FAILURE_KERNEL_CAPTURE_TIMEOUT_SECONDS = 0.5
 PROTOCOL_VERSION = 4
 MAGIC = b"ORGB"
@@ -134,6 +136,8 @@ class StopRequest:
     lifecycle_start: str | None = None
     server_pid: int | None = None
     server_start: str | None = None
+    operation_pid: int | None = None
+    operation_start: str | None = None
 
 
 @dataclass(frozen=True)
@@ -892,7 +896,8 @@ class RuntimeControl:
         self.root = _runtime_root()
         _private_directory(self.root)
         self.stop_path = self.root / "ram-tetris.stop"
-        self.write_lock_path = self.root / "ram-tetris-write.lock"
+        self.stop_lock_path = self.root / "stop-intent.lock"
+        self.hardware_lock_path = self.root / "hardware-operation.lock"
         self.status_path = self.root / "ram-tetris-status.json"
         self.failure_path = _state_root() / "ram-tetris-failure.json"
 
@@ -914,14 +919,16 @@ class RuntimeControl:
             raise SafetyStop(f"{label} ownership changed")
 
     def verify_runtime_ownership(
-        self, writer_lock_fd: int | None, write_lock_fd: int | None
+        self, writer_lock_fd: int | None, hardware_lock_fd: int | None
     ) -> None:
         if self.failure_path.exists():
             raise SafetyStop("a persistent RAM Tetris failure is active")
         self._verify_open_lock(
             self.root / "ram-tetris.lock", writer_lock_fd, "writer singleton"
         )
-        self._verify_open_lock(self.write_lock_path, write_lock_fd, "RGB write gate")
+        self._verify_open_lock(
+            self.hardware_lock_path, hardware_lock_fd, "hardware-operation lock"
+        )
 
     def stop_request(self) -> StopRequest | None:
         try:
@@ -933,8 +940,24 @@ class RuntimeControl:
         if not isinstance(value, dict) or value.get("reason") not in STOP_REASONS:
             raise SafetyStop("RAM Tetris stop request is invalid")
         reason = value["reason"]
-        if reason in LOCAL_STOP_REASONS:
+        if reason == "user-off":
             return StopRequest(reason)
+        if reason == "preset-change":
+            operation_pid = value.get("operation_pid")
+            operation_start = value.get("operation_start")
+            if (
+                not isinstance(operation_pid, int)
+                or isinstance(operation_pid, bool)
+                or operation_pid <= 0
+                or not isinstance(operation_start, str)
+                or not operation_start
+            ):
+                raise SafetyStop("preset stop request is not authenticated")
+            return StopRequest(
+                reason,
+                operation_pid=operation_pid,
+                operation_start=operation_start,
+            )
         lifecycle_pid = value.get("lifecycle_pid")
         lifecycle_start = value.get("lifecycle_start")
         server_pid = value.get("server_pid")
@@ -967,6 +990,26 @@ class RuntimeControl:
         except SafetyStop:
             return "invalid-stop-request"
 
+    @contextmanager
+    def _stop_intent_lock(self):
+        lock_fd = os.open(self.stop_lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+        deadline = time.monotonic() + STOP_INTENT_LOCK_WAIT_SECONDS
+        try:
+            while True:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise SafetyStop("stop-intent lock acquisition timed out")
+                    time.sleep(0.005)
+            yield
+        finally:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+
     def publish_stop(self, request: StopRequest) -> None:
         value: dict[str, object] = {"reason": request.reason, "time": time.time()}
         if request.reason in LIFECYCLE_STOP_REASONS:
@@ -976,13 +1019,39 @@ class RuntimeControl:
                 server_pid=request.server_pid,
                 server_start=request.server_start,
             )
-        lock_fd = os.open(self.write_lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        elif request.reason == "preset-change":
+            value.update(
+                operation_pid=request.operation_pid,
+                operation_start=request.operation_start,
+            )
+        # Publication never holds this metadata lock while waiting for a
+        # writer, preset, or hardware lock. Conditional preset cleanup can
+        # acquire it while owning preset locks, but no path acquires those
+        # locks while holding it, so there is no inverse edge or lock cycle.
+        with self._stop_intent_lock():
+            if request.reason in LOCAL_STOP_REASONS:
+                current = self.stop_request()
+                if (
+                    current is not None
+                    and current.reason in LIFECYCLE_STOP_REASONS
+                ):
+                    raise SafetyStop(
+                        "authenticated lifecycle stop intent takes precedence"
+                    )
             _write_json(self.stop_path, value)
-        finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            os.close(lock_fd)
+
+    def clear_local_stop(self, expected: StopRequest) -> bool:
+        if expected.reason not in LOCAL_STOP_REASONS:
+            raise SafetyStop("only a local stop request may be cleared")
+        with self._stop_intent_lock():
+            current = self.stop_request()
+            if current != expected:
+                return False
+            try:
+                self.stop_path.unlink()
+            except FileNotFoundError:
+                return False
+            return True
 
     def status(self, state: str, message: str, **extra: object) -> None:
         _write_json(
@@ -1054,7 +1123,7 @@ class TetrisWriter:
         effects: EffectsContract,
         control: RuntimeControl,
         preset: str,
-        write_lock_fd: int | None = None,
+        hardware_lock_fd: int | None = None,
         writer_lock_fd: int | None = None,
         checkpoint_interval: float = HEALTH_CHECKPOINT_INTERVAL_SECONDS,
         checkpoint_timeout: float = HEALTH_CHECKPOINT_TIMEOUT_SECONDS,
@@ -1066,7 +1135,7 @@ class TetrisWriter:
         self.effects = effects
         self.control = control
         self.preset = preset
-        self.write_lock_fd = write_lock_fd
+        self.hardware_lock_fd = hardware_lock_fd
         self.writer_lock_fd = writer_lock_fd
         self.checkpoint_interval = checkpoint_interval
         self.checkpoint_timeout = checkpoint_timeout
@@ -1084,15 +1153,34 @@ class TetrisWriter:
         self.checkpoint_phase = "idle"
 
     @contextmanager
-    def _write_guard(self):
-        if self.write_lock_fd is None:
+    def _hardware_operation(self, *, allowed_stop: str | None = None):
+        if self.hardware_lock_fd is None:
             yield
             return
-        fcntl.flock(self.write_lock_fd, fcntl.LOCK_SH)
+        deadline = time.monotonic() + HARDWARE_LOCK_WAIT_SECONDS
+        while True:
+            request = self._validated_stop_request()
+            if request is not None and request.reason != allowed_stop:
+                raise SafetyStop("hardware operation refused after stop intent")
+            try:
+                fcntl.flock(
+                    self.hardware_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB
+                )
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise SafetyStop(
+                        "hardware-operation lock acquisition timed out",
+                        evidence={
+                            "failure_kind": "hardware-lock-timeout",
+                            "deadline_ms": round(HARDWARE_LOCK_WAIT_SECONDS * 1000),
+                        },
+                    )
+                time.sleep(0.005)
         try:
             yield
         finally:
-            fcntl.flock(self.write_lock_fd, fcntl.LOCK_UN)
+            fcntl.flock(self.hardware_lock_fd, fcntl.LOCK_UN)
 
     def request_termination(self, signum: int) -> None:
         self.termination_signal = signum
@@ -1121,7 +1209,9 @@ class TetrisWriter:
         return request
 
     def _lightweight_gate(self, *, require_fresh_checkpoint: bool) -> None:
-        self.control.verify_runtime_ownership(self.writer_lock_fd, self.write_lock_fd)
+        self.control.verify_runtime_ownership(
+            self.writer_lock_fd, self.hardware_lock_fd
+        )
         self.health.verify_immediate_identity()
         if self.checkpoint_failed:
             raise SafetyStop("RAM Tetris health checkpoint previously failed")
@@ -1271,59 +1361,57 @@ class TetrisWriter:
     def _write(
         self, identity: core.ControllerIdentity, colors: tuple[str, ...]
     ) -> bool:
-        with self._write_guard():
-            if self._validated_stop_request() is not None:
-                return False
-            self._lightweight_gate(require_fresh_checkpoint=False)
-            checkpoint, refreshed = self._ensure_health_checkpoint()
+        if self._validated_stop_request() is not None:
+            return False
+        self._lightweight_gate(require_fresh_checkpoint=False)
+        checkpoint, refreshed = self._ensure_health_checkpoint()
+        if self._validated_stop_request() is not None:
+            return False
+        try:
+            self._lightweight_gate(require_fresh_checkpoint=True)
+        except SafetyStop as error:
+            if refreshed or error.evidence.get("failure_kind") != "checkpoint-expired":
+                raise
+            trigger_age = error.evidence.get("checkpoint_age_ms")
+            try:
+                checkpoint = self._full_health_checkpoint()
+            except SafetyStop as refresh_error:
+                raise SafetyStop(
+                    str(refresh_error),
+                    evidence={
+                        **refresh_error.evidence,
+                        "checkpoint_refresh_attempts": 1,
+                        "checkpoint_refresh_result": "health-check-failed",
+                        "checkpoint_refresh_trigger_age_ms": trigger_age,
+                    },
+                ) from refresh_error
+            refreshed = True
             if self._validated_stop_request() is not None:
                 return False
             try:
                 self._lightweight_gate(require_fresh_checkpoint=True)
-            except SafetyStop as error:
-                if (
-                    refreshed
-                    or error.evidence.get("failure_kind") != "checkpoint-expired"
-                ):
-                    raise
-                trigger_age = error.evidence.get("checkpoint_age_ms")
-                try:
-                    checkpoint = self._full_health_checkpoint()
-                except SafetyStop as refresh_error:
-                    raise SafetyStop(
-                        str(refresh_error),
-                        evidence={
-                            **refresh_error.evidence,
-                            "checkpoint_refresh_attempts": 1,
-                            "checkpoint_refresh_result": "health-check-failed",
-                            "checkpoint_refresh_trigger_age_ms": trigger_age,
-                        },
-                    ) from refresh_error
-                refreshed = True
-                if self._validated_stop_request() is not None:
-                    return False
-                try:
-                    self._lightweight_gate(require_fresh_checkpoint=True)
-                except SafetyStop as refresh_error:
-                    result = "post-refresh-gate-failed"
-                    evidence = {
-                        **refresh_error.evidence,
-                        "checkpoint_refresh_attempts": 1,
-                        "checkpoint_refresh_trigger_age_ms": trigger_age,
-                    }
-                    if (
-                        refresh_error.evidence.get("failure_kind")
-                        == "checkpoint-expired"
-                    ):
-                        self.checkpoint_failed = True
-                        result = "refreshed-checkpoint-expired"
-                        evidence["refreshed_checkpoint_age_ms"] = (
-                            refresh_error.evidence.get("checkpoint_age_ms")
-                        )
-                    evidence["checkpoint_refresh_result"] = result
-                    raise SafetyStop(
-                        str(refresh_error), evidence=evidence
-                    ) from refresh_error
+            except SafetyStop as refresh_error:
+                result = "post-refresh-gate-failed"
+                evidence = {
+                    **refresh_error.evidence,
+                    "checkpoint_refresh_attempts": 1,
+                    "checkpoint_refresh_trigger_age_ms": trigger_age,
+                }
+                if refresh_error.evidence.get("failure_kind") == "checkpoint-expired":
+                    self.checkpoint_failed = True
+                    result = "refreshed-checkpoint-expired"
+                    evidence["refreshed_checkpoint_age_ms"] = (
+                        refresh_error.evidence.get("checkpoint_age_ms")
+                    )
+                evidence["checkpoint_refresh_result"] = result
+                raise SafetyStop(str(refresh_error), evidence=evidence) from refresh_error
+
+        # The health/SPD/journal/controller/Effects work above never owns this
+        # lock.  Only final qualification plus the SDK mutation is serialized.
+        with self._hardware_operation():
+            if self._validated_stop_request() is not None:
+                return False
+            self._lightweight_gate(require_fresh_checkpoint=True)
             if colors == self.expected[identity]:
                 raise SafetyStop("scheduler produced a redundant frame")
             self.sdk.update_leds(checkpoint.controllers[identity].index, colors)
@@ -1347,28 +1435,37 @@ class TetrisWriter:
     def _restore_static(self) -> bool:
         static = core.static_pattern_for(self.preset)
         for identity in core.VERIFIED_DIMMS:
-            with self._write_guard():
+            request = self._validated_stop_request()
+            if request is None or request.reason != "user-off":
+                return False
+            self._lightweight_gate(require_fresh_checkpoint=False)
+            with _bounded_operation(
+                self.checkpoint_timeout, "RAM Tetris restoration health gate"
+            ):
+                controllers, temperatures = self._health_gate_for_restoration()
+            # Reuse the completed restoration gate as the <=250 ms checkpoint
+            # for the immediate mutation qualification.
+            self.checkpoint = HealthCheckpoint(
+                controllers=controllers,
+                temperatures=temperatures,
+                completed_monotonic=time.monotonic(),
+                completed_unix=time.time(),
+                duration_seconds=0.0,
+            )
+            if controllers[identity].colors == static:
+                self.expected[identity] = static
+                continue
+            with self._hardware_operation(allowed_stop="user-off"):
                 request = self._validated_stop_request()
                 if request is None or request.reason != "user-off":
                     return False
-                self._lightweight_gate(require_fresh_checkpoint=False)
-                with _bounded_operation(
-                    self.checkpoint_timeout, "RAM Tetris restoration health gate"
-                ):
-                    controllers, _ = self._health_gate_for_restoration()
-                request = self._validated_stop_request()
-                if request is None or request.reason != "user-off":
-                    return False
-                self._lightweight_gate(require_fresh_checkpoint=False)
-                if controllers[identity].colors == static:
-                    self.expected[identity] = static
-                    continue
+                self._lightweight_gate(require_fresh_checkpoint=True)
                 self.sdk.update_leds(controllers[identity].index, static)
                 self.expected[identity] = static
-                with _bounded_operation(
-                    self.checkpoint_timeout, "RAM Tetris restoration verification"
-                ):
-                    self._health_gate_for_restoration()
+            with _bounded_operation(
+                self.checkpoint_timeout, "RAM Tetris restoration verification"
+            ):
+                self._health_gate_for_restoration()
         return True
 
     def _health_gate_for_restoration(
@@ -1393,19 +1490,18 @@ class TetrisWriter:
             self.checkpoint_timeout, "RAM Tetris kernel journal baseline"
         ):
             self.health.begin()
-        with self._write_guard():
-            initial_request = self._validated_stop_request()
-            if initial_request is not None and initial_request.reason != "user-off":
-                self.control.status(
-                    "stopped",
-                    f"RAM Tetris stopped for {initial_request.reason}",
-                    preset=self.preset,
-                    writes=0,
-                )
-                return
-            self._lightweight_gate(require_fresh_checkpoint=False)
-            checkpoint, _ = self._ensure_health_checkpoint()
-            self._lightweight_gate(require_fresh_checkpoint=True)
+        initial_request = self._validated_stop_request()
+        if initial_request is not None and initial_request.reason != "user-off":
+            self.control.status(
+                "stopped",
+                f"RAM Tetris stopped for {initial_request.reason}",
+                preset=self.preset,
+                writes=0,
+            )
+            return
+        self._lightweight_gate(require_fresh_checkpoint=False)
+        checkpoint, _ = self._ensure_health_checkpoint()
+        self._lightweight_gate(require_fresh_checkpoint=True)
         self.expected = {
             identity: target.colors
             for identity, target in checkpoint.controllers.items()
@@ -1518,6 +1614,8 @@ def _request_stop(
     lifecycle_start: str | None = None,
     server_pid: int | None = None,
     server_start: str | None = None,
+    operation_pid: int | None = None,
+    operation_start: str | None = None,
 ) -> None:
     control.publish_stop(
         StopRequest(
@@ -1526,6 +1624,8 @@ def _request_stop(
             lifecycle_start,
             server_pid,
             server_start,
+            operation_pid,
+            operation_start,
         )
     )
 
@@ -1551,7 +1651,9 @@ def _run(args: argparse.Namespace) -> int:
         return 0
     lock_path = control.root / "ram-tetris.lock"
     lock_fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
-    write_lock_fd = os.open(control.write_lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    hardware_lock_fd = os.open(
+        control.hardware_lock_path, os.O_WRONLY | os.O_CREAT, 0o600
+    )
     try:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1585,7 +1687,7 @@ def _run(args: argparse.Namespace) -> int:
                 EffectsContract(preset, Path(__file__).resolve().parent),
                 control,
                 preset,
-                write_lock_fd,
+                hardware_lock_fd,
                 lock_fd,
             )
             writer.run()
@@ -1619,7 +1721,7 @@ def _run(args: argparse.Namespace) -> int:
             sdk.close()
         return 0
     finally:
-        os.close(write_lock_fd)
+        os.close(hardware_lock_fd)
         os.close(lock_fd)
 
 
@@ -1726,6 +1828,221 @@ def _validate_health(args: argparse.Namespace) -> int:
     return 0
 
 
+def _current_service_identity() -> tuple[int, str, int, str]:
+    """Resolve the authenticated lifecycle boundary used by preset helpers."""
+
+    path = _state_root() / "lifecycle-service-state.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SafetyStop("authoritative lifecycle state is unreadable") from error
+    if not isinstance(value, dict):
+        raise SafetyStop("authoritative lifecycle state is invalid")
+
+    environment = (
+        os.environ.get("OPENRGB_LIFECYCLE_PID"),
+        os.environ.get("OPENRGB_LIFECYCLE_START"),
+        os.environ.get("OPENRGB_SERVER_PID"),
+        os.environ.get("OPENRGB_SERVER_START"),
+    )
+    if any(environment) and not all(environment):
+        raise SafetyStop("preset helper service identity is incomplete")
+    if all(environment):
+        try:
+            inherited = (
+                int(environment[0] or ""),
+                environment[1] or "",
+                int(environment[2] or ""),
+                environment[3] or "",
+            )
+        except ValueError as error:
+            raise SafetyStop("preset helper service identity is invalid") from error
+        if value.get("state") not in {"starting", "ready"}:
+            raise SafetyStop(
+                "authoritative lifecycle is stopping or unavailable for startup restoration"
+            )
+        if (
+            value.get("lifecycle_pid") != inherited[0]
+            or value.get("lifecycle_start") != inherited[1]
+        ):
+            raise SafetyStop("inherited lifecycle identity is no longer authoritative")
+        state_server = (value.get("server_pid"), value.get("server_start"))
+        if (
+            any(item is not None for item in state_server)
+            and state_server != inherited[2:]
+        ):
+            raise SafetyStop("inherited SDK identity is no longer authoritative")
+        return inherited
+    if not isinstance(value, dict) or value.get("state") != "ready":
+        raise SafetyStop("authoritative lifecycle is not ready for a hardware operation")
+    fields = (
+        value.get("lifecycle_pid"),
+        value.get("lifecycle_start"),
+        value.get("server_pid"),
+        value.get("server_start"),
+    )
+    if (
+        not isinstance(fields[0], int)
+        or isinstance(fields[0], bool)
+        or not isinstance(fields[1], str)
+        or not isinstance(fields[2], int)
+        or isinstance(fields[2], bool)
+        or not isinstance(fields[3], str)
+    ):
+        raise SafetyStop("authoritative lifecycle identity is invalid")
+    return fields[0], fields[1], fields[2], fields[3]
+
+
+def _guarded_recovery_mutation_allowed(control: RuntimeControl) -> bool:
+    """Mirror the existing recovery restore exception at the mutation gate."""
+
+    outcome_path = _state_root() / "lighting-recovery-outcome.json"
+    recovery_lock_path = control.root / "lighting-recovery.lock"
+    try:
+        outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
+        latch_hash = hashlib.sha256(control.failure_path.read_bytes()).hexdigest()
+    except (OSError, json.JSONDecodeError):
+        return False
+    if (
+        not isinstance(outcome, dict)
+        or outcome.get("outcome") != "recovery-in-progress"
+        or outcome.get("latch_sha256") != latch_hash
+    ):
+        return False
+    lock_fd = os.open(recovery_lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass
+        else:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            return False
+    finally:
+        os.close(lock_fd)
+    current = os.getppid()
+    for _ in range(8):
+        if current <= 1:
+            break
+        try:
+            if _process_argv(current) == LIFECYCLE_ARGV:
+                return True
+            current = _process_parent(current)
+        except (OSError, SafetyStop, ValueError):
+            return False
+    return False
+
+
+def _guarded_mutation(args: argparse.Namespace) -> int:
+    """Qualify, exclusively own, and perform exactly one hardware mutation."""
+
+    command = tuple(args.command)
+    if command and command[0] == "--":
+        command = command[1:]
+    effects_sdk = str(Path(__file__).resolve().parent / "effects-sdk")
+    openrgb_command = bool(
+        command
+        and command[0] == "/usr/bin/openrgb"
+        and command[1:2] == ("--nodetect",)
+    )
+    effects_command = bool(
+        command
+        and command[0] == effects_sdk
+        and (
+            command[1:] == ("stop-all",)
+            or (len(command) == 4 and command[1] == "load-profile")
+        )
+    )
+    if not openrgb_command and not effects_command:
+        raise SafetyStop("guarded hardware mutation command is not approved")
+    control = RuntimeControl()
+    recovery_allowed = (
+        control.failure_path.exists()
+        and _guarded_recovery_mutation_allowed(control)
+    )
+    if control.failure_path.exists() and not recovery_allowed:
+        raise SafetyStop("a persistent RAM Tetris failure is active")
+    if control.stop_request() is not None:
+        raise SafetyStop("hardware operation refused after stop intent")
+    lifecycle_pid, lifecycle_start, server_pid, server_start = (
+        _current_service_identity()
+    )
+    namespace = argparse.Namespace(
+        lifecycle_pid=lifecycle_pid,
+        lifecycle_start=lifecycle_start,
+        server_pid=server_pid,
+        server_start=server_start,
+    )
+    started = time.monotonic()
+    with _bounded_operation(
+        HEALTH_CHECKPOINT_TIMEOUT_SECONDS, "preset hardware checkpoint"
+    ):
+        lifecycle, server, _temperatures, dimm_count = _hardware_health(namespace)
+        effects = OpenRGBSDK()
+        try:
+            effects.open()
+            effects.active_effects()
+        finally:
+            effects.close()
+    completed = time.monotonic()
+    if completed - started > HEALTH_CHECKPOINT_TIMEOUT_SECONDS:
+        raise SafetyStop("preset hardware checkpoint exceeded its two-second deadline")
+    expected_preset = _selected_preset()
+    expected_preference = _preference()
+    lock_fd = os.open(
+        control.hardware_lock_path, os.O_WRONLY | os.O_CREAT, 0o600
+    )
+    deadline = time.monotonic() + HARDWARE_LOCK_WAIT_SECONDS
+    try:
+        while True:
+            if control.stop_request() is not None:
+                raise SafetyStop("hardware operation refused after stop intent")
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise SafetyStop("hardware-operation lock acquisition timed out")
+                time.sleep(0.005)
+
+        # Nothing expensive belongs below this point.
+        if (control.failure_path.exists() and not recovery_allowed) or (
+            control.stop_request() is not None
+        ):
+            raise SafetyStop("hardware operation refused by the final safety gate")
+        health = LinuxHealth(server, lifecycle)
+        health.verify_immediate_identity()
+        age = time.monotonic() - completed
+        if (
+            age < 0
+            or age > HEALTH_CHECKPOINT_INTERVAL_SECONDS
+            or dimm_count != len(core.VERIFIED_DIMMS)
+            or expected_preset != _selected_preset()
+            or expected_preference is not _preference()
+        ):
+            raise SafetyStop("hardware checkpoint changed or expired before mutation")
+        try:
+            result = subprocess.run(
+                ("/usr/bin/setpriv", "--pdeathsig", "TERM", *command),
+                check=False,
+                timeout=HEALTH_CHECKPOINT_TIMEOUT_SECONDS + 13,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise HardwareWriteFailure(
+                "guarded hardware mutation exceeded its fifteen-second deadline"
+            ) from error
+        if result.returncode != 0:
+            raise HardwareWriteFailure(
+                f"guarded hardware mutation exited with status {result.returncode}"
+            )
+        return 0
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     actions = parser.add_subparsers(dest="action", required=True)
@@ -1744,6 +2061,8 @@ def build_parser() -> argparse.ArgumentParser:
     validate_hardware.add_argument("--server-start", required=True)
     validate_hardware.add_argument("--lifecycle-pid", type=int, required=True)
     validate_hardware.add_argument("--lifecycle-start", required=True)
+    guarded_mutation = actions.add_parser("guarded-mutation")
+    guarded_mutation.add_argument("command", nargs=argparse.REMAINDER)
     actions.add_parser("status")
     actions.add_parser("enable")
     actions.add_parser("disable")
@@ -1756,7 +2075,11 @@ def build_parser() -> argparse.ArgumentParser:
     stop.add_argument("--server-start")
     stop.add_argument("--lifecycle-pid", type=int)
     stop.add_argument("--lifecycle-start")
-    actions.add_parser("clear-stop")
+    stop.add_argument("--operation-pid", type=int)
+    stop.add_argument("--operation-start")
+    clear_local = actions.add_parser("clear-local-stop")
+    clear_local.add_argument("--operation-pid", type=int, required=True)
+    clear_local.add_argument("--operation-start", required=True)
     completed_stop = actions.add_parser("completed-local-stop")
     completed_stop.add_argument("--pid", type=int, required=True)
     completed_stop.add_argument("--start", required=True)
@@ -1782,12 +2105,11 @@ def main() -> int:
         return _validate_health(args)
     if args.action == "validate-hardware":
         return _validate_hardware(args)
+    if args.action == "guarded-mutation":
+        return _guarded_mutation(args)
     if args.action == "enable":
         _atomic_text(_state_root() / "ram-tetris-enabled", "on\n")
-        try:
-            control.stop_path.unlink()
-        except FileNotFoundError:
-            pass
+        control.clear_local_stop(StopRequest("user-off"))
         print("RAM Tetris preference enabled")
         return 0
     if args.action == "disable":
@@ -1802,6 +2124,7 @@ def main() -> int:
             args.server_pid,
             args.server_start,
         )
+        operation_identity = (args.operation_pid, args.operation_start)
         if args.reason in LIFECYCLE_STOP_REASONS and any(
             item is None for item in identity
         ):
@@ -1812,6 +2135,16 @@ def main() -> int:
             item is not None for item in identity
         ):
             raise SystemExit("local stop request must not carry lifecycle identity")
+        if args.reason == "preset-change" and any(
+            item is None for item in operation_identity
+        ):
+            raise SystemExit("preset stop request requires its operation identity")
+        if args.reason != "preset-change" and any(
+            item is not None for item in operation_identity
+        ):
+            raise SystemExit(
+                "only a preset stop request may carry an operation identity"
+            )
         _request_stop(
             control,
             args.reason,
@@ -1819,14 +2152,17 @@ def main() -> int:
             args.lifecycle_start,
             args.server_pid,
             args.server_start,
+            args.operation_pid,
+            args.operation_start,
         )
         return 0
-    if args.action == "clear-stop":
-        try:
-            control.stop_path.unlink()
-        except FileNotFoundError:
-            pass
-        return 0
+    if args.action == "clear-local-stop":
+        expected = StopRequest(
+            "preset-change",
+            operation_pid=args.operation_pid,
+            operation_start=args.operation_start,
+        )
+        return 0 if control.clear_local_stop(expected) else 1
     if args.action == "completed-local-stop":
         reason = control.completed_local_stop(args.pid, args.start)
         if reason is None:

@@ -148,12 +148,12 @@ SHUTDOWN_RACE_SERVER_START: Final = "85366961"
 SHUTDOWN_RACE_WRITER_PID: Final = 394561
 SHUTDOWN_RACE_BOUNDARY_TIME: Final = 1793310621.0151148
 SHUTDOWN_RACE_FAILURE_TIME: Final = 1793310623.257292
-SHUTDOWN_RACE_CORRECTED_VERSION: Final = "0.4.40"
+SHUTDOWN_RACE_CORRECTED_VERSION: Final = "0.4.41"
 SHUTDOWN_RACE_CORRECTED_LIFECYCLE_SHA256: Final = (
-    "d03cb8a1525ea70f0e296a2a6bd9cc10f6c4f69a8aee685e1a03a5fb17ada7b2"
+    "6b97c0e1dc4befcc852f81f562342671c1be8b63eaaaf2785a0ba13123cba229"
 )
 SHUTDOWN_RACE_CORRECTED_RAM_TETRIS_SHA256: Final = (
-    "318a5d229dc0306c5ecb912e7fbedf727e590b28bb5b46a1420be372da2f1b18"
+    "9962b1bf8ef932ab2b8efae99ead191692cf3976b65d1e1f801d107dd9b2e66c"
 )
 SHUTDOWN_RACE_RECOVERY_BOOT_ID: Final = "8f7fdab1-de77-4db2-864c-ea5ce41a279c"
 SHUTDOWN_RACE_REVIEWED_KERNEL_MESSAGE: Final = (
@@ -2776,7 +2776,7 @@ def _verify_no_lighting_owners() -> None:
     for name, label in (
         ("lifecycle.lock", "lifecycle"),
         ("ram-tetris.lock", "RAM Tetris writer"),
-        ("ram-tetris-write.lock", "lighting write"),
+        ("hardware-operation.lock", "hardware operation"),
     ):
         if _lock_is_owned(root / name):
             raise RecoveryBlocked(f"Recovery blocked: the {label} lock is owned.")
@@ -3220,7 +3220,7 @@ def _verify_service_and_hardware(
         )
     if _lock_is_owned(root / "ram-tetris.lock"):
         raise RecoveryBlocked("Recovery blocked: a RAM Tetris writer owns its lock.")
-    if _lock_is_owned(root / "ram-tetris-write.lock"):
+    if _lock_is_owned(root / "hardware-operation.lock"):
         raise RecoveryBlocked("Recovery blocked: a lighting write is active.")
 
     for entry in PROC_ROOT.iterdir():
@@ -3464,7 +3464,7 @@ def _verify_historical_running_environment(
         )
     if _lock_is_owned(root / "ram-tetris.lock"):
         raise RecoveryBlocked("Recovery blocked: a RAM Tetris writer owns its lock.")
-    if _lock_is_owned(root / "ram-tetris-write.lock"):
+    if _lock_is_owned(root / "hardware-operation.lock"):
         raise RecoveryBlocked("Recovery blocked: a lighting write is active.")
     if require_preference_off and (
         _read_protected_bytes(

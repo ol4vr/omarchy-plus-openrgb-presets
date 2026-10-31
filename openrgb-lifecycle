@@ -40,12 +40,12 @@ readonly TETRIS_FAILURE_FILE="${STATE_ROOT}/ram-tetris-failure.json"
 readonly TETRIS_STATUS_FILE="${RUNTIME_DIR}/ram-tetris-status.json"
 readonly TETRIS_STOP_FILE="${RUNTIME_DIR}/ram-tetris.stop"
 readonly TETRIS_LOCK_FILE="${RUNTIME_DIR}/ram-tetris.lock"
-readonly TETRIS_WRITE_LOCK_FILE="${RUNTIME_DIR}/ram-tetris-write.lock"
+readonly HARDWARE_LOCK_FILE="${RUNTIME_DIR}/hardware-operation.lock"
+readonly PRESET_OWNER_FILE="${RUNTIME_DIR}/preset-operation.state"
 readonly USER_MANAGER_COMMAND="${USER_MANAGER_COMMAND:-/usr/lib/systemd/systemd --user}"
 readonly RESTORE_TIMEOUT="75s"
 readonly RESUME_DELAY="${OPENRGB_RESUME_DELAY:-3}"
 readonly SHUTDOWN_BUDGET_SECONDS=15
-readonly TETRIS_WRITE_GATE_WAIT_SECONDS="${OPENRGB_TETRIS_WRITE_GATE_WAIT_SECONDS:-5}"
 readonly -a OPENRGB_SERVER_ARGS=(
   --noautoconnect
   --startminimized
@@ -353,6 +353,95 @@ verify_tetris_lock_released() {
   close_fd "${verify_fd}"
 }
 
+verify_exclusive_lock_released() {
+  local path="${1}"
+  local label="${2}"
+  local verify_fd=''
+  local old_umask=''
+
+  old_umask="$(umask)"
+  umask 077
+  "${MKDIR_BIN}" -p -- "$(/usr/bin/dirname "${path}")"
+  exec {verify_fd}>"${path}"
+  umask "${old_umask}"
+  if ! "${FLOCK_BIN}" -n "${verify_fd}"; then
+    close_fd "${verify_fd}"
+    log "${label} is still owned"
+    return 1
+  fi
+  close_fd "${verify_fd}"
+}
+
+is_preset_operation_process() {
+  local pid="${1:-}"
+  local start_time="${2:-}"
+  local command=''
+
+  is_same_process "${pid}" "${start_time}" || return 1
+  [[ "$(process_uid "${pid}" 2>/dev/null || true)" == "${USER_ID}" ]] || return 1
+  command="$(process_command "${pid}" 2>/dev/null || true)"
+  [[ "${command}" == "/usr/bin/bash ${APPLY_PRESET} "* \
+    || "${command}" == "/usr/bin/bash ${APPLY_PRESET}" ]]
+}
+
+stop_preset_operation() {
+  local pid=''
+  local start_time=''
+  local recorded=''
+
+  if [[ -r "${PRESET_OWNER_FILE}" ]]; then
+    recorded="$(/usr/bin/head -n 1 "${PRESET_OWNER_FILE}" 2>/dev/null || true)"
+    read -r pid start_time <<<"${recorded}"
+  fi
+  if [[ -z "${pid}" ]]; then
+    verify_exclusive_lock_released \
+      "${PRESET_OPERATION_LOCK_FILE}" 'preset-operation lock'
+    return
+  fi
+  if process_has_exited "${pid}" "${start_time}"; then
+    /usr/bin/rm -f -- "${PRESET_OWNER_FILE}"
+  elif ! is_preset_operation_process "${pid}" "${start_time}"; then
+    if process_has_exited "${pid}" "${start_time}"; then
+      /usr/bin/rm -f -- "${PRESET_OWNER_FILE}"
+      verify_exclusive_lock_released \
+        "${PRESET_OPERATION_LOCK_FILE}" 'preset-operation lock'
+      return
+    fi
+    log "Refusing to signal unauthenticated preset operation PID ${pid}"
+    return 1
+  else
+    if ! wait_for_process_exit "${pid}" "${start_time}" 40 0.05; then
+      is_preset_operation_process "${pid}" "${start_time}" || {
+        log "Preset operation identity changed before SIGTERM"
+        return 1
+      }
+      kill -TERM "${pid}" 2>/dev/null || true
+      if ! wait_for_process_exit "${pid}" "${start_time}" 20 0.05; then
+        is_preset_operation_process "${pid}" "${start_time}" || {
+          log "Preset operation identity changed before SIGKILL"
+          return 1
+        }
+        kill -KILL "${pid}" 2>/dev/null || true
+        if ! wait_for_process_exit "${pid}" "${start_time}" 20 0.05; then
+          log "Authenticated preset operation did not exit before shutdown deadline"
+          return 1
+        fi
+      fi
+    fi
+    /usr/bin/rm -f -- "${PRESET_OWNER_FILE}"
+  fi
+  verify_exclusive_lock_released \
+    "${PRESET_OPERATION_LOCK_FILE}" 'preset-operation lock'
+}
+
+verify_hardware_clients_quiesced() {
+  verify_tetris_lock_released \
+    && verify_exclusive_lock_released \
+      "${PRESET_OPERATION_LOCK_FILE}" 'preset-operation lock' \
+    && verify_exclusive_lock_released \
+      "${HARDWARE_LOCK_FILE}" 'hardware-operation lock'
+}
+
 acquire_lifecycle_lock() {
   local old_umask
   old_umask="$(umask)"
@@ -500,7 +589,6 @@ start_tetris_locked() {
   (
     close_lock_for_child
     close_fd "${operation_lock_fd}"
-    close_fd "${start_write_lock_fd}"
     exec "${SETPRIV_BIN}" --pdeathsig TERM "${RAM_TETRIS}" run \
       --server-pid "${server_pid}" \
       --server-start "${server_start_time}" \
@@ -540,7 +628,6 @@ start_tetris_locked() {
 
 start_tetris() {
   local operation_lock_fd=''
-  local start_write_lock_fd=''
   local old_umask=''
   local result=0
 
@@ -552,17 +639,7 @@ start_tetris() {
     close_fd "${operation_lock_fd}"
     return 0
   fi
-  old_umask="$(umask)"
-  umask 077
-  exec {start_write_lock_fd}>"${TETRIS_WRITE_LOCK_FILE}"
-  umask "${old_umask}"
-  if ! "${FLOCK_BIN}" -n "${start_write_lock_fd}"; then
-    close_fd "${start_write_lock_fd}"
-    close_fd "${operation_lock_fd}"
-    return 0
-  fi
   start_tetris_locked || result=$?
-  close_fd "${start_write_lock_fd}"
   close_fd "${operation_lock_fd}"
   return "${result}"
 }
@@ -571,56 +648,28 @@ stop_tetris() {
   local reason="${1:-handoff}"
   local exit_status=''
   local lifecycle_start=''
-  local stop_lock_fd=''
-  local stop_temp=''
-  local stop_time=''
-  local old_umask=''
-  local lock_wait=''
+
+  if [[ "${reason}" == @(handoff|suspend|shutdown) ]]; then
+    lifecycle_start="$(process_start_time $$)"
+    is_server_listener "${server_pid}" "${server_start_time}" || return 1
+    if ! "${RAM_TETRIS}" request-stop "${reason}" \
+      --lifecycle-pid "$$" \
+      --lifecycle-start "${lifecycle_start}" \
+      --server-pid "${server_pid}" \
+      --server-start "${server_start_time}" >/dev/null 2>&1; then
+      log "Failed to establish authenticated RAM Tetris ${reason} intent"
+      return 1
+    fi
+  elif ! "${RAM_TETRIS}" request-stop "${reason}" >/dev/null 2>&1; then
+    log "Failed to establish RAM Tetris ${reason} stop"
+    return 1
+  fi
 
   if [[ -z "${tetris_pid}" ]]; then
     return 0
   fi
   if ! is_tetris_process "${tetris_pid}" "${tetris_start_time}"; then
     log "Refusing stop request for changed RAM Tetris PID ${tetris_pid}"
-    return 1
-  fi
-
-  if [[ "${reason}" == @(handoff|suspend|shutdown) ]]; then
-    lifecycle_start="$(process_start_time $$)"
-    is_server_listener "${server_pid}" "${server_start_time}" || return 1
-    stop_temp="${TETRIS_STOP_FILE}.$$"
-    stop_time="${EPOCHREALTIME}"
-    if ! (
-      umask 077
-      /usr/bin/printf \
-        '{"lifecycle_pid":%s,"lifecycle_start":"%s","reason":"%s","server_pid":%s,"server_start":"%s","time":%s}\n' \
-        "$$" "${lifecycle_start}" "${reason}" \
-        "${server_pid}" "${server_start_time}" "${stop_time}" >"${stop_temp}"
-    ) || ! "${MV_BIN}" -f -- "${stop_temp}" "${TETRIS_STOP_FILE}"; then
-      log "Failed to establish authenticated RAM Tetris ${reason} intent"
-      return 1
-    fi
-    old_umask="$(umask)"
-    umask 077
-    exec {stop_lock_fd}>"${TETRIS_WRITE_LOCK_FILE}"
-    umask "${old_umask}"
-    lock_wait="$(shutdown_seconds_remaining 2>/dev/null || true)"
-    if [[ -z "${lock_wait}" ]]; then
-      close_fd "${stop_lock_fd}"
-      log "Lifecycle shutdown deadline expired before the RAM Tetris write gate was acquired"
-      return 1
-    fi
-    if ((lock_wait > TETRIS_WRITE_GATE_WAIT_SECONDS)); then
-      lock_wait="${TETRIS_WRITE_GATE_WAIT_SECONDS}"
-    fi
-    if ! "${FLOCK_BIN}" --wait "${lock_wait}" "${stop_lock_fd}"; then
-      close_fd "${stop_lock_fd}"
-      log "Timed out acquiring the RAM Tetris write gate for ${reason}"
-      return 1
-    fi
-    close_fd "${stop_lock_fd}"
-  elif ! "${RAM_TETRIS}" request-stop "${reason}" >/dev/null 2>&1; then
-    log "Failed to establish RAM Tetris ${reason} stop"
     return 1
   fi
 
@@ -637,14 +686,19 @@ stop_tetris() {
   if is_tetris_process "${tetris_pid}" "${tetris_start_time}"; then
     kill -TERM "${tetris_pid}" 2>/dev/null || true
     if ! wait_for_process_exit "${tetris_pid}" "${tetris_start_time}" 20 0.1; then
-      log "RAM Tetris did not exit before the lifecycle shutdown deadline"
-      return 1
+      if ! is_tetris_process "${tetris_pid}" "${tetris_start_time}"; then
+        log "Refusing SIGKILL for changed RAM Tetris PID ${tetris_pid}"
+        return 1
+      fi
+      kill -KILL "${tetris_pid}" 2>/dev/null || true
+      if ! wait_for_process_exit "${tetris_pid}" "${tetris_start_time}" 20 0.1; then
+        log "RAM Tetris did not exit before the lifecycle shutdown deadline"
+        return 1
+      fi
     fi
     exit_status="${wait_exit_status}"
     if [[ "${exit_status}" -ne 0 ]]; then
-      clear_tetris_identity
-      record_tetris_exit_failure "${exit_status}"
-      return 1
+      log "RAM Tetris required authenticated signal escalation for ${reason}"
     fi
   else
     log "Refusing to signal changed RAM Tetris PID ${tetris_pid}"
@@ -885,6 +939,10 @@ start_restore() {
   fi
   (
     close_lock_for_child
+    export OPENRGB_LIFECYCLE_PID="$$"
+    export OPENRGB_LIFECYCLE_START="${lifecycle_start}"
+    export OPENRGB_SERVER_PID="${server_pid}"
+    export OPENRGB_SERVER_START="${server_start_time}"
     exec "${SETPRIV_BIN}" --pdeathsig TERM \
       "${TIMEOUT_BIN}" --signal=TERM --kill-after=2s "${RESTORE_TIMEOUT}" \
       "${APPLY_PRESET}" --restore
@@ -1083,7 +1141,9 @@ handle_sleep_signal() {
     fi
     suspended=true
     log "PrepareForSleep(true): stopping OpenRGB"
-    if ! stop_tetris suspend || ! verify_tetris_lock_released; then
+    if ! stop_tetris suspend \
+      || ! stop_preset_operation \
+      || ! verify_hardware_clients_quiesced; then
       /usr/bin/printf '%s\n' 'RAM Tetris could not be stopped safely before sleep' >&2
       /usr/bin/printf '%s\n' 'OpenRGB SDK teardown skipped because RAM Tetris still owns shutdown state' >&2
     elif ! stop_server 'suspend'; then
@@ -1155,7 +1215,15 @@ cleanup() {
     failed=true
     tetris_quiesced=false
   fi
-  if ! verify_tetris_lock_released; then
+  stop_restore || {
+    failed=true
+    tetris_quiesced=false
+  }
+  if ! stop_preset_operation; then
+    failed=true
+    tetris_quiesced=false
+  fi
+  if ! verify_hardware_clients_quiesced; then
     failed=true
     tetris_quiesced=false
   fi
