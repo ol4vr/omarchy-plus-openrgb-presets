@@ -20,6 +20,8 @@ readonly FLOCK_BIN="${FLOCK_BIN:-/usr/bin/flock}"
 readonly MKDIR_BIN="${MKDIR_BIN:-/usr/bin/mkdir}"
 readonly MV_BIN="${MV_BIN:-/usr/bin/mv}"
 readonly TR_BIN="${TR_BIN:-/usr/bin/tr}"
+readonly SHA256SUM_BIN="${SHA256SUM_BIN:-/usr/bin/sha256sum}"
+readonly READLINK_BIN="${READLINK_BIN:-/usr/bin/readlink}"
 readonly SYSTEMD_NOTIFY_BIN="${SYSTEMD_NOTIFY_BIN:-/usr/bin/systemd-notify}"
 readonly PROC_ROOT="${PROC_ROOT:-/proc}"
 readonly SCRIPT_PATH="$(/usr/bin/readlink -f "${BASH_SOURCE[0]}")"
@@ -78,6 +80,19 @@ listener_query_owner=''
 server_identity_failure_stage=''
 server_identity_observed_pid=''
 server_identity_observed_start=''
+server_identity_process_state=''
+server_identity_command_state='not-observed'
+server_identity_observed_command_sha256=''
+server_identity_expected_command_sha256=''
+server_identity_observed_command_argc=''
+server_identity_expected_command_argc=''
+server_identity_executable_state='not-observed'
+server_identity_observed_executable=''
+server_identity_observed_executable_sha256=''
+server_identity_expected_executable_sha256=''
+server_identity_ownership_state='not-observed'
+server_identity_observed_uid=''
+server_identity_observed_cgroup_sha256=''
 
 log() {
   /usr/bin/printf '%s\n' "$*"
@@ -179,6 +194,24 @@ process_command() {
   [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
   [[ -r "${PROC_ROOT}/${pid}/cmdline" ]] || return 1
   "${TR_BIN}" '\0' ' ' <"${PROC_ROOT}/${pid}/cmdline" | /usr/bin/sed 's/ $//'
+}
+
+process_command_argc() {
+  local pid="${1:-}"
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ -r "${PROC_ROOT}/${pid}/cmdline" ]] || return 1
+  /usr/bin/awk 'BEGIN {RS="\0"} length {count++} END {print count+0}' \
+    "${PROC_ROOT}/${pid}/cmdline"
+}
+
+process_executable() {
+  local pid="${1:-}"
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  "${READLINK_BIN}" -f -- "${PROC_ROOT}/${pid}/exe"
+}
+
+command_sha256() {
+  /usr/bin/printf '%s' "${1:-}" | "${SHA256SUM_BIN}" | /usr/bin/awk '{print $1}'
 }
 
 process_parent() {
@@ -778,8 +811,7 @@ is_server_process() {
   local pid="${1:-}"
   local start_time="${2:-}"
 
-  is_same_process "${pid}" "${start_time}" \
-    && [[ "$(process_command "${pid}" 2>/dev/null || true)" == "$(expected_server_command)" ]]
+  classify_server_process_identity "${pid}" "${start_time}"
 }
 
 is_server_listener() {
@@ -789,29 +821,11 @@ is_server_listener() {
 classify_server_listener_identity() {
   local pid="${1:-}"
   local start_time="${2:-}"
-  local command=''
   local first_owner=''
 
-  server_identity_failure_stage=''
-  server_identity_observed_pid=''
-  server_identity_observed_start="$(process_start_time "${pid}" 2>/dev/null || true)"
   listener_query_state='not-queried'
   listener_query_owner=''
-  if [[ -n "${server_identity_observed_start}" ]]; then
-    server_identity_observed_pid="${pid}"
-  fi
-
-  if [[ -z "${server_identity_observed_start}" \
-    || "${server_identity_observed_start}" != "${start_time}" ]]; then
-    server_identity_failure_stage='process-missing-or-start-mismatch'
-    return 1
-  fi
-
-  command="$(process_command "${pid}" 2>/dev/null || true)"
-  if [[ "${command}" != "$(expected_server_command)" ]]; then
-    server_identity_failure_stage='command-line-mismatch'
-    return 1
-  fi
+  classify_server_process_identity "${pid}" "${start_time}" || return 1
 
   if ! query_listener_owner; then
     if [[ "${listener_query_state}" == absent ]]; then
@@ -827,11 +841,7 @@ classify_server_listener_identity() {
     return 1
   fi
 
-  server_identity_observed_start="$(process_start_time "${pid}" 2>/dev/null || true)"
-  command="$(process_command "${pid}" 2>/dev/null || true)"
-  if [[ "${server_identity_observed_start}" != "${start_time}" \
-    || "${command}" != "$(expected_server_command)" ]]; then
-    server_identity_failure_stage='identity-changed-during-verification'
+  if ! classify_server_process_identity "${pid}" "${start_time}"; then
     return 1
   fi
 
@@ -842,6 +852,109 @@ classify_server_listener_identity() {
     server_identity_failure_stage='identity-changed-during-verification'
     return 1
   fi
+}
+
+classify_server_process_identity() {
+  local pid="${1:-}"
+  local start_time="${2:-}"
+  local command=''
+  local expected_command=''
+  local expected_executable=''
+  local lifecycle_cgroup=''
+
+  server_identity_failure_stage=''
+  server_identity_observed_pid=''
+  server_identity_observed_start="$(process_start_time "${pid}" 2>/dev/null || true)"
+  server_identity_process_state="$(process_state "${pid}" 2>/dev/null || true)"
+  server_identity_command_state='not-observed'
+  server_identity_observed_command_sha256=''
+  server_identity_expected_command_sha256=''
+  server_identity_observed_command_argc=''
+  server_identity_expected_command_argc=''
+  server_identity_executable_state='not-observed'
+  server_identity_observed_executable=''
+  server_identity_observed_executable_sha256=''
+  server_identity_expected_executable_sha256=''
+  server_identity_ownership_state='not-observed'
+  server_identity_observed_uid=''
+  server_identity_observed_cgroup_sha256=''
+  if [[ -n "${server_identity_observed_start}" ]]; then
+    server_identity_observed_pid="${pid}"
+  fi
+
+  if [[ -z "${server_identity_observed_start}" ]]; then
+    server_identity_failure_stage='process-absent'
+    return 1
+  fi
+  if [[ "${server_identity_observed_start}" != "${start_time}" ]]; then
+    server_identity_failure_stage='process-start-mismatch'
+    return 1
+  fi
+  if [[ "${server_identity_process_state}" == Z ]]; then
+    server_identity_failure_stage='process-zombie'
+    return 1
+  fi
+
+  expected_command="$(expected_server_command)"
+  server_identity_expected_command_sha256="$(command_sha256 "${expected_command}")"
+  server_identity_expected_command_argc=$((${#OPENRGB_SERVER_ARGS[@]} + 1))
+  if [[ ! -r "${PROC_ROOT}/${pid}/cmdline" ]] \
+    || ! command="$(process_command "${pid}" 2>/dev/null)"; then
+    server_identity_command_state='unreadable'
+    server_identity_failure_stage='cmdline-unreadable'
+    return 1
+  fi
+  if [[ -z "${command}" ]]; then
+    server_identity_command_state='empty'
+    server_identity_failure_stage='cmdline-empty'
+    return 1
+  fi
+  server_identity_observed_command_sha256="$(command_sha256 "${command}")"
+  server_identity_observed_command_argc="$(process_command_argc "${pid}" 2>/dev/null || true)"
+  if [[ "${command}" != "${expected_command}" ]]; then
+    server_identity_command_state='mismatch'
+    server_identity_failure_stage='command-line-mismatch'
+    return 1
+  fi
+  server_identity_command_state='match'
+
+  expected_executable="$("${READLINK_BIN}" -f -- "${OPENRGB_BIN}" 2>/dev/null || true)"
+  server_identity_observed_executable="$(process_executable "${pid}" 2>/dev/null || true)"
+  if [[ -n "${expected_executable}" ]]; then
+    server_identity_expected_executable_sha256="$(command_sha256 "${expected_executable}")"
+  fi
+  if [[ -n "${server_identity_observed_executable}" ]]; then
+    server_identity_observed_executable_sha256="$(command_sha256 "${server_identity_observed_executable}")"
+  fi
+  if [[ -z "${expected_executable}" || -z "${server_identity_observed_executable}" ]]; then
+    server_identity_executable_state='unreadable'
+    server_identity_failure_stage='executable-unreadable'
+    return 1
+  fi
+  if [[ "${server_identity_observed_executable}" != "${expected_executable}" ]]; then
+    server_identity_executable_state='mismatch'
+    server_identity_failure_stage='executable-mismatch'
+    return 1
+  fi
+  server_identity_executable_state='match'
+
+  server_identity_observed_uid="$(process_uid "${pid}" 2>/dev/null || true)"
+  lifecycle_cgroup="$(process_cgroup $$ 2>/dev/null || true)"
+  command="$(process_cgroup "${pid}" 2>/dev/null || true)"
+  if [[ -z "${server_identity_observed_uid}" \
+    || -z "${lifecycle_cgroup}" || -z "${command}" ]]; then
+    server_identity_ownership_state='unreadable'
+    server_identity_failure_stage='ownership-unreadable'
+    return 1
+  fi
+  server_identity_observed_cgroup_sha256="$(command_sha256 "${command}")"
+  if [[ "${server_identity_observed_uid}" != "${USER_ID}" \
+    || "${command}" != "${lifecycle_cgroup}" ]]; then
+    server_identity_ownership_state='mismatch'
+    server_identity_failure_stage='ownership-mismatch'
+    return 1
+  fi
+  server_identity_ownership_state='match'
 }
 
 record_shutdown_identity_refusal() {
@@ -863,6 +976,10 @@ record_shutdown_identity_refusal() {
     --cleanup-stage "${cleanup_stage}"
     --identity-failure-stage "${server_identity_failure_stage}"
     --listener-query-state "${listener_query_state}"
+    --process-state "${server_identity_process_state:-unavailable}"
+    --cmdline-state "${server_identity_command_state}"
+    --executable-state "${server_identity_executable_state}"
+    --ownership-state "${server_identity_ownership_state}"
   )
 
   if [[ -n "${server_identity_observed_pid}" ]]; then
@@ -874,8 +991,32 @@ record_shutdown_identity_refusal() {
   if [[ -n "${listener_query_owner}" ]]; then
     command+=(--observed-listener-owner "${listener_query_owner}")
   fi
+  if [[ -n "${server_identity_observed_command_sha256}" ]]; then
+    command+=(--observed-command-sha256 "${server_identity_observed_command_sha256}")
+  fi
+  if [[ -n "${server_identity_expected_command_sha256}" ]]; then
+    command+=(--expected-command-sha256 "${server_identity_expected_command_sha256}")
+  fi
+  if [[ -n "${server_identity_observed_command_argc}" ]]; then
+    command+=(--observed-command-argc "${server_identity_observed_command_argc}")
+  fi
+  if [[ -n "${server_identity_expected_command_argc}" ]]; then
+    command+=(--expected-command-argc "${server_identity_expected_command_argc}")
+  fi
+  if [[ -n "${server_identity_observed_executable_sha256}" ]]; then
+    command+=(--observed-executable-sha256 "${server_identity_observed_executable_sha256}")
+  fi
+  if [[ -n "${server_identity_expected_executable_sha256}" ]]; then
+    command+=(--expected-executable-sha256 "${server_identity_expected_executable_sha256}")
+  fi
+  if [[ -n "${server_identity_observed_uid}" ]]; then
+    command+=(--observed-uid "${server_identity_observed_uid}")
+  fi
+  if [[ -n "${server_identity_observed_cgroup_sha256}" ]]; then
+    command+=(--observed-cgroup-sha256 "${server_identity_observed_cgroup_sha256}")
+  fi
   "${command[@]}" || true
-  log "OpenRGB SDK shutdown authentication refused: cleanup_stage=${cleanup_stage} failure_stage=${server_identity_failure_stage} expected_pid=${server_pid} expected_start=${server_start_time} observed_pid=${server_identity_observed_pid:-none} observed_start=${server_identity_observed_start:-none} listener_state=${listener_query_state} listener_owner=${listener_query_owner:-none} reason=${reason}"
+  log "OpenRGB SDK shutdown authentication refused: cleanup_stage=${cleanup_stage} failure_stage=${server_identity_failure_stage} expected_pid=${server_pid} expected_start=${server_start_time} observed_pid=${server_identity_observed_pid:-none} observed_start=${server_identity_observed_start:-none} process_state=${server_identity_process_state:-unavailable} cmdline_state=${server_identity_command_state} command_sha256=${server_identity_observed_command_sha256:-none} executable_state=${server_identity_executable_state} ownership_state=${server_identity_ownership_state} listener_state=${listener_query_state} listener_owner=${listener_query_owner:-none} reason=${reason}"
 }
 
 find_existing_server() {
@@ -988,6 +1129,7 @@ detach_server() {
 stop_server() {
   local reason="${1:-deliberate shutdown}"
   local listener_owner=''
+  local observed_state=''
 
   stop_restore || return 1
   if [[ -z "${server_pid}" ]]; then
@@ -995,9 +1137,18 @@ stop_server() {
     return 0
   fi
 
-  if ! is_same_process "${server_pid}" "${server_start_time}"; then
-    server_identity_observed_start="$(process_start_time "${server_pid}" 2>/dev/null || true)"
-    log "Tracked OpenRGB PID ${server_pid} no longer has start identity ${server_start_time}; failure_stage=process-missing-or-start-mismatch observed_start=${server_identity_observed_start:-none}; not signaling"
+  observed_state="$(process_state "${server_pid}" 2>/dev/null || true)"
+  if ! is_same_process "${server_pid}" "${server_start_time}" \
+    || [[ "${observed_state}" == Z ]]; then
+    classify_server_process_identity "${server_pid}" "${server_start_time}" || true
+    if query_listener_owner || [[ "${listener_query_state}" != absent ]]; then
+      record_shutdown_identity_refusal sdk-term-authentication "${reason}"
+      return 1
+    fi
+    if [[ "${observed_state}" == Z ]]; then
+      wait "${server_pid}" 2>/dev/null || true
+    fi
+    log "Tracked OpenRGB PID ${server_pid} requires no signal: failure_stage=${server_identity_failure_stage} observed_start=${server_identity_observed_start:-none} listener_state=absent"
     clear_server_identity
     return 0
   fi
@@ -1005,6 +1156,7 @@ stop_server() {
     record_shutdown_identity_refusal sdk-term-authentication "${reason}"
     return 1
   fi
+  log "OpenRGB SDK shutdown authentication succeeded: pid=${server_pid} start=${server_start_time} process_state=${server_identity_process_state} cmdline_state=${server_identity_command_state} command_sha256=${server_identity_observed_command_sha256} executable_state=${server_identity_executable_state} ownership_state=${server_identity_ownership_state} listener_state=${listener_query_state}"
 
   kill -TERM "${server_pid}" 2>/dev/null || true
   if wait_for_process_exit "${server_pid}" "${server_start_time}" 20 0.1; then

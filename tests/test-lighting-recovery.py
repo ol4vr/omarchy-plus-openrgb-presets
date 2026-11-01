@@ -269,6 +269,142 @@ class LightingRecoveryTests(unittest.TestCase):
             path.chmod(0o600)
         return failure_raw, boundary_raw, journal, kernel
 
+    def load_cleanup_refusal_fixture(
+        self,
+        *,
+        boundary_time: float = 1_800_000_000.0,
+        latch_pid: int = 7700,
+    ) -> tuple[bytes, bytes, str, str]:
+        lifecycle_pid, server_pid = 4100, 4200
+        lifecycle_start, server_start = "41000", "42000"
+        boot_id = "current-boot"
+        failure_time = boundary_time + 0.15
+        failure_raw = (
+            json.dumps(
+                {
+                    "message": recovery.CLEANUP_REFUSAL_REASON,
+                    "pid": latch_pid,
+                    "state": "failed",
+                    "time": failure_time,
+                },
+                sort_keys=True,
+            ).encode()
+            + b"\n"
+        )
+        boundary_raw = (
+            json.dumps(
+                {
+                    "boot_id": boot_id,
+                    "cleanup_failure": {
+                        "cleanup_stage": "sdk-term-authentication",
+                        "expected_server_pid": server_pid,
+                        "expected_server_start": server_start,
+                        "failure_stage": "command-line-mismatch",
+                        "kind": "sdk-shutdown-identity-refusal",
+                        "listener_query_state": "not-queried",
+                        "observed_server_pid": server_pid,
+                        "observed_server_start": server_start,
+                    },
+                    "lifecycle_pid": lifecycle_pid,
+                    "lifecycle_start": lifecycle_start,
+                    "reason": "deliberate",
+                    "server_pid": server_pid,
+                    "server_start": server_start,
+                    "state": "stopping",
+                    "stop_result": {
+                        "classification": "explicit-cleanup-refusal",
+                        "exit_code": "exited",
+                        "exit_status": "1",
+                        "service_result": "exit-code",
+                        "time": failure_time - 0.005,
+                    },
+                    "time": boundary_time,
+                },
+                sort_keys=True,
+            ).encode()
+            + b"\n"
+        )
+        self.failure.parent.mkdir(parents=True, exist_ok=True)
+        self.failure.parent.chmod(0o700)
+        self.failure.write_bytes(failure_raw)
+        self.lifecycle_state.write_bytes(boundary_raw)
+        self.failure.chmod(0o600)
+        self.lifecycle_state.chmod(0o600)
+
+        evidence_root = self.failure.parent / "deployment-evidence"
+        snapshot = evidence_root / "generic-pre-shutdown-snapshot"
+        evidence_root.mkdir(mode=0o700, exist_ok=True)
+        snapshot.mkdir(mode=0o700, exist_ok=True)
+        evidence_root.chmod(0o700)
+        snapshot.chmod(0o700)
+        metadata = (
+            "created=2027-01-15T07:58:20+00:00\n"
+            "purpose=OpenRGB Presets v0.4.40 protected rollback before v0.4.41 deployment\n"
+            f"installed_revision={recovery.LEGACY_CLEANUP_REFUSAL_REVISION}\n"
+            "target_revision=c0ad65be1108704fc0e98482daba274fd54b4c57\n"
+            f"package={recovery.EXPECTED_OPENRGB_PACKAGE}\n"
+            f"executable_sha256={recovery.EXPECTED_OPENRGB_EXECUTABLE_SHA256}\n"
+            f"lifecycle_identity={lifecycle_pid}/{lifecycle_start}\n"
+            f"sdk_identity={server_pid}/{server_start}\n"
+            "active_preset=electric-sunrise\n"
+            "tetris_preference=off\n"
+            "tetris_writers=0\n"
+            "failure_latch=absent\n"
+            "bundle_complete_history=true\n"
+        ).encode()
+        ready = (
+            json.dumps(
+                {
+                    "boot_id": boot_id,
+                    "lifecycle_pid": lifecycle_pid,
+                    "lifecycle_start": lifecycle_start,
+                    "reason": "independent lifecycle health validation complete",
+                    "server_pid": server_pid,
+                    "server_start": server_start,
+                    "state": "ready",
+                    "time": boundary_time - 10,
+                },
+                sort_keys=True,
+            ).encode()
+            + b"\n"
+        )
+        manifest = (
+            json.dumps({"version": recovery.LEGACY_CLEANUP_REFUSAL_VERSION}).encode()
+            + b"\n"
+        )
+        bundle_name = (
+            f"openrgb-presets-v{recovery.LEGACY_CLEANUP_REFUSAL_VERSION}.bundle"
+        )
+        files = {
+            "metadata.txt": metadata,
+            "lifecycle-service-state.json": ready,
+            "installed-manifest.json": manifest,
+            "omarchy-plus-openrgb-presets.service": (
+                ROOT / "systemd/omarchy-plus-openrgb-presets.service"
+            ).read_bytes(),
+            bundle_name: b"protected test bundle\n",
+        }
+        checksums = "".join(
+            f"{hashlib.sha256(raw).hexdigest()}  {name}\n"
+            for name, raw in files.items()
+            if name != "metadata.txt"
+        ).encode()
+        files["SHA256SUMS"] = checksums
+        for name, raw in files.items():
+            path = snapshot / name
+            path.write_bytes(raw)
+            path.chmod(0o600)
+
+        journal = "\n".join(
+            (
+                f"{boundary_time - 0.09} hugin systemd[1]: Stopping Omarchy+ OpenRGB lifecycle...",
+                f"{boundary_time + 0.03} hugin systemd[1]: omarchy-plus-openrgb-presets.service: Main process exited, code=exited, status=1/FAILURE",
+                f"{failure_time} hugin omarchy-plus-openrgb-presets[{latch_pid}]: OpenRGB lifecycle stop incomplete: explicit-cleanup-refusal",
+                f"{failure_time + 0.01} hugin systemd[1]: omarchy-plus-openrgb-presets.service: Failed with result 'exit-code'.",
+            )
+        ) + "\n"
+        return failure_raw, boundary_raw, journal, ""
+
     def generic_incomplete_binding(
         self, fixture: str = "c21"
     ) -> recovery.IncompleteShutdownRecoveryBinding:
@@ -2164,6 +2300,136 @@ class LightingRecoveryTests(unittest.TestCase):
             self.assertEqual(incident.old_boot_id, f"old-boot-{index}")
         self.assertEqual(len(references), 2)
 
+    def test_cleanup_refusal_uses_protected_pre_shutdown_ownership_not_reference(self):
+        failure_raw, _boundary_raw, journal, kernel = (
+            self.load_cleanup_refusal_fixture(latch_pid=8811)
+        )
+        bundle = subprocess.CompletedProcess(
+            [],
+            0,
+            f"{recovery.LEGACY_CLEANUP_REFUSAL_REVISION} HEAD\n",
+            "",
+        )
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery, "_current_boot_id", return_value="current-boot"
+            ),
+            mock.patch.object(recovery, "_process_start", return_value=None),
+            mock.patch.object(recovery.subprocess, "run", return_value=bundle) as run,
+        ):
+            incident = recovery._classify_incomplete_shutdown_incident()
+            with mock.patch.object(
+                recovery,
+                "_incomplete_shutdown_journal_slice",
+                side_effect=(journal, kernel),
+            ):
+                evidence = json.loads(
+                    recovery._incomplete_shutdown_historical_evidence(incident)
+                )
+        self.assertEqual(incident.evidence_kind, "authenticated-cleanup-refusal")
+        self.assertEqual(
+            incident.incident_reference, recovery._incident_reference(failure_raw)
+        )
+        self.assertNotEqual(incident.incident_reference, "LR-C21B55C0B1514836")
+        self.assertEqual(
+            evidence["authentication_observation"],
+            "legacy-command-observation-unavailable",
+        )
+        self.assertEqual(evidence["category"], "authenticated-sdk-cleanup-refusal")
+        self.assertEqual(
+            run.call_args.args[0][:3], [recovery.GIT, "bundle", "list-heads"]
+        )
+
+    def test_cleanup_refusal_rejects_genuine_or_unclassifiable_identity_conflict(self):
+        self.load_cleanup_refusal_fixture()
+        boundary = json.loads(self.lifecycle_state.read_bytes())
+        boundary["cleanup_failure"].update(
+            {
+                "process_state": "S",
+                "cmdline_state": "mismatch",
+                "observed_command_sha256": "1" * 64,
+                "expected_command_sha256": "2" * 64,
+                "executable_state": "match",
+                "ownership_state": "match",
+            }
+        )
+        self.lifecycle_state.write_text(
+            json.dumps(boundary, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery, "_current_boot_id", return_value="current-boot"
+            ),
+            mock.patch.object(recovery, "_process_start", return_value=None),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "genuine or unclassifiable"),
+        ):
+            self.assertFalse(
+                recovery._incomplete_shutdown_candidate_shape(
+                    json.loads(self.failure.read_bytes()),
+                    recovery.CLEANUP_REFUSAL_REASON,
+                )
+            )
+            recovery._classify_incomplete_shutdown_incident()
+
+        self.load_cleanup_refusal_fixture(boundary_time=1_800_000_200.0)
+        boundary = json.loads(self.lifecycle_state.read_bytes())
+        boundary["cleanup_failure"]["failure_stage"] = "cmdline-unreadable"
+        self.lifecycle_state.write_text(
+            json.dumps(boundary, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery, "_current_boot_id", return_value="current-boot"
+            ),
+            mock.patch.object(recovery, "_process_start", return_value=None),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "genuine or unclassifiable"),
+        ):
+            recovery._classify_incomplete_shutdown_incident()
+
+    def test_cleanup_refusal_rejects_missing_or_changed_protected_history(self):
+        self.load_cleanup_refusal_fixture()
+        snapshot = (
+            self.failure.parent
+            / "deployment-evidence/generic-pre-shutdown-snapshot"
+        )
+        (snapshot / "lifecycle-service-state.json").write_text(
+            '{"state":"ready","server_pid":9999}\n', encoding="utf-8"
+        )
+        bundle = subprocess.CompletedProcess(
+            [],
+            0,
+            f"{recovery.LEGACY_CLEANUP_REFUSAL_REVISION} HEAD\n",
+            "",
+        )
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery, "_current_boot_id", return_value="current-boot"
+            ),
+            mock.patch.object(recovery, "_process_start", return_value=None),
+            mock.patch.object(recovery.subprocess, "run", return_value=bundle),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "checksum changed"),
+        ):
+            recovery._classify_incomplete_shutdown_incident()
+
+        for path in snapshot.iterdir():
+            path.unlink()
+        snapshot.rmdir()
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery, "_current_boot_id", return_value="current-boot"
+            ),
+            mock.patch.object(recovery, "_process_start", return_value=None),
+            self.assertRaisesRegex(
+                recovery.RecoveryBlocked, "exactly one protected pre-shutdown"
+            ),
+        ):
+            recovery._classify_incomplete_shutdown_incident()
+
     def test_generic_incomplete_shutdown_rejects_modified_and_unprotected_latches(self):
         failure_raw, _boundary_raw, _journal, _kernel = (
             self.load_incomplete_shutdown_fixture("c21")
@@ -2987,7 +3253,7 @@ class LightingRecoveryTests(unittest.TestCase):
         ):
             value = recovery.prepare_document()
         self.assertEqual(value["state"], "recovery-ready")
-        self.assertEqual(value["recovery_kind"], "old-boot-incomplete-shutdown")
+        self.assertEqual(value["recovery_kind"], "incomplete-lifecycle-shutdown")
         self.assertNotIn("confirmation_token", value)
 
     def test_display_code_alone_never_grants_eligibility(self):

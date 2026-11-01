@@ -622,6 +622,28 @@ v0.4.40 generic recovery policy is unchanged except that its ownership checks
 now recognize `hardware-operation.lock`; its guarded restore exception is
 authenticated again at the new final mutation boundary.
 
+Version 0.4.42 separates SDK cleanup authentication outcomes into absent,
+zombie, unreadable-or-empty command line, actual command mismatch,
+executable/ownership mismatch, and success. Refusals retain only bounded safe
+diagnostics: process state, UID, argument count, and hashes of command,
+executable path, and cgroup. Unknown evidence remains fail closed and is never
+reported as identity replacement. Successful shutdown authentication is also
+recorded before the first signal; an absent, zombie, or replaced tracked PID is
+accepted without a signal only after listener absence is verified.
+
+The existing single-process lifecycle recovery also accepts the narrow legacy
+v0.4.40 cleanup-refusal shape when one protected pre-shutdown deployment
+snapshot proves the same ready lifecycle/SDK identities, reviewed source
+bundle, unit, package and executable, Tetris OFF, zero writers, and no latch.
+The raw latch and boundary must remain unchanged; historical journal ordering,
+current quiescence, four SPD5118 endpoints, detector policy, and current kernel
+history still pass the existing double preflight. The unavailable refusal-time
+command observation is retained explicitly as unknown. Richly observed command,
+executable, ownership, or listener mismatches are not eligible. No incident
+reference, latch hash, or boot identity is allowlisted, and the established
+single start, post-start acceptance, bounded cleanup, and evidence-preservation
+contracts are unchanged.
+
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
 The experimental orange, blue, and red Sunrise gradients are therefore stored
@@ -1205,6 +1227,17 @@ preference preserved. Do not translate or remove a failure latch during the
 rollback. The v0.4.40 generic recovery remains available after rollback, but
 rollback itself does not authorize recovery, a service start, or any RGB
 mutation.
+
+## Roll back the 0.4.42 SDK cleanup-refusal correction
+
+Rollback must not erase or translate a cleanup-refusal latch or its protected
+pre-shutdown evidence. If recovery has not started, redeploy exact v0.4.41 only
+while the lifecycle, SDK, listener, writer, preset helper, recovery owner, and
+hardware-operation locks are all absent. That rollback removes eligibility for
+the legacy ambiguous refusal and therefore cannot itself restore the service.
+If a guarded recovery start occurred, use only its persisted completed or
+bounded-cleanup disposition before considering rollback; do not start, stop,
+or retry the service as part of source rollback.
 
 ## Remove
 

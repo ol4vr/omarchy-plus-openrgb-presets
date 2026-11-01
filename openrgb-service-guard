@@ -166,6 +166,10 @@ def mark(args: argparse.Namespace) -> int:
             "expected_server_pid": args.server_pid,
             "expected_server_start": args.server_start,
             "listener_query_state": args.listener_query_state,
+            "process_state": args.process_state,
+            "cmdline_state": args.cmdline_state,
+            "executable_state": args.executable_state,
+            "ownership_state": args.ownership_state,
         }
         if args.observed_server_pid is not None:
             diagnostic["observed_server_pid"] = args.observed_server_pid
@@ -173,6 +177,22 @@ def mark(args: argparse.Namespace) -> int:
             diagnostic["observed_server_start"] = args.observed_server_start
         if args.observed_listener_owner is not None:
             diagnostic["observed_listener_owner"] = args.observed_listener_owner
+        for name in (
+            "observed_command_sha256",
+            "expected_command_sha256",
+            "observed_executable_sha256",
+            "expected_executable_sha256",
+            "observed_cgroup_sha256",
+        ):
+            observed = getattr(args, name)
+            if observed is not None:
+                diagnostic[name] = observed
+        if args.observed_command_argc is not None:
+            diagnostic["observed_command_argc"] = args.observed_command_argc
+        if args.expected_command_argc is not None:
+            diagnostic["expected_command_argc"] = args.expected_command_argc
+        if args.observed_uid is not None:
+            diagnostic["observed_uid"] = args.observed_uid
         value["cleanup_failure"] = diagnostic
     atomic_json(service_state_path(), value)
     return 0
@@ -300,8 +320,16 @@ def build_parser() -> argparse.ArgumentParser:
     mark_parser.add_argument(
         "--identity-failure-stage",
         choices=(
-            "process-missing-or-start-mismatch",
+            "process-absent",
+            "process-zombie",
+            "process-start-mismatch",
+            "cmdline-unreadable",
+            "cmdline-empty",
             "command-line-mismatch",
+            "executable-unreadable",
+            "executable-mismatch",
+            "ownership-unreadable",
+            "ownership-mismatch",
             "listener-query-unreadable",
             "listener-absent",
             "listener-owner-unexpected",
@@ -312,9 +340,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--listener-query-state",
         choices=("not-queried", "unreadable", "absent", "present"),
     )
+    mark_parser.add_argument(
+        "--process-state",
+        choices=("unavailable", "R", "S", "D", "Z", "T", "t", "X", "I"),
+    )
+    mark_parser.add_argument(
+        "--cmdline-state",
+        choices=("not-observed", "unreadable", "empty", "mismatch", "match"),
+    )
+    mark_parser.add_argument(
+        "--executable-state",
+        choices=("not-observed", "unreadable", "mismatch", "match"),
+    )
+    mark_parser.add_argument(
+        "--ownership-state",
+        choices=("not-observed", "unreadable", "mismatch", "match"),
+    )
     mark_parser.add_argument("--observed-server-pid", type=int)
     mark_parser.add_argument("--observed-server-start")
     mark_parser.add_argument("--observed-listener-owner", type=int)
+    mark_parser.add_argument("--observed-command-sha256")
+    mark_parser.add_argument("--expected-command-sha256")
+    mark_parser.add_argument("--observed-command-argc", type=int)
+    mark_parser.add_argument("--expected-command-argc", type=int)
+    mark_parser.add_argument("--observed-executable-sha256")
+    mark_parser.add_argument("--expected-executable-sha256")
+    mark_parser.add_argument("--observed-uid", type=int)
+    mark_parser.add_argument("--observed-cgroup-sha256")
     return parser
 
 
@@ -332,6 +384,10 @@ def main() -> int:
         args.cleanup_stage,
         args.identity_failure_stage,
         args.listener_query_state,
+        args.process_state,
+        args.cmdline_state,
+        args.executable_state,
+        args.ownership_state,
     )
     if any(value is not None for value in diagnostic_values) and not all(
         value is not None for value in diagnostic_values
@@ -339,6 +395,18 @@ def main() -> int:
         raise SystemExit("cleanup diagnostics must be supplied together")
     if args.identity_failure_stage is not None and args.server_pid is None:
         raise SystemExit("cleanup diagnostics require the expected server identity")
+    for name in (
+        "observed_command_sha256",
+        "expected_command_sha256",
+        "observed_executable_sha256",
+        "expected_executable_sha256",
+        "observed_cgroup_sha256",
+    ):
+        value = getattr(args, name)
+        if value is not None and (
+            len(value) != 64 or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise SystemExit(f"{name.replace('_', '-')} is not a SHA-256 digest")
     if (args.observed_server_pid is None) != (args.observed_server_start is None):
         raise SystemExit(
             "observed server PID and start token must be supplied together"

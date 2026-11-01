@@ -148,9 +148,9 @@ SHUTDOWN_RACE_SERVER_START: Final = "85366961"
 SHUTDOWN_RACE_WRITER_PID: Final = 394561
 SHUTDOWN_RACE_BOUNDARY_TIME: Final = 1793310621.0151148
 SHUTDOWN_RACE_FAILURE_TIME: Final = 1793310623.257292
-SHUTDOWN_RACE_CORRECTED_VERSION: Final = "0.4.41"
+SHUTDOWN_RACE_CORRECTED_VERSION: Final = "0.4.42"
 SHUTDOWN_RACE_CORRECTED_LIFECYCLE_SHA256: Final = (
-    "6b97c0e1dc4befcc852f81f562342671c1be8b63eaaaf2785a0ba13123cba229"
+    "ebf58492beabb0b519463e2915ceb9346d2f7a75e8df06255d143b4a6d475e7b"
 )
 SHUTDOWN_RACE_CORRECTED_RAM_TETRIS_SHA256: Final = (
     "9962b1bf8ef932ab2b8efae99ead191692cf3976b65d1e1f801d107dd9b2e66c"
@@ -186,6 +186,19 @@ INCOMPLETE_SHUTDOWN_SIMPLE_REASONS: Final = frozenset(
         "OpenRGB lifecycle service did not complete its previous bounded shutdown",
         "OpenRGB lifecycle service required manager escalation before clean shutdown",
     }
+)
+CLEANUP_REFUSAL_REASON: Final = (
+    "OpenRGB lifecycle explicitly refused SDK shutdown authentication before clean shutdown"
+)
+LEGACY_CLEANUP_REFUSAL_REVISION: Final = (
+    "84a16b03a555af5e1cef967e4aa4c43f108d73fd"
+)
+LEGACY_CLEANUP_REFUSAL_VERSION: Final = "0.4.40"
+LEGACY_CLEANUP_REFUSAL_LIFECYCLE_SHA256: Final = (
+    "d03cb8a1525ea70f0e296a2a6bd9cc10f6c4f69a8aee685e1a03a5fb17ada7b2"
+)
+LEGACY_CLEANUP_REFUSAL_UNIT_SHA256: Final = (
+    "bcb805f37bc9ed426e766d09775e96e68fc74df88dd73772c533faa425463e42"
 )
 INCOMPLETE_SHUTDOWN_WINDOW_SECONDS: Final = 120.0
 INCOMPLETE_SHUTDOWN_JOURNAL_PADDING_SECONDS: Final = 15.0
@@ -434,6 +447,8 @@ class IncompleteShutdownIncident:
     lifecycle_start: str
     server_pid: int
     server_start: str
+    evidence_kind: str = "old-boot-incomplete-shutdown"
+    historical_ownership_raw: bytes = b""
 
 
 @dataclass(frozen=True)
@@ -1115,8 +1130,195 @@ def _protected_failure_record() -> tuple[bytes, dict[str, object]]:
     return raw, _json_record(raw, "lighting failure latch")
 
 
+def _key_value_record(raw: bytes, label: str) -> dict[str, str]:
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise RecoveryBlocked(f"Recovery blocked: {label} is unreadable.") from error
+    record: dict[str, str] = {}
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if not separator or not key or key in record:
+            raise RecoveryBlocked(f"Recovery blocked: {label} is invalid.")
+        record[key] = value
+    return record
+
+
+def _checksum_manifest(raw: bytes) -> dict[str, str]:
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise RecoveryBlocked(
+            "Recovery blocked: protected pre-shutdown checksums are unreadable."
+        ) from error
+    checksums: dict[str, str] = {}
+    for line in lines:
+        match = re.fullmatch(r"([0-9a-f]{64})  ([^/]+)", line)
+        if match is None or match.group(2) in checksums:
+            raise RecoveryBlocked(
+                "Recovery blocked: protected pre-shutdown checksums are invalid."
+            )
+        checksums[match.group(2)] = match.group(1)
+    return checksums
+
+
+def _legacy_cleanup_refusal_snapshot(
+    *,
+    boundary_time: float,
+    boot_id: str,
+    lifecycle_pid: int,
+    lifecycle_start: str,
+    server_pid: int,
+    server_start: str,
+) -> bytes:
+    """Authenticate legacy ambiguous cmdline evidence without incident identifiers."""
+
+    root = state_root() / "deployment-evidence"
+    _require_private_directory(root, "deployment evidence directory")
+    matches: list[dict[str, object]] = []
+    for directory in sorted(root.iterdir()):
+        if not directory.is_dir():
+            continue
+        try:
+            _require_private_directory(directory, "pre-shutdown evidence directory")
+            metadata_raw = _read_protected_bytes(
+                directory / "metadata.txt", "pre-shutdown metadata"
+            )
+            metadata = _key_value_record(metadata_raw, "pre-shutdown metadata")
+        except RecoveryBlocked:
+            continue
+        if metadata.get("installed_revision") != LEGACY_CLEANUP_REFUSAL_REVISION:
+            continue
+        required_metadata = {
+            "created",
+            "purpose",
+            "installed_revision",
+            "target_revision",
+            "package",
+            "executable_sha256",
+            "lifecycle_identity",
+            "sdk_identity",
+            "active_preset",
+            "tetris_preference",
+            "tetris_writers",
+            "failure_latch",
+            "bundle_complete_history",
+        }
+        if set(metadata) != required_metadata:
+            raise RecoveryBlocked(
+                "Recovery blocked: matching pre-shutdown metadata is incomplete."
+            )
+        try:
+            created = datetime.fromisoformat(metadata["created"]).timestamp()
+        except ValueError as error:
+            raise RecoveryBlocked(
+                "Recovery blocked: matching pre-shutdown timestamp is invalid."
+            ) from error
+        if (
+            created >= boundary_time
+            or not re.fullmatch(
+                rf"OpenRGB Presets v{re.escape(LEGACY_CLEANUP_REFUSAL_VERSION)} "
+                r"protected rollback before v[0-9.]+ deployment",
+                metadata["purpose"],
+            )
+            or not re.fullmatch(r"[0-9a-f]{40}", metadata["target_revision"])
+            or metadata["package"] != EXPECTED_OPENRGB_PACKAGE
+            or metadata["executable_sha256"]
+            != EXPECTED_OPENRGB_EXECUTABLE_SHA256
+            or metadata["lifecycle_identity"]
+            != f"{lifecycle_pid}/{lifecycle_start}"
+            or metadata["sdk_identity"] != f"{server_pid}/{server_start}"
+            or metadata["tetris_preference"] != "off"
+            or metadata["tetris_writers"] != "0"
+            or metadata["failure_latch"] != "absent"
+            or metadata["bundle_complete_history"] != "true"
+        ):
+            raise RecoveryBlocked(
+                "Recovery blocked: matching pre-shutdown ownership metadata changed."
+            )
+
+        names = {
+            "lifecycle-service-state.json",
+            "installed-manifest.json",
+            "omarchy-plus-openrgb-presets.service",
+            "SHA256SUMS",
+            f"openrgb-presets-v{LEGACY_CLEANUP_REFUSAL_VERSION}.bundle",
+        }
+        protected = {
+            name: _read_protected_bytes(directory / name, f"pre-shutdown {name}")
+            for name in names
+        }
+        checksums = _checksum_manifest(protected["SHA256SUMS"])
+        for name in names - {"SHA256SUMS"}:
+            if checksums.get(name) != hashlib.sha256(protected[name]).hexdigest():
+                raise RecoveryBlocked(
+                    "Recovery blocked: matching pre-shutdown evidence checksum changed."
+                )
+        snapshot = _json_record(
+            protected["lifecycle-service-state.json"], "pre-shutdown lifecycle state"
+        )
+        manifest = _json_record(
+            protected["installed-manifest.json"], "pre-shutdown plugin manifest"
+        )
+        if (
+            snapshot.get("state") != "ready"
+            or snapshot.get("boot_id") != boot_id
+            or snapshot.get("lifecycle_pid") != lifecycle_pid
+            or snapshot.get("lifecycle_start") != lifecycle_start
+            or snapshot.get("server_pid") != server_pid
+            or snapshot.get("server_start") != server_start
+            or not isinstance(snapshot.get("time"), (int, float))
+            or isinstance(snapshot.get("time"), bool)
+            or float(snapshot["time"]) >= boundary_time
+            or manifest.get("version") != LEGACY_CLEANUP_REFUSAL_VERSION
+            or hashlib.sha256(
+                protected["omarchy-plus-openrgb-presets.service"]
+            ).hexdigest()
+            != LEGACY_CLEANUP_REFUSAL_UNIT_SHA256
+        ):
+            raise RecoveryBlocked(
+                "Recovery blocked: matching pre-shutdown service ownership is invalid."
+            )
+        bundle_name = f"openrgb-presets-v{LEGACY_CLEANUP_REFUSAL_VERSION}.bundle"
+        heads = subprocess.run(
+            [GIT, "bundle", "list-heads", str(directory / bundle_name)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if (
+            heads.returncode != 0
+            or heads.stderr.strip()
+            or heads.stdout.strip() != f"{LEGACY_CLEANUP_REFUSAL_REVISION} HEAD"
+        ):
+            raise RecoveryBlocked(
+                "Recovery blocked: matching pre-shutdown source bundle is invalid."
+            )
+        matches.append(
+            {
+                "directory": directory.name,
+                "metadata": metadata,
+                "metadata_sha256": hashlib.sha256(metadata_raw).hexdigest(),
+                "checksums_sha256": hashlib.sha256(protected["SHA256SUMS"]).hexdigest(),
+                "lifecycle_state": snapshot,
+                "source_revision": LEGACY_CLEANUP_REFUSAL_REVISION,
+                "source_lifecycle_sha256": LEGACY_CLEANUP_REFUSAL_LIFECYCLE_SHA256,
+                "authentication_observation": (
+                    "legacy-command-observation-unavailable"
+                ),
+            }
+        )
+    if len(matches) != 1:
+        raise RecoveryBlocked(
+            "Recovery blocked: exactly one protected pre-shutdown ownership snapshot "
+            "was not established."
+        )
+    return (json.dumps(matches[0], sort_keys=True) + "\n").encode()
+
+
 def _classify_incomplete_shutdown_incident() -> IncompleteShutdownIncident:
-    """Derive old-boot shutdown eligibility from protected raw evidence."""
+    """Derive bounded lifecycle-shutdown eligibility from protected raw evidence."""
 
     failure_raw, failure = _protected_failure_record()
     boundary_raw = _read_protected_bytes(
@@ -1141,8 +1343,9 @@ def _classify_incomplete_shutdown_incident() -> IncompleteShutdownIncident:
             "Recovery blocked: failure and lifecycle-boundary evidence do not correlate."
         )
 
-    if set(failure) == {"message", "pid", "state", "time"}:
-        if message not in INCOMPLETE_SHUTDOWN_SIMPLE_REASONS:
+    simple_failure = set(failure) == {"message", "pid", "state", "time"}
+    if simple_failure:
+        if message not in INCOMPLETE_SHUTDOWN_SIMPLE_REASONS | {CLEANUP_REFUSAL_REASON}:
             raise RecoveryBlocked(
                 "Recovery blocked: the latch is not an incomplete lifecycle shutdown."
             )
@@ -1182,15 +1385,42 @@ def _classify_incomplete_shutdown_incident() -> IncompleteShutdownIncident:
 
     old_boot_id = boundary.get("boot_id")
     stop_result = boundary.get("stop_result")
+    cleanup_failure = boundary.get("cleanup_failure")
+    cleanup_refusal = message == CLEANUP_REFUSAL_REASON
     if (
         boundary.get("state") != "stopping"
         or boundary.get("reason") != "deliberate"
         or not isinstance(old_boot_id, str)
         or not old_boot_id
-        or old_boot_id == _current_boot_id()
         or not isinstance(stop_result, dict)
-        or stop_result.get("classification") != "incomplete-lifecycle-exit"
         or stop_result.get("service_result") != "exit-code"
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: the lifecycle boundary is not an authenticated "
+            "old-boot incomplete shutdown."
+        )
+    if cleanup_refusal:
+        expected_cleanup = {
+            "kind": "sdk-shutdown-identity-refusal",
+            "cleanup_stage": "sdk-term-authentication",
+            "failure_stage": "command-line-mismatch",
+            "expected_server_pid": boundary.get("server_pid"),
+            "expected_server_start": boundary.get("server_start"),
+            "listener_query_state": "not-queried",
+            "observed_server_pid": boundary.get("server_pid"),
+            "observed_server_start": boundary.get("server_start"),
+        }
+        if (
+            not simple_failure
+            or stop_result.get("classification") != "explicit-cleanup-refusal"
+            or cleanup_failure != expected_cleanup
+        ):
+            raise RecoveryBlocked(
+                "Recovery blocked: SDK cleanup refusal is genuine or unclassifiable."
+            )
+    elif (
+        old_boot_id == _current_boot_id()
+        or stop_result.get("classification") != "incomplete-lifecycle-exit"
     ):
         raise RecoveryBlocked(
             "Recovery blocked: the lifecycle boundary is not an authenticated "
@@ -1205,6 +1435,18 @@ def _classify_incomplete_shutdown_incident() -> IncompleteShutdownIncident:
         raise RecoveryBlocked(
             "Recovery blocked: an old lifecycle or SDK identity is still active."
         )
+    historical_ownership_raw = b""
+    evidence_kind = "old-boot-incomplete-shutdown"
+    if cleanup_refusal:
+        historical_ownership_raw = _legacy_cleanup_refusal_snapshot(
+            boundary_time=boundary_time,
+            boot_id=old_boot_id,
+            lifecycle_pid=lifecycle_pid,
+            lifecycle_start=lifecycle_start,
+            server_pid=server_pid,
+            server_start=server_start,
+        )
+        evidence_kind = "authenticated-cleanup-refusal"
     return IncompleteShutdownIncident(
         failure_raw=failure_raw,
         boundary_raw=boundary_raw,
@@ -1219,6 +1461,8 @@ def _classify_incomplete_shutdown_incident() -> IncompleteShutdownIncident:
         lifecycle_start=lifecycle_start,
         server_pid=server_pid,
         server_start=server_start,
+        evidence_kind=evidence_kind,
+        historical_ownership_raw=historical_ownership_raw,
     )
 
 
@@ -3003,11 +3247,31 @@ def _incomplete_shutdown_candidate_shape(
             or state.get("reason") != "deliberate"
             or not isinstance(old_boot, str)
             or not old_boot
-            or old_boot == _current_boot_id()
         ):
             return False
         if set(failure) == {"message", "pid", "state", "time"}:
-            return message in INCOMPLETE_SHUTDOWN_SIMPLE_REASONS
+            if message == CLEANUP_REFUSAL_REASON:
+                stop_result = state.get("stop_result")
+                cleanup = state.get("cleanup_failure")
+                expected_cleanup = {
+                    "kind": "sdk-shutdown-identity-refusal",
+                    "cleanup_stage": "sdk-term-authentication",
+                    "failure_stage": "command-line-mismatch",
+                    "expected_server_pid": state.get("server_pid"),
+                    "expected_server_start": state.get("server_start"),
+                    "listener_query_state": "not-queried",
+                    "observed_server_pid": state.get("server_pid"),
+                    "observed_server_start": state.get("server_start"),
+                }
+                return (
+                    isinstance(stop_result, dict)
+                    and stop_result.get("classification") == "explicit-cleanup-refusal"
+                    and cleanup == expected_cleanup
+                )
+            return (
+                old_boot != _current_boot_id()
+                and message in INCOMPLETE_SHUTDOWN_SIMPLE_REASONS
+            )
         return classify_reason(message).subsystem == "sdk"
     except RecoveryBlocked:
         return False
@@ -3105,7 +3369,7 @@ def status_document() -> dict[str, object]:
         else ("manual-review" if failure_class is UNKNOWN_FAILURE else "blocked")
     )
     recovery_summary = (
-        "Evidence-based old-boot shutdown recovery can be checked."
+        "Evidence-based incomplete lifecycle recovery can be checked."
         if incomplete_shutdown_candidate
         else "Reviewed old-boot shutdown recovery can be checked."
         if shutdown_race_candidate
@@ -3157,7 +3421,7 @@ def status_document() -> dict[str, object]:
         "recovery_outcome": recovery_outcome,
         "recovery_available": available,
         "recovery_kind": (
-            "old-boot-incomplete-shutdown" if incomplete_shutdown_candidate else ""
+            "incomplete-lifecycle-shutdown" if incomplete_shutdown_candidate else ""
         ),
     }
 
@@ -3683,6 +3947,73 @@ def _incomplete_shutdown_historical_evidence(
 ) -> bytes:
     journal = _incomplete_shutdown_journal_slice(incident, kernel=False)
     kernel = _incomplete_shutdown_journal_slice(incident, kernel=True)
+    if incident.evidence_kind == "authenticated-cleanup-refusal":
+        required = (
+            "Stopping Omarchy+ OpenRGB lifecycle",
+            "omarchy-plus-openrgb-presets.service: Main process exited, code=exited, status=1/FAILURE",
+            "OpenRGB lifecycle stop incomplete: explicit-cleanup-refusal",
+            "omarchy-plus-openrgb-presets.service: Failed with result 'exit-code'",
+        )
+        if not all(marker in journal for marker in required):
+            raise RecoveryBlocked(
+                "Recovery blocked: authenticated cleanup-refusal history is missing."
+            )
+        stopping_time = _journal_marker_time(
+            journal, "Stopping Omarchy+ OpenRGB lifecycle"
+        )
+        exit_time = _journal_marker_time(
+            journal,
+            "omarchy-plus-openrgb-presets.service: Main process exited, code=exited, status=1/FAILURE",
+        )
+        latch_time = _journal_marker_time(
+            journal, "OpenRGB lifecycle stop incomplete: explicit-cleanup-refusal"
+        )
+        if (
+            None in {stopping_time, exit_time, latch_time}
+            or not stopping_time
+            <= incident.boundary_time
+            <= exit_time
+            <= latch_time
+            or abs(latch_time - incident.failure_time) > 1.0
+            or (
+                f"omarchy-plus-openrgb-presets[{incident.latch_pid}]: "
+                "OpenRGB lifecycle stop incomplete: explicit-cleanup-refusal"
+            )
+            not in journal
+        ):
+            raise RecoveryBlocked(
+                "Recovery blocked: cleanup-refusal timestamps or process identity "
+                "do not correlate."
+            )
+        combined = journal + "\n" + kernel
+        if OPENRGB_CRASH_HISTORY.search(combined):
+            raise RecoveryBlocked(
+                "Recovery blocked: historical OpenRGB crash or resource failure exists."
+            )
+        if INCOMPLETE_SHUTDOWN_UNSAFE_HISTORY.search(combined):
+            raise RecoveryBlocked(
+                "Recovery blocked: historical hardware, SDK, or ownership failure exists."
+            )
+        if any(RELEVANT_KERNEL_ERROR.search(line) for line in kernel.splitlines()):
+            raise RecoveryBlocked(
+                "Recovery blocked: historical protected-transport failure exists."
+            )
+        document = {
+            "schema_version": 3,
+            "category": "authenticated-sdk-cleanup-refusal",
+            "boot_id": incident.old_boot_id,
+            "boundary_time": incident.boundary_time,
+            "failure_time": incident.failure_time,
+            "lifecycle_identity": [incident.lifecycle_pid, incident.lifecycle_start],
+            "server_identity": [incident.server_pid, incident.server_start],
+            "authentication_observation": "legacy-command-observation-unavailable",
+            "protected_pre_shutdown_ownership": json.loads(
+                incident.historical_ownership_raw
+            ),
+            "journal": journal,
+            "kernel": kernel,
+        }
+        return (json.dumps(document, sort_keys=True) + "\n").encode()
     if not all(
         marker in journal for marker in INCOMPLETE_SHUTDOWN_REQUIRED_JOURNAL_MARKERS
     ):
@@ -4767,7 +5098,7 @@ def prepare_document() -> dict[str, object]:
             return {
                 "state": "recovery-ready",
                 "incident_reference": binding.incident.incident_reference,
-                "recovery_kind": "old-boot-incomplete-shutdown",
+                "recovery_kind": "incomplete-lifecycle-shutdown",
                 "message": (
                     "Run one evidence-qualified lifecycle recovery. "
                     "RAM Tetris will remain OFF."
@@ -5337,7 +5668,7 @@ def _cleanup_failed_incomplete_shutdown_recovery(failure_raw: bytes) -> bool:
 
 
 def _recover_incomplete_shutdown() -> dict[str, object]:
-    """Run one internally double-checked old-boot lifecycle recovery."""
+    """Run one internally double-checked incomplete-lifecycle recovery."""
 
     failure_raw, _ = _protected_failure_record()
     existing_outcome = _read_recovery_outcome(failure_raw)

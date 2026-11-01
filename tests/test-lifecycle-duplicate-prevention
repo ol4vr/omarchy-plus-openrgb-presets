@@ -80,6 +80,10 @@ write_server_process() {
   done
   /usr/bin/printf ' %s\n' "${start_time}" >>"${PROC_FIXTURE}/${pid}/stat"
   /usr/bin/printf '%s' "${command}" | /usr/bin/tr ' ' '\0' >"${PROC_FIXTURE}/${pid}/cmdline"
+  /usr/bin/printf 'Uid:\t%s\t%s\t%s\t%s\n' "${USER_ID}" "${USER_ID}" "${USER_ID}" "${USER_ID}" \
+    >"${PROC_FIXTURE}/${pid}/status"
+  /usr/bin/printf '0::/user.slice/test.service\n' >"${PROC_FIXTURE}/${pid}/cgroup"
+  /usr/bin/ln -sf "${OPENRGB_BIN}" "${PROC_FIXTURE}/${pid}/exe"
 }
 
 set_listener() {
@@ -202,6 +206,7 @@ reset_lifecycle_state() {
 reset_fixture() {
   /usr/bin/rm -rf -- "${PROC_FIXTURE:?}/"*
   /usr/bin/rm -rf -- "${STATE_HOME}"
+  write_server_process "$$" 7000
   set_listener ''
   : >"${LISTENER_SEQUENCE}"
   : >"${SIGNAL_LOG}"
@@ -309,12 +314,12 @@ test_suspend_stops_adopted_and_resume_starts_one() {
 test_pid_reuse_prevents_signaling() {
   adopt_fixture_server 4104 8104
   write_server_process 4104 9999
-  if ! stop_server suspend >/dev/null; then
-    return 1
-  fi
+  enable_durable_diagnostics
+  if stop_server 'deliberate lifecycle shutdown' >/dev/null; then return 1; fi
   [[ ! -s "${SIGNAL_LOG}" ]]
   [[ -d "${PROC_FIXTURE}/4104" ]]
-  [[ "${server_origin}" == none ]]
+  [[ "${server_origin}" != none ]]
+  assert_persisted_identity_failure process-start-mismatch present
 }
 
 test_listener_mismatch_prevents_signaling() {
@@ -345,19 +350,77 @@ test_command_mismatch_prevents_signaling() {
   [[ "${server_pid}" == 4108 ]]
   [[ "${server_start_time}" == 8108 ]]
   assert_persisted_identity_failure command-line-mismatch not-queried
+  local state_file="${STATE_HOME}/omarchy-plus/openrgb-presets/lifecycle-service-state.json"
+  [[ "$(jq -r '.cleanup_failure.cmdline_state' "${state_file}")" == mismatch ]]
+  [[ "$(jq -r '.cleanup_failure.observed_command_sha256 | length' "${state_file}")" == 64 ]]
+  [[ "$(jq -r '.cleanup_failure.expected_command_sha256 | length' "${state_file}")" == 64 ]]
+  [[ "$(jq -r '.cleanup_failure.observed_executable // empty' "${state_file}")" == '' ]]
+}
+
+test_cmdline_empty_and_unreadable_are_distinct() {
+  write_server_process 4120 8120
+  : >"${PROC_FIXTURE}/4120/cmdline"
+  if classify_server_process_identity 4120 8120; then return 1; fi
+  [[ "${server_identity_failure_stage}" == cmdline-empty ]]
+  [[ "${server_identity_command_state}" == empty ]]
+
+  /usr/bin/rm -- "${PROC_FIXTURE}/4120/cmdline"
+  if classify_server_process_identity 4120 8120; then return 1; fi
+  [[ "${server_identity_failure_stage}" == cmdline-unreadable ]]
+  [[ "${server_identity_command_state}" == unreadable ]]
+}
+
+test_executable_and_ownership_mismatches_are_distinct() {
+  write_server_process 4121 8121
+  /usr/bin/ln -sfn "${BIN_DIR}/apply-preset" "${PROC_FIXTURE}/4121/exe"
+  if classify_server_process_identity 4121 8121; then return 1; fi
+  [[ "${server_identity_failure_stage}" == executable-mismatch ]]
+  [[ "${server_identity_executable_state}" == mismatch ]]
+
+  write_server_process 4121 8121
+  /usr/bin/printf '0::/foreign.slice/foreign.service\n' >"${PROC_FIXTURE}/4121/cgroup"
+  if classify_server_process_identity 4121 8121; then return 1; fi
+  [[ "${server_identity_failure_stage}" == ownership-mismatch ]]
+  [[ "${server_identity_ownership_state}" == mismatch ]]
+}
+
+test_authenticated_process_records_all_identity_dimensions() {
+  write_server_process 4122 8122
+  classify_server_process_identity 4122 8122
+  [[ -z "${server_identity_failure_stage}" ]]
+  [[ "${server_identity_command_state}" == match ]]
+  [[ "${server_identity_executable_state}" == match ]]
+  [[ "${server_identity_ownership_state}" == match ]]
+  [[ "${server_identity_observed_command_argc}" == 8 ]]
+}
+
+test_disappeared_or_zombie_sdk_preserves_bounded_shutdown_disposition() {
+  adopt_fixture_server 4123 8123
+  remove_server_process 4123
+  stop_server 'deliberate lifecycle shutdown' >/dev/null
+  [[ ! -s "${SIGNAL_LOG}" ]]
+  [[ "${server_origin}" == none ]]
+
+  adopt_fixture_server 4124 8124
+  /usr/bin/sed -i 's/) S /) Z /' "${PROC_FIXTURE}/4124/stat"
+  set_listener ''
+  stop_server 'deliberate lifecycle shutdown' >/dev/null
+  [[ ! -s "${SIGNAL_LOG}" ]]
+  [[ "${server_origin}" == none ]]
+  [[ ! -s "${UNSAFE_WAIT_LOG}" ]]
 }
 
 test_missing_process_is_classified_without_signaling() {
   if classify_server_listener_identity 4110 8110; then
     return 1
   fi
-  [[ "${server_identity_failure_stage}" == process-missing-or-start-mismatch ]]
+  [[ "${server_identity_failure_stage}" == process-absent ]]
   [[ ! -s "${SIGNAL_LOG}" ]]
   server_pid=4110
   server_start_time=8110
   enable_durable_diagnostics
   record_shutdown_identity_refusal sdk-term-authentication 'deliberate lifecycle shutdown'
-  assert_persisted_identity_failure process-missing-or-start-mismatch not-queried
+  assert_persisted_identity_failure process-absent not-queried
   local state_file="${STATE_HOME}/omarchy-plus/openrgb-presets/lifecycle-service-state.json"
   [[ "$(jq -r '.cleanup_failure | has("observed_server_pid")' "${state_file}")" == false ]]
 }
@@ -368,14 +431,14 @@ test_start_token_mismatch_is_classified_without_signaling() {
   if classify_server_listener_identity 4111 9999; then
     return 1
   fi
-  [[ "${server_identity_failure_stage}" == process-missing-or-start-mismatch ]]
+  [[ "${server_identity_failure_stage}" == process-start-mismatch ]]
   [[ "${server_identity_observed_start}" == 8111 ]]
   [[ ! -s "${SIGNAL_LOG}" ]]
   server_pid=4111
   server_start_time=9999
   enable_durable_diagnostics
   record_shutdown_identity_refusal sdk-term-authentication 'deliberate lifecycle shutdown'
-  assert_persisted_identity_failure process-missing-or-start-mismatch not-queried
+  assert_persisted_identity_failure process-start-mismatch not-queried
   local state_file="${STATE_HOME}/omarchy-plus/openrgb-presets/lifecycle-service-state.json"
   [[ "$(jq -r '.cleanup_failure.observed_server_pid' "${state_file}")" == 4111 ]]
   [[ "$(jq -r '.cleanup_failure.observed_server_start' "${state_file}")" == 8111 ]]
@@ -444,7 +507,9 @@ test_duplicate_start_reuses_listener() {
 test_deliberate_cleanup_stops_verified_server() {
   start_server >/dev/null
   local owned_pid="${server_pid}"
-  cleanup deliberate >/dev/null
+  local output_file="${TEST_ROOT}/authenticated-stop.log"
+  cleanup deliberate >"${output_file}"
+  /usr/bin/grep -q 'OpenRGB SDK shutdown authentication succeeded:' "${output_file}"
   [[ "$(<"${SIGNAL_LOG}")" == "-TERM ${owned_pid}" ]]
   [[ ! -d "${PROC_FIXTURE}/${owned_pid}" ]]
   [[ -z "$(<"${LISTENER_STATE}")" ]]
@@ -540,6 +605,10 @@ run_test 'suspend stops adopted SDK and resume restores exactly one' test_suspen
 run_test 'PID reuse prevents signaling' test_pid_reuse_prevents_signaling
 run_test 'listener ownership mismatch prevents signaling' test_listener_mismatch_prevents_signaling
 run_test 'command identity mismatch prevents signaling' test_command_mismatch_prevents_signaling
+run_test 'empty and unreadable SDK cmdlines remain distinct' test_cmdline_empty_and_unreadable_are_distinct
+run_test 'executable and ownership mismatches remain distinct' test_executable_and_ownership_mismatches_are_distinct
+run_test 'authenticated SDK records every identity dimension' test_authenticated_process_records_all_identity_dimensions
+run_test 'disappeared and zombie SDKs retain bounded shutdown disposition' test_disappeared_or_zombie_sdk_preserves_bounded_shutdown_disposition
 run_test 'missing process is classified without signaling' test_missing_process_is_classified_without_signaling
 run_test 'start-token mismatch is classified without signaling' test_start_token_mismatch_is_classified_without_signaling
 run_test 'unreadable listener query is persisted without signaling' test_unreadable_listener_query_is_persisted_without_signaling
@@ -555,5 +624,5 @@ run_test 'SDK ignoring TERM receives bounded SIGKILL escalation' test_sdk_ignori
 run_test 'overall shutdown deadline fails closed without an unbounded wait' test_overall_deadline_fails_closed
 run_test 'an SDK child retaining the listener prevents clean shutdown' test_lingering_sdk_listener_fails_closed
 
-[[ "${pass_count}" -eq 21 ]]
+[[ "${pass_count}" -eq 25 ]]
 /usr/bin/printf 'SDK ownership lifecycle: PASS (%s signal-free cases)\n' "${pass_count}"
