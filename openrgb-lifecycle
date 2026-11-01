@@ -4,6 +4,7 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
+readonly FDFLAGS_LOADABLE="/usr/lib/bash/fdflags"
 readonly OPENRGB_BIN="${OPENRGB_BIN:-/usr/bin/openrgb}"
 readonly GDBUS_BIN="${GDBUS_BIN:-/usr/bin/gdbus}"
 readonly STDBUF_BIN="${STDBUF_BIN:-/usr/bin/stdbuf}"
@@ -48,6 +49,9 @@ readonly USER_MANAGER_COMMAND="${USER_MANAGER_COMMAND:-/usr/lib/systemd/systemd 
 readonly RESTORE_TIMEOUT="75s"
 readonly RESUME_DELAY="${OPENRGB_RESUME_DELAY:-3}"
 readonly SHUTDOWN_BUDGET_SECONDS=15
+readonly SHUTDOWN_TEARDOWN_RESERVE_SECONDS=6
+readonly PRESET_LOCK_DRAIN_ATTEMPTS=10
+readonly PRESET_LOCK_DRAIN_DELAY=0.05
 readonly -a OPENRGB_SERVER_ARGS=(
   --noautoconnect
   --startminimized
@@ -93,6 +97,12 @@ server_identity_expected_executable_sha256=''
 server_identity_ownership_state='not-observed'
 server_identity_observed_uid=''
 server_identity_observed_cgroup_sha256=''
+
+if ! enable -f "${FDFLAGS_LOADABLE}" fdflags; then
+  /usr/bin/printf '%s\n' \
+    "Required Bash fdflags loadable is unavailable: ${FDFLAGS_LOADABLE}" >&2
+  exit 69
+fi
 
 log() {
   /usr/bin/printf '%s\n' "$*"
@@ -165,6 +175,14 @@ shutdown_seconds_remaining() {
   /usr/bin/printf '%s' "${remaining}"
 }
 
+preset_shutdown_time_available() {
+  local remaining=''
+
+  remaining="$(shutdown_seconds_remaining 2>/dev/null || true)"
+  [[ "${remaining}" =~ ^[0-9]+$ ]] \
+    && ((remaining > SHUTDOWN_TEARDOWN_RESERVE_SECONDS))
+}
+
 wait_for_process_exit() {
   local pid="${1:-}"
   local expected_start="${2:-}"
@@ -179,6 +197,30 @@ wait_for_process_exit() {
       return 0
     fi
     shutdown_time_available || return 1
+    "${SLEEP_BIN}" "${delay}"
+  done
+  if process_has_exited "${pid}" "${expected_start}"; then
+    wait_exit_status=0
+    wait "${pid}" 2>/dev/null || wait_exit_status=$?
+    return 0
+  fi
+  return 1
+}
+
+wait_for_preset_process_exit() {
+  local pid="${1:-}"
+  local expected_start="${2:-}"
+  local attempts="${3:-1}"
+  local delay="${4:-0.1}"
+  local attempt
+
+  for ((attempt = 0; attempt < attempts; attempt++)); do
+    if process_has_exited "${pid}" "${expected_start}"; then
+      wait_exit_status=0
+      wait "${pid}" 2>/dev/null || wait_exit_status=$?
+      return 0
+    fi
+    preset_shutdown_time_available || return 1
     "${SLEEP_BIN}" "${delay}"
   done
   if process_has_exited "${pid}" "${expected_start}"; then
@@ -340,6 +382,12 @@ close_fd() {
   eval "exec ${fd}>&-"
 }
 
+set_fd_cloexec() {
+  local fd="${1:-}"
+  [[ "${fd}" =~ ^[0-9]+$ ]] || return 64
+  fdflags -s +cloexec "${fd}"
+}
+
 close_lock_for_child() {
   close_fd "${lifecycle_lock_fd}"
 }
@@ -386,9 +434,8 @@ verify_tetris_lock_released() {
   close_fd "${verify_fd}"
 }
 
-verify_exclusive_lock_released() {
+exclusive_lock_released() {
   local path="${1}"
-  local label="${2}"
   local verify_fd=''
   local old_umask=''
 
@@ -399,10 +446,44 @@ verify_exclusive_lock_released() {
   umask "${old_umask}"
   if ! "${FLOCK_BIN}" -n "${verify_fd}"; then
     close_fd "${verify_fd}"
-    log "${label} is still owned"
     return 1
   fi
   close_fd "${verify_fd}"
+}
+
+verify_exclusive_lock_released() {
+  local path="${1}"
+  local label="${2}"
+
+  if ! exclusive_lock_released "${path}"; then
+    log "${label} is still owned"
+    return 1
+  fi
+}
+
+wait_for_preset_lock_release() {
+  local attempt
+
+  for ((attempt = 0; attempt < PRESET_LOCK_DRAIN_ATTEMPTS; attempt++)); do
+    if exclusive_lock_released "${PRESET_OPERATION_LOCK_FILE}"; then
+      return 0
+    fi
+    preset_shutdown_time_available || return 1
+    "${SLEEP_BIN}" "${PRESET_LOCK_DRAIN_DELAY}"
+  done
+  log 'preset-operation lock is still owned after authenticated drain'
+  return 1
+}
+
+remove_preset_owner_if_unchanged() {
+  local expected="${1:-}"
+  local observed=''
+
+  [[ -n "${expected}" && -r "${PRESET_OWNER_FILE}" ]] || return 0
+  observed="$(/usr/bin/head -n 1 "${PRESET_OWNER_FILE}" 2>/dev/null || true)"
+  if [[ "${observed}" == "${expected}" ]]; then
+    /usr/bin/rm -f -- "${PRESET_OWNER_FILE}"
+  fi
 }
 
 is_preset_operation_process() {
@@ -432,39 +513,56 @@ stop_preset_operation() {
     return
   fi
   if process_has_exited "${pid}" "${start_time}"; then
-    /usr/bin/rm -f -- "${PRESET_OWNER_FILE}"
+    if ! wait_for_preset_lock_release; then
+      log "Authenticated preset-operation record exited but its lock did not drain"
+      return 1
+    fi
+    remove_preset_owner_if_unchanged "${recorded}"
+    return 0
   elif ! is_preset_operation_process "${pid}" "${start_time}"; then
     if process_has_exited "${pid}" "${start_time}"; then
-      /usr/bin/rm -f -- "${PRESET_OWNER_FILE}"
-      verify_exclusive_lock_released \
-        "${PRESET_OPERATION_LOCK_FILE}" 'preset-operation lock'
-      return
+      if ! wait_for_preset_lock_release; then
+        log "Changed preset-operation identity exited but its lock did not drain"
+        return 1
+      fi
+      remove_preset_owner_if_unchanged "${recorded}"
+      return 0
     fi
     log "Refusing to signal unauthenticated preset operation PID ${pid}"
     return 1
   else
-    if ! wait_for_process_exit "${pid}" "${start_time}" 40 0.05; then
+    if ! wait_for_preset_process_exit "${pid}" "${start_time}" 40 0.05; then
+      preset_shutdown_time_available || {
+        log "Preset operation did not exit before the teardown reserve"
+        return 1
+      }
       is_preset_operation_process "${pid}" "${start_time}" || {
         log "Preset operation identity changed before SIGTERM"
         return 1
       }
       kill -TERM "${pid}" 2>/dev/null || true
-      if ! wait_for_process_exit "${pid}" "${start_time}" 20 0.05; then
+      if ! wait_for_preset_process_exit "${pid}" "${start_time}" 20 0.05; then
+        preset_shutdown_time_available || {
+          log "Preset operation did not exit before the teardown reserve"
+          return 1
+        }
         is_preset_operation_process "${pid}" "${start_time}" || {
           log "Preset operation identity changed before SIGKILL"
           return 1
         }
         kill -KILL "${pid}" 2>/dev/null || true
-        if ! wait_for_process_exit "${pid}" "${start_time}" 20 0.05; then
+        if ! wait_for_preset_process_exit "${pid}" "${start_time}" 20 0.05; then
           log "Authenticated preset operation did not exit before shutdown deadline"
           return 1
         fi
       fi
     fi
-    /usr/bin/rm -f -- "${PRESET_OWNER_FILE}"
   fi
-  verify_exclusive_lock_released \
-    "${PRESET_OPERATION_LOCK_FILE}" 'preset-operation lock'
+  if ! wait_for_preset_lock_release; then
+    log "Authenticated preset operation exited but its lock did not drain"
+    return 1
+  fi
+  remove_preset_owner_if_unchanged "${recorded}"
 }
 
 verify_hardware_clients_quiesced() {
@@ -671,6 +769,10 @@ start_tetris() {
   if ! "${FLOCK_BIN}" -n "${operation_lock_fd}"; then
     close_fd "${operation_lock_fd}"
     return 0
+  fi
+  if ! set_fd_cloexec "${operation_lock_fd}"; then
+    close_fd "${operation_lock_fd}"
+    return 1
   fi
   start_tetris_locked || result=$?
   close_fd "${operation_lock_fd}"

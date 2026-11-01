@@ -658,6 +658,27 @@ and post-start acceptance both reject relevant kernel history after the bound
 journal cursor. Other lifecycle-recovery categories retain their existing
 strict kernel policy; no incident, latch, or boot identity is allowlisted.
 
+Version 0.4.44 makes both `apply.flock` acquisition descriptors close-on-exec.
+The preset helper now explicitly unlocks and closes its whole-operation FD on
+normal, error, signal, and timeout exits, independently verifies release, and
+only then removes the unchanged authenticated owner record. Shutdown waits and
+signals only a revalidated preset helper, allows a short deadline-aware lock
+drain after its exit, and preserves six seconds of the existing 15-second
+budget for SDK, inhibitor, and monitor teardown. An unknown or changed holder
+still blocks clean shutdown and is never signaled from lock ownership alone.
+
+The generic old-boot recovery classifier also accepts the reusable v0.4.43
+authenticated preset-lock refusal family. It requires the ordered reboot,
+lifecycle stop, authenticated Tetris exit, owned preset lock, skipped SDK
+teardown, unsuccessful lifecycle, guard latch, and unit exit-code evidence;
+binds the old lifecycle and preset-helper source blobs; and rejects crashes,
+foreign ownership, protected transport errors, changed evidence, or any
+continuing helper or lock. Qualification additionally requires the exact
+reviewed v0.4.44 lifecycle, preset-helper, and RAM-Tetris source before the
+existing double preflight, Tetris-OFF, single-start, acceptance, evidence, and
+bounded-cleanup contracts can run. No incident reference, latch hash, or boot
+identity grants eligibility.
+
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
 The experimental orange, blue, and red Sunrise gradients are therefore stored
@@ -932,6 +953,8 @@ qmllint -I "$OMARCHY_PATH/shell" \
 /usr/bin/bash "$PLUGIN_DIR/tests/test-lifecycle-tetris-handoff"
 "$PLUGIN_DIR/tests/test-lifecycle-tetris-reconciliation"
 "$PLUGIN_DIR/tests/test-independent-lifecycle"
+"$PLUGIN_DIR/tests/test-preset-lock-ownership"
+"$PLUGIN_DIR/tests/test-stage2-shutdown"
 /usr/bin/python3 "$PLUGIN_DIR/tests/test-presets.py"
 /usr/bin/python3 "$PLUGIN_DIR/tests/test-ram-tetris.py"
 /usr/bin/python3 "$PLUGIN_DIR/tests/test-lighting-recovery.py"

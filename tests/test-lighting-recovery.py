@@ -1314,6 +1314,10 @@ class LightingRecoveryTests(unittest.TestCase):
             recovery.SHUTDOWN_RACE_CORRECTED_RAM_TETRIS_SHA256,
         )
         self.assertEqual(
+            hashlib.sha256((ROOT / "apply-preset").read_bytes()).hexdigest(),
+            recovery.SHUTDOWN_RACE_CORRECTED_APPLY_PRESET_SHA256,
+        )
+        self.assertEqual(
             json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))["version"],
             recovery.SHUTDOWN_RACE_CORRECTED_VERSION,
         )
@@ -2294,6 +2298,144 @@ class LightingRecoveryTests(unittest.TestCase):
                 )
                 references.add(incident.incident_reference)
         self.assertEqual(len(references), 2)
+
+    def test_current_preset_lock_incident_qualifies_as_a_generic_family(self):
+        failure_raw, _boundary_raw, journal, kernel = (
+            self.load_incomplete_shutdown_fixture("preset-lock")
+        )
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery, "_current_boot_id", return_value="current-boot"
+            ),
+            mock.patch.object(recovery, "_process_start", return_value=None),
+        ):
+            incident = recovery._classify_incomplete_shutdown_incident()
+            with mock.patch.object(
+                recovery,
+                "_incomplete_shutdown_journal_slice",
+                side_effect=(journal, kernel),
+            ):
+                evidence = json.loads(
+                    recovery._incomplete_shutdown_historical_evidence(incident)
+                )
+        self.assertEqual(
+            incident.incident_reference,
+            "LR-5D4DC05B04339F7F",
+        )
+        self.assertEqual(
+            incident.latch_sha256,
+            hashlib.sha256(failure_raw).hexdigest(),
+        )
+        self.assertEqual(
+            evidence["category"],
+            "authenticated-preset-lock-shutdown-refusal",
+        )
+        self.assertEqual(
+            evidence["source_provenance"]["revision"],
+            recovery.LEGACY_PRESET_LOCK_REFUSAL_REVISION,
+        )
+        self.assertEqual(
+            evidence["lifecycle_identity"],
+            [672599, "7779563"],
+        )
+        self.assertEqual(evidence["server_identity"], [672640, "7779572"])
+
+    def test_preset_lock_family_rejects_changed_or_unsafe_history(self):
+        _failure_raw, _boundary_raw, journal, kernel = (
+            self.load_incomplete_shutdown_fixture("preset-lock")
+        )
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery, "_current_boot_id", return_value="current-boot"
+            ),
+            mock.patch.object(recovery, "_process_start", return_value=None),
+        ):
+            incident = recovery._classify_incomplete_shutdown_incident()
+        cases = (
+            (
+                journal.replace(
+                    "RAM Tetris completed authenticated shutdown stop",
+                    "unreviewed Tetris disposition",
+                ),
+                "history is missing",
+            ),
+            (
+                journal.replace("1793504428.635906", "1793504428.600000"),
+                "timestamps or process identity",
+            ),
+            (
+                journal + "1793504428.650000 hugin helper: ownership violation\n",
+                "hardware, SDK, or foreign ownership",
+            ),
+            (
+                journal + "1793504428.650000 hugin openrgb: segfault\n",
+                "crash",
+            ),
+        )
+        for changed, refusal in cases:
+            with (
+                self.subTest(refusal=refusal),
+                mock.patch.object(
+                    recovery,
+                    "_incomplete_shutdown_journal_slice",
+                    side_effect=(changed, kernel),
+                ),
+                self.assertRaisesRegex(recovery.RecoveryBlocked, refusal),
+            ):
+                recovery._incomplete_shutdown_historical_evidence(incident)
+        with (
+            mock.patch.object(
+                recovery,
+                "_incomplete_shutdown_journal_slice",
+                side_effect=(journal, kernel),
+            ),
+            mock.patch.object(
+                recovery, "_source_blob_sha256", return_value="0" * 64
+            ),
+            self.assertRaisesRegex(
+                recovery.RecoveryBlocked, "source provenance changed"
+            ),
+        ):
+            recovery._incomplete_shutdown_historical_evidence(incident)
+
+    def test_preset_lock_family_rejects_changed_latch_and_continuing_lock(self):
+        failure_raw, _boundary_raw, _journal, _kernel = (
+            self.load_incomplete_shutdown_fixture("preset-lock")
+        )
+        changed = json.loads(failure_raw)
+        changed["message"] = "unknown incomplete shutdown"
+        self.failure.write_text(
+            json.dumps(changed, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery, "_current_boot_id", return_value="current-boot"
+            ),
+            self.assertRaisesRegex(recovery.RecoveryBlocked, "not an incomplete"),
+        ):
+            recovery._classify_incomplete_shutdown_incident()
+
+        lock_path = self.failure.parent / "apply.flock"
+        lock_path.touch(mode=0o600)
+        lock_fd = os.open(lock_path, os.O_WRONLY | os.O_NOFOLLOW)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        listener = subprocess.CompletedProcess([], 0, "", "")
+        try:
+            with (
+                self.patched_environment(),
+                mock.patch.object(recovery, "PROC_ROOT", self.proc),
+                mock.patch.object(recovery, "_matching_processes", return_value=[]),
+                mock.patch.object(recovery.subprocess, "run", return_value=listener),
+                self.assertRaisesRegex(
+                    recovery.RecoveryBlocked, "preset operation lock is owned"
+                ),
+            ):
+                recovery._verify_no_lighting_owners()
+        finally:
+            os.close(lock_fd)
 
     def test_generic_incomplete_shutdown_accepts_synthetic_incident_identities(self):
         references = set()

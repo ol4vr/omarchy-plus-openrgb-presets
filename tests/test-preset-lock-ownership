@@ -1,0 +1,181 @@
+#!/usr/bin/bash
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+readonly REPOSITORY_ROOT="$(/usr/bin/readlink -f "$(/usr/bin/dirname "${BASH_SOURCE[0]}")/..")"
+readonly TEST_ROOT="$(/usr/bin/mktemp -d)"
+readonly STATE_ROOT="${TEST_ROOT}/state/omarchy-plus/openrgb-presets"
+readonly RUNTIME_ROOT="${TEST_ROOT}/runtime"
+readonly LOCK_FILE="${STATE_ROOT}/apply.flock"
+readonly OWNER_FILE="${RUNTIME_ROOT}/preset-operation.state"
+
+cleanup_test() {
+  local child
+  while read -r child; do
+    [[ -z "${child}" ]] || kill -KILL "${child}" 2>/dev/null || true
+  done < <(jobs -pr)
+  wait 2>/dev/null || true
+  /usr/bin/rm -rf -- "${TEST_ROOT}"
+}
+trap cleanup_test EXIT
+
+/usr/bin/mkdir -p -- "${STATE_ROOT}" "${RUNTIME_ROOT}"
+
+cat >"${TEST_ROOT}/child-probe" <<'EOF'
+#!/usr/bin/bash
+set -o errexit
+set -o nounset
+for descriptor in /proc/$$/fd/*; do
+  target="$(/usr/bin/readlink "${descriptor}" 2>/dev/null || true)"
+  if [[ "${target}" == "${EXPECTED_APPLY_LOCK}" ]]; then
+    /usr/bin/printf '%s\n' "inherited ${descriptor}" >"${CHILD_PROBE_FAILURE}"
+    exit 1
+  fi
+done
+EOF
+/usr/bin/chmod 0755 "${TEST_ROOT}/child-probe"
+
+cat >"${TEST_ROOT}/ram-tetris-refusal" <<'EOF'
+#!/usr/bin/bash
+set -o errexit
+set -o nounset
+"${CHILD_PROBE}"
+exit 70
+EOF
+/usr/bin/chmod 0755 "${TEST_ROOT}/ram-tetris-refusal"
+
+cat >"${TEST_ROOT}/flock-wrapper" <<'EOF'
+#!/usr/bin/bash
+set -o errexit
+set -o nounset
+if [[ "${1:-}" == --unlock ]]; then
+  [[ -s "${OBSERVED_OWNER_FILE}" ]]
+  /usr/bin/printf '%s\n' unlock-owner-present >>"${FLOCK_TRACE}"
+elif [[ "${1:-}" == --nonblock && -s "${OBSERVED_OWNER_FILE}" ]]; then
+  /usr/bin/printf '%s\n' probe-owner-present >>"${FLOCK_TRACE}"
+fi
+exec /usr/bin/flock "$@"
+EOF
+/usr/bin/chmod 0755 "${TEST_ROOT}/flock-wrapper"
+
+cat >"${TEST_ROOT}/apply-fixture" <<'EOF'
+#!/usr/bin/bash
+set -o errexit
+set -o nounset
+set -o pipefail
+source "${REPOSITORY_ROOT}/apply-preset"
+
+exec 9>"${LOCK_FILE}"
+"${FLOCK_BIN}" --nonblock 9
+preset_lock_held=true
+set_fd_cloexec 9
+operation_identity="$$ $(/usr/bin/awk '{print $22}' /proc/$$/stat)"
+/usr/bin/printf '%s\n' "${operation_identity}" >"${PRESET_OWNER_FILE}"
+"${CHILD_PROBE}"
+
+case "${1}" in
+  normal)
+    exit 0
+    ;;
+  error)
+    false
+    ;;
+  signal|timeout)
+    while true; do
+      "${CHILD_PROBE}"
+      /usr/bin/sleep 0.02
+    done
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+EOF
+/usr/bin/chmod 0755 "${TEST_ROOT}/apply-fixture"
+
+export REPOSITORY_ROOT
+export XDG_STATE_HOME="${TEST_ROOT}/state"
+export OPENRGB_RUNTIME_DIR="${RUNTIME_ROOT}"
+export FLOCK_BIN="${TEST_ROOT}/flock-wrapper"
+export FLOCK_TRACE="${TEST_ROOT}/flock.trace"
+export OBSERVED_OWNER_FILE="${OWNER_FILE}"
+export EXPECTED_APPLY_LOCK="${LOCK_FILE}"
+export CHILD_PROBE="${TEST_ROOT}/child-probe"
+export CHILD_PROBE_FAILURE="${TEST_ROOT}/child-probe.failure"
+
+assert_released() {
+  local verify_fd
+  [[ ! -e "${OWNER_FILE}" ]]
+  exec {verify_fd}>"${LOCK_FILE}"
+  /usr/bin/flock --nonblock "${verify_fd}"
+  eval "exec ${verify_fd}>&-"
+  [[ ! -e "${CHILD_PROBE_FAILURE}" ]]
+}
+
+assert_cleanup_trace() {
+  /usr/bin/grep -Fxq unlock-owner-present "${FLOCK_TRACE}"
+  /usr/bin/grep -Fxq probe-owner-present "${FLOCK_TRACE}"
+}
+
+: >"${FLOCK_TRACE}"
+"${TEST_ROOT}/apply-fixture" normal
+assert_cleanup_trace
+assert_released
+/usr/bin/printf '%s\n' \
+  'PASS: normal exit retains the owner record through verified lock release'
+
+: >"${FLOCK_TRACE}"
+if RAM_TETRIS="${TEST_ROOT}/ram-tetris-refusal" \
+  "${REPOSITORY_ROOT}/apply-preset" deep-red; then
+  /usr/bin/printf '%s\n' 'FAIL: error fixture unexpectedly succeeded' >&2
+  exit 1
+fi
+assert_cleanup_trace
+assert_released
+/usr/bin/printf '%s\n' \
+  'PASS: real apply-preset acquisition keeps FD 9 out of its failing child'
+
+: >"${FLOCK_TRACE}"
+"${TEST_ROOT}/apply-fixture" signal &
+fixture_pid=$!
+for _attempt in {1..100}; do
+  [[ -s "${OWNER_FILE}" ]] && break
+  /usr/bin/sleep 0.01
+done
+[[ -s "${OWNER_FILE}" ]]
+kill -TERM "${fixture_pid}"
+signal_status=0
+wait "${fixture_pid}" || signal_status=$?
+[[ "${signal_status}" -eq 143 ]]
+assert_cleanup_trace
+assert_released
+/usr/bin/printf '%s\n' \
+  'PASS: SIGTERM exit follows the same ordered lock cleanup'
+
+: >"${FLOCK_TRACE}"
+timeout_status=0
+/usr/bin/timeout --signal=TERM 0.25 "${TEST_ROOT}/apply-fixture" timeout 2>/dev/null \
+  || timeout_status=$?
+[[ "${timeout_status}" -eq 124 ]]
+assert_cleanup_trace
+assert_released
+/usr/bin/printf '%s\n' \
+  'PASS: timeout termination follows the same ordered lock cleanup'
+
+FLOCK_BIN=/usr/bin/flock /usr/bin/bash -c '
+  set -o errexit
+  set -o nounset
+  set -o pipefail
+  source "${REPOSITORY_ROOT}/openrgb-lifecycle"
+  start_tetris_locked() { "${CHILD_PROBE}"; }
+  start_tetris
+  exclusive_lock_released "${PRESET_OPERATION_LOCK_FILE}"
+'
+[[ ! -e "${CHILD_PROBE_FAILURE}" ]]
+/usr/bin/printf '%s\n' \
+  'PASS: lifecycle Tetris acquisition is close-on-exec and releases cleanly'
+
+/usr/bin/printf '%s\n' \
+  'Preset lock ownership process tests: PASS (5 cases)'

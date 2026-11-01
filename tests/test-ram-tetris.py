@@ -3208,7 +3208,7 @@ class IntegrationSourceTests(unittest.TestCase):
         runner = (ROOT / "ram-tetris").read_text()
         request = apply.index('"${RAM_TETRIS}" request-stop preset-change')
         tetris_lock = apply.index('exec 8>"${TETRIS_LOCK_FILE}"')
-        quiesced = apply.index("/usr/bin/flock --wait 10 8")
+        quiesced = apply.index('"${FLOCK_BIN}" --wait 10 8')
         clear = apply.index('"${RAM_TETRIS}" clear-local-stop', quiesced)
         apply_call = apply.index('apply_preset "${preset}"', clear)
         self.assertLess(request, tetris_lock)
@@ -3217,7 +3217,7 @@ class IntegrationSourceTests(unittest.TestCase):
         self.assertLess(clear, apply_call)
         self.assertIn("guarded_hardware_mutation", apply)
         self.assertIn("hardware-operation.lock", runner)
-        quiescence_failure = apply.split("if ! /usr/bin/flock --wait 10 8; then", 1)[
+        quiescence_failure = apply.split('if ! "${FLOCK_BIN}" --wait 10 8; then', 1)[
             1
         ].split("fi", 1)[0]
         self.assertIn("return 75", quiescence_failure)

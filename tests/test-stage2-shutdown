@@ -81,12 +81,33 @@ assert_locks_free
 helper_pid=$!
 wait_for_owner
 /usr/bin/printf '%s\n' stop >"${TETRIS_STOP_FILE}"
-shutdown_deadline=$((SECONDS + 8))
+shutdown_started="${SECONDS}"
+shutdown_deadline=$((SECONDS + SHUTDOWN_BUDGET_SECONDS))
 stop_preset_operation
+((SECONDS - shutdown_started < SHUTDOWN_BUDGET_SECONDS))
 ! kill -0 "${helper_pid}" 2>/dev/null
 assert_locks_free
 /usr/bin/printf '%s\n' \
   'PASS: authenticated preset helper ignoring SIGTERM is killed boundedly'
+
+/usr/bin/rm -f -- "${TETRIS_STOP_FILE}"
+"${FAKE_APPLY}" ignore &
+helper_pid=$!
+wait_for_owner
+shutdown_started="${SECONDS}"
+shutdown_deadline=$((SECONDS + SHUTDOWN_TEARDOWN_RESERVE_SECONDS + 1))
+if stop_preset_operation; then
+  /usr/bin/printf '%s\n' 'FAIL: teardown reserve was consumed by preset wait' >&2
+  exit 1
+fi
+((SECONDS - shutdown_started < SHUTDOWN_BUDGET_SECONDS))
+kill -0 "${helper_pid}"
+kill -KILL "${helper_pid}"
+wait "${helper_pid}" 2>/dev/null || true
+/usr/bin/rm -f -- "${PRESET_OWNER_FILE}"
+assert_locks_free
+/usr/bin/printf '%s\n' \
+  'PASS: preset wait preserves the explicit SDK/inhibitor/monitor reserve'
 
 /usr/bin/rm -f -- "${TETRIS_STOP_FILE}"
 /usr/bin/sleep 30 &
@@ -103,6 +124,33 @@ wait "${foreign_pid}" 2>/dev/null || true
 /usr/bin/rm -f -- "${PRESET_OWNER_FILE}"
 /usr/bin/printf '%s\n' \
   'PASS: unauthenticated foreign process is never signaled'
+
+foreign_ready="${TEST_ROOT}/foreign-lock.ready"
+FOREIGN_LOCK_FILE="${PRESET_OPERATION_LOCK_FILE}" \
+FOREIGN_READY="${foreign_ready}" /usr/bin/bash -c '
+  exec 7>"${FOREIGN_LOCK_FILE}"
+  /usr/bin/flock 7
+  : >"${FOREIGN_READY}"
+  exec /usr/bin/sleep 30
+' &
+foreign_pid=$!
+for _attempt in {1..100}; do
+  [[ -e "${foreign_ready}" ]] && break
+  /usr/bin/sleep 0.01
+done
+[[ -e "${foreign_ready}" ]]
+shutdown_started="${SECONDS}"
+shutdown_deadline=$((SECONDS + SHUTDOWN_BUDGET_SECONDS))
+if stop_preset_operation; then
+  /usr/bin/printf '%s\n' 'FAIL: unrecorded foreign lock was accepted' >&2
+  exit 1
+fi
+((SECONDS - shutdown_started < SHUTDOWN_BUDGET_SECONDS))
+kill -0 "${foreign_pid}"
+kill -TERM "${foreign_pid}"
+wait "${foreign_pid}" 2>/dev/null || true
+/usr/bin/printf '%s\n' \
+  'PASS: an unrecorded foreign lock blocks clean shutdown without signaling'
 
 /usr/bin/rm -f -- "${TETRIS_STOP_FILE}"
 "${FAKE_APPLY}" cooperative &
@@ -123,9 +171,11 @@ release_inhibitor() { return 0; }
 stop_monitor() { return 0; }
 shutting_down=false
 shutdown_deadline=0
+shutdown_started="${SECONDS}"
 cleanup deliberate
+((SECONDS - shutdown_started < SHUTDOWN_BUDGET_SECONDS))
 [[ "${sdk_stop_observed}" == true ]]
 /usr/bin/printf '%s\n' \
   'PASS: SDK teardown is called only after authenticated clients and locks exit'
 
-/usr/bin/printf '%s\n' 'Stage 2 shutdown process tests: PASS (4 cases)'
+/usr/bin/printf '%s\n' 'Stage 2 shutdown process tests: PASS (6 cases)'

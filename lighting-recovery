@@ -148,12 +148,15 @@ SHUTDOWN_RACE_SERVER_START: Final = "85366961"
 SHUTDOWN_RACE_WRITER_PID: Final = 394561
 SHUTDOWN_RACE_BOUNDARY_TIME: Final = 1793310621.0151148
 SHUTDOWN_RACE_FAILURE_TIME: Final = 1793310623.257292
-SHUTDOWN_RACE_CORRECTED_VERSION: Final = "0.4.43"
+SHUTDOWN_RACE_CORRECTED_VERSION: Final = "0.4.44"
 SHUTDOWN_RACE_CORRECTED_LIFECYCLE_SHA256: Final = (
-    "ebf58492beabb0b519463e2915ceb9346d2f7a75e8df06255d143b4a6d475e7b"
+    "7d42efa358802e8219a3c6d157581df445124375d5084a9f26fdcec46303ebf0"
 )
 SHUTDOWN_RACE_CORRECTED_RAM_TETRIS_SHA256: Final = (
     "9962b1bf8ef932ab2b8efae99ead191692cf3976b65d1e1f801d107dd9b2e66c"
+)
+SHUTDOWN_RACE_CORRECTED_APPLY_PRESET_SHA256: Final = (
+    "694119835f96ce5894e092b092a5e9f9c3543ccce6225195128d0eb734a1684e"
 )
 SHUTDOWN_RACE_RECOVERY_BOOT_ID: Final = "8f7fdab1-de77-4db2-864c-ea5ce41a279c"
 SHUTDOWN_RACE_REVIEWED_KERNEL_MESSAGE: Final = (
@@ -213,10 +216,30 @@ INCOMPLETE_SHUTDOWN_TEARDOWN_MARKERS: Final = (
     "OpenRGB SDK teardown skipped because RAM Tetris did not quiesce",
     "OpenRGB server stopped for deliberate lifecycle shutdown",
 )
+PRESET_LOCK_SHUTDOWN_REQUIRED_JOURNAL_MARKERS: Final = (
+    "Stopping Omarchy+ OpenRGB lifecycle",
+    "RAM Tetris completed authenticated shutdown stop",
+    "preset-operation lock is still owned",
+    "OpenRGB SDK teardown skipped because RAM Tetris did not quiesce",
+    "omarchy-plus-openrgb-presets.service: Main process exited, code=exited, status=1/FAILURE",
+    "OpenRGB lifecycle stop incomplete: incomplete-lifecycle-exit",
+    "omarchy-plus-openrgb-presets.service: Failed with result 'exit-code'",
+)
+LEGACY_PRESET_LOCK_REFUSAL_REVISION: Final = (
+    "b0ac8c191c93e42e049184c5d5a8cab24dfa00d8"
+)
+LEGACY_PRESET_LOCK_REFUSAL_VERSION: Final = "0.4.43"
+LEGACY_PRESET_LOCK_REFUSAL_LIFECYCLE_SHA256: Final = (
+    "ebf58492beabb0b519463e2915ceb9346d2f7a75e8df06255d143b4a6d475e7b"
+)
+LEGACY_PRESET_LOCK_REFUSAL_APPLY_PRESET_SHA256: Final = (
+    "c577cbb2f42ca6bda9db6bfa0dc8e019010c74d59aaba204d577e99db4090370"
+)
 INCOMPLETE_SHUTDOWN_UNSAFE_HISTORY: Final = re.compile(
     r"(?:temperature is unreadable|expected seven controllers|DIMM (?:is not|state changed)|"
     r"UPDATELEDS failed|ownership is ambiguous|ownership violation|listener owner changed|"
-    r"lifecycle identity changed|unexpected SDK (?:exit|crash))",
+    r"lifecycle identity changed|unexpected SDK (?:exit|crash)|"
+    r"unauthenticated preset operation|preset operation identity changed)",
     re.IGNORECASE,
 )
 OPENRGB_CRASH_HISTORY: Final = re.compile(
@@ -939,7 +962,11 @@ def _verify_corrected_source_revision(minimum_revision: str) -> str:
 
 
 def _source_blob_sha256(revision: str, source_path: str) -> str:
-    if not re.fullmatch(r"[0-9a-f]{40}", revision) or source_path != "ram-tetris":
+    if not re.fullmatch(r"[0-9a-f]{40}", revision) or source_path not in {
+        "apply-preset",
+        "openrgb-lifecycle",
+        "ram-tetris",
+    }:
         raise RecoveryBlocked("Recovery blocked: failure source provenance is invalid.")
     source = subprocess.run(
         [GIT, "-C", str(ROOT), "show", f"{revision}:{source_path}"],
@@ -1496,6 +1523,9 @@ def _verify_shutdown_race_corrected_source() -> str:
         ram_tetris_sha256 = hashlib.sha256(
             (ROOT / "ram-tetris").read_bytes()
         ).hexdigest()
+        apply_preset_sha256 = hashlib.sha256(
+            (ROOT / "apply-preset").read_bytes()
+        ).hexdigest()
     except (OSError, json.JSONDecodeError) as error:
         raise RecoveryBlocked(
             "Recovery blocked: corrected shutdown source is unreadable."
@@ -1509,6 +1539,7 @@ def _verify_shutdown_race_corrected_source() -> str:
         or manifest.get("version") != SHUTDOWN_RACE_CORRECTED_VERSION
         or lifecycle_sha256 != SHUTDOWN_RACE_CORRECTED_LIFECYCLE_SHA256
         or ram_tetris_sha256 != SHUTDOWN_RACE_CORRECTED_RAM_TETRIS_SHA256
+        or apply_preset_sha256 != SHUTDOWN_RACE_CORRECTED_APPLY_PRESET_SHA256
     ):
         raise RecoveryBlocked(
             "Recovery blocked: the reviewed shutdown-ordering correction is not installed."
@@ -3009,6 +3040,13 @@ def _verify_no_lighting_owners() -> None:
         argv = _process_argv(int(entry.name))
         if len(argv) >= 3 and Path(argv[1]) == RAM_TETRIS and argv[2] == "run":
             raise RecoveryBlocked("Recovery blocked: a RAM Tetris writer is active.")
+        if any(
+            Path(argument) in {ROOT / "apply-preset", ROOT / "effects-sdk"}
+            for argument in argv
+        ):
+            raise RecoveryBlocked(
+                "Recovery blocked: a lighting preset or Effects helper is active."
+            )
 
     listener = subprocess.run(
         [SS, "-H", "-ltnp", "sport = :6742"],
@@ -3030,6 +3068,10 @@ def _verify_no_lighting_owners() -> None:
     ):
         if _lock_is_owned(root / name):
             raise RecoveryBlocked(f"Recovery blocked: the {label} lock is owned.")
+    if _lock_is_owned(state_root() / "apply.flock"):
+        raise RecoveryBlocked(
+            "Recovery blocked: the lighting preset operation lock is owned."
+        )
 
 
 def _verify_lifecycle_environment(
@@ -3948,6 +3990,24 @@ def _journal_marker_time(journal: str, marker: str) -> float | None:
     return None
 
 
+def _legacy_preset_lock_source_provenance() -> dict[str, str]:
+    expected = {
+        "openrgb-lifecycle": LEGACY_PRESET_LOCK_REFUSAL_LIFECYCLE_SHA256,
+        "apply-preset": LEGACY_PRESET_LOCK_REFUSAL_APPLY_PRESET_SHA256,
+    }
+    for path, sha256 in expected.items():
+        if _source_blob_sha256(LEGACY_PRESET_LOCK_REFUSAL_REVISION, path) != sha256:
+            raise RecoveryBlocked(
+                "Recovery blocked: preset-lock shutdown source provenance changed."
+            )
+    return {
+        "revision": LEGACY_PRESET_LOCK_REFUSAL_REVISION,
+        "version": LEGACY_PRESET_LOCK_REFUSAL_VERSION,
+        "lifecycle_sha256": LEGACY_PRESET_LOCK_REFUSAL_LIFECYCLE_SHA256,
+        "apply_preset_sha256": LEGACY_PRESET_LOCK_REFUSAL_APPLY_PRESET_SHA256,
+    }
+
+
 def _incomplete_shutdown_historical_evidence(
     incident: IncompleteShutdownIncident,
 ) -> bytes:
@@ -4016,6 +4076,109 @@ def _incomplete_shutdown_historical_evidence(
             "protected_pre_shutdown_ownership": json.loads(
                 incident.historical_ownership_raw
             ),
+            "journal": journal,
+            "kernel": kernel,
+        }
+        return (json.dumps(document, sort_keys=True) + "\n").encode()
+    if all(
+        marker in journal
+        for marker in PRESET_LOCK_SHUTDOWN_REQUIRED_JOURNAL_MARKERS
+    ):
+        reboot_time = next(
+            (
+                _journal_marker_time(journal, marker)
+                for marker in (
+                    "System is rebooting",
+                    "The system will reboot now!",
+                    "/usr/bin/systemctl reboot --no-wall",
+                )
+                if marker in journal
+            ),
+            None,
+        )
+        stopping_time = _journal_marker_time(
+            journal, "Stopping Omarchy+ OpenRGB lifecycle"
+        )
+        tetris_time = _journal_marker_time(
+            journal, "RAM Tetris completed authenticated shutdown stop"
+        )
+        preset_lock_time = _journal_marker_time(
+            journal, "preset-operation lock is still owned"
+        )
+        teardown_time = _journal_marker_time(
+            journal,
+            "OpenRGB SDK teardown skipped because RAM Tetris did not quiesce",
+        )
+        exit_time = _journal_marker_time(
+            journal,
+            "omarchy-plus-openrgb-presets.service: Main process exited, code=exited, status=1/FAILURE",
+        )
+        latch_time = _journal_marker_time(
+            journal, "OpenRGB lifecycle stop incomplete: incomplete-lifecycle-exit"
+        )
+        failed_time = _journal_marker_time(
+            journal,
+            "omarchy-plus-openrgb-presets.service: Failed with result 'exit-code'",
+        )
+        if (
+            None
+            in {
+                reboot_time,
+                stopping_time,
+                tetris_time,
+                preset_lock_time,
+                teardown_time,
+                exit_time,
+                latch_time,
+                failed_time,
+            }
+            or not reboot_time
+            <= stopping_time
+            <= incident.boundary_time
+            <= tetris_time
+            <= preset_lock_time
+            <= teardown_time
+            <= exit_time
+            <= latch_time
+            <= failed_time
+            or abs(latch_time - incident.failure_time) > 1.0
+            or (
+                f"omarchy-plus-openrgb-presets[{incident.latch_pid}]: "
+                "OpenRGB lifecycle stop incomplete: incomplete-lifecycle-exit"
+            )
+            not in journal
+            or "OpenRGB server stopped for deliberate lifecycle shutdown" in journal
+        ):
+            raise RecoveryBlocked(
+                "Recovery blocked: preset-lock shutdown timestamps or process "
+                "identity do not correlate."
+            )
+        combined = journal + "\n" + kernel
+        if OPENRGB_CRASH_HISTORY.search(combined):
+            raise RecoveryBlocked(
+                "Recovery blocked: historical OpenRGB crash or resource failure exists."
+            )
+        if INCOMPLETE_SHUTDOWN_UNSAFE_HISTORY.search(combined):
+            raise RecoveryBlocked(
+                "Recovery blocked: historical hardware, SDK, or foreign ownership "
+                "failure exists."
+            )
+        if any(RELEVANT_KERNEL_ERROR.search(line) for line in kernel.splitlines()):
+            raise RecoveryBlocked(
+                "Recovery blocked: historical protected-transport failure exists."
+            )
+        document = {
+            "schema_version": 3,
+            "category": "authenticated-preset-lock-shutdown-refusal",
+            "boot_id": incident.old_boot_id,
+            "boundary_time": incident.boundary_time,
+            "failure_time": incident.failure_time,
+            "lifecycle_identity": [
+                incident.lifecycle_pid,
+                incident.lifecycle_start,
+            ],
+            "server_identity": [incident.server_pid, incident.server_start],
+            "source_provenance": _legacy_preset_lock_source_provenance(),
             "journal": journal,
             "kernel": kernel,
         }

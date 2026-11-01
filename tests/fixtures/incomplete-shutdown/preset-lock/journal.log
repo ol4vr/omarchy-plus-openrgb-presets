@@ -1,0 +1,11 @@
+1793504428.313391 hugin systemd[2611]: Started [systemd-run] /usr/bin/systemctl reboot --no-wall.
+1793504428.333126 hugin systemd-logind[2452]: The system will reboot now!
+1793504428.333173 hugin systemd-logind[2452]: System is rebooting.
+1793504428.376754 hugin systemd[2611]: Stopping Omarchy+ OpenRGB lifecycle...
+1793504428.633032 hugin omarchy-plus-openrgb-presets[712497]: RAM Tetris completed authenticated shutdown stop
+1793504428.635906 hugin omarchy-plus-openrgb-presets[712507]: preset-operation lock is still owned
+1793504428.640031 hugin omarchy-plus-openrgb-presets[712516]: preset-operation lock is still owned
+1793504428.640615 hugin omarchy-plus-openrgb-presets[712517]: OpenRGB SDK teardown skipped because RAM Tetris did not quiesce
+1793504428.661503 hugin systemd[2611]: omarchy-plus-openrgb-presets.service: Main process exited, code=exited, status=1/FAILURE
+1793504429.133614 hugin omarchy-plus-openrgb-presets[712580]: OpenRGB lifecycle stop incomplete: incomplete-lifecycle-exit
+1793504429.138503 hugin systemd[2611]: omarchy-plus-openrgb-presets.service: Failed with result 'exit-code'.
