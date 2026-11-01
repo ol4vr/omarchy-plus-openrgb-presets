@@ -148,7 +148,7 @@ SHUTDOWN_RACE_SERVER_START: Final = "85366961"
 SHUTDOWN_RACE_WRITER_PID: Final = 394561
 SHUTDOWN_RACE_BOUNDARY_TIME: Final = 1793310621.0151148
 SHUTDOWN_RACE_FAILURE_TIME: Final = 1793310623.257292
-SHUTDOWN_RACE_CORRECTED_VERSION: Final = "0.4.42"
+SHUTDOWN_RACE_CORRECTED_VERSION: Final = "0.4.43"
 SHUTDOWN_RACE_CORRECTED_LIFECYCLE_SHA256: Final = (
     "ebf58492beabb0b519463e2915ceb9346d2f7a75e8df06255d143b4a6d475e7b"
 )
@@ -226,6 +226,11 @@ I2C_CLIENT_REGISTRATION_FAILURE: Final = re.compile(
     r"^i2c i2c-(?P<bus>[0-9]+): Failed to register i2c client "
     r"(?P<client>ITE8853:[0-9]+) at 0x(?P<address>[0-9a-fA-F]+) "
     r"\((?P<errno>-[0-9]+)\)$"
+)
+RESUME_SPD5118_ERROR: Final = re.compile(
+    r"^spd5118 (?P<endpoint>10-005[0-3]): "
+    r"(?P<failure>Failed to write b = 0: -6|"
+    r"PM: failed to resume async: error -6)$"
 )
 # These are the reviewed OpenRGB/SPD transports. A failed ITE8853 registration
 # can be retained as unrelated only when its parsed bus/address is outside all
@@ -1262,6 +1267,7 @@ def _legacy_cleanup_refusal_snapshot(
         )
         if (
             snapshot.get("state") != "ready"
+            or snapshot.get("reason") != HISTORICAL_READY_REASON
             or snapshot.get("boot_id") != boot_id
             or snapshot.get("lifecycle_pid") != lifecycle_pid
             or snapshot.get("lifecycle_start") != lifecycle_start
@@ -4117,6 +4123,30 @@ def _unprotected_ite_registration(message: str) -> dict[str, object] | None:
 def _incomplete_shutdown_current_kernel_records(
     boot_id: str,
 ) -> tuple[tuple[dict[str, object], dict[str, object]], ...]:
+    _raw, records = _incomplete_shutdown_current_kernel_journal(boot_id)
+    return _strict_current_kernel_records(records)
+
+
+def _strict_current_kernel_records(
+    records: tuple[dict[str, object], ...],
+) -> tuple[tuple[dict[str, object], dict[str, object]], ...]:
+    retained: list[tuple[dict[str, object], dict[str, object]]] = []
+    for record in records:
+        message = record.get("MESSAGE")
+        if not isinstance(message, str) or not RELEVANT_KERNEL_ERROR.search(message):
+            continue
+        exclusion = _unprotected_ite_registration(message)
+        if exclusion is None:
+            raise RecoveryBlocked(
+                "Recovery blocked: current-boot protected-transport or kernel error exists."
+            )
+        retained.append((record, exclusion))
+    return tuple(retained)
+
+
+def _incomplete_shutdown_current_kernel_journal(
+    boot_id: str,
+) -> tuple[str, tuple[dict[str, object], ...]]:
     command = [
         JOURNALCTL,
         "--boot",
@@ -4137,7 +4167,7 @@ def _incomplete_shutdown_current_kernel_records(
             "Recovery blocked: current-boot kernel history is unreadable."
         )
     expected_boot = boot_id.replace("-", "").lower()
-    retained: list[tuple[dict[str, object], dict[str, object]]] = []
+    records: list[dict[str, object]] = []
     for raw in result.stdout.splitlines():
         try:
             record = json.loads(raw)
@@ -4149,21 +4179,185 @@ def _incomplete_shutdown_current_kernel_records(
             raise RecoveryBlocked(
                 "Recovery blocked: current-boot kernel history is malformed."
             )
-        message = record.get("MESSAGE")
-        if not isinstance(message, str) or not RELEVANT_KERNEL_ERROR.search(message):
-            continue
         record_boot = record.get("_BOOT_ID")
         if not isinstance(record_boot, str) or record_boot.lower() != expected_boot:
             raise RecoveryBlocked(
                 "Recovery blocked: current kernel evidence belongs to another boot."
             )
+        records.append(record)
+    return result.stdout, tuple(records)
+
+
+def _kernel_record_time(record: dict[str, object]) -> float:
+    value = record.get("__REALTIME_TIMESTAMP")
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (str, int))
+        or not str(value).isdigit()
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: current kernel evidence timestamp is malformed."
+        )
+    return int(value) / 1_000_000
+
+
+def _cleanup_refusal_ready_time(incident: IncompleteShutdownIncident) -> float:
+    try:
+        ownership = json.loads(incident.historical_ownership_raw)
+        ready = ownership["lifecycle_state"]
+    except (json.JSONDecodeError, KeyError, TypeError) as error:
+        raise RecoveryBlocked(
+            "Recovery blocked: protected healthy-ready ownership is unreadable."
+        ) from error
+    ready_time = _number(ready.get("time")) if isinstance(ready, dict) else None
+    if (
+        not isinstance(ready, dict)
+        or ready.get("state") != "ready"
+        or ready.get("reason") != HISTORICAL_READY_REASON
+        or ready.get("boot_id") != incident.old_boot_id
+        or ready.get("lifecycle_pid") != incident.lifecycle_pid
+        or ready.get("lifecycle_start") != incident.lifecycle_start
+        or ready.get("server_pid") != incident.server_pid
+        or ready.get("server_start") != incident.server_start
+        or ready_time is None
+        or ready_time >= incident.boundary_time
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: authenticated full healthy readiness is incomplete."
+        )
+    return ready_time
+
+
+def _cleanup_refusal_kernel_qualification(
+    records: tuple[dict[str, object], ...], *, ready_time: float
+) -> tuple[tuple[dict[str, object], dict[str, object]], ...]:
+    resume_errors: list[tuple[dict[str, object], re.Match[str], float]] = []
+    excluded: list[tuple[dict[str, object], dict[str, object]]] = []
+    suspend_events: list[tuple[str, float]] = []
+    for record in records:
+        message = record.get("MESSAGE")
+        if not isinstance(message, str):
+            continue
+        if SUSPEND_RESUME_EVENT.search(message):
+            event_time = _kernel_record_time(record)
+            if event_time >= ready_time:
+                raise RecoveryBlocked(
+                    "Recovery blocked: suspend or resume followed authenticated readiness."
+                )
+            suspend_events.append((message, event_time))
+        if not RELEVANT_KERNEL_ERROR.search(message):
+            continue
         exclusion = _unprotected_ite_registration(message)
-        if exclusion is None:
+        if exclusion is not None:
+            excluded.append((record, exclusion))
+            continue
+        match = RESUME_SPD5118_ERROR.fullmatch(message)
+        if match is None:
             raise RecoveryBlocked(
                 "Recovery blocked: current-boot protected-transport or kernel error exists."
             )
-        retained.append((record, exclusion))
-    return tuple(retained)
+        error_time = _kernel_record_time(record)
+        if error_time >= ready_time:
+            raise RecoveryBlocked(
+                "Recovery blocked: protected-transport error followed authenticated readiness."
+            )
+        resume_errors.append((record, match, error_time))
+
+    expected = {
+        (endpoint, failure)
+        for endpoint in TRANSIENT_SPD_ENDPOINTS
+        for failure in (
+            "Failed to write b = 0: -6",
+            "PM: failed to resume async: error -6",
+        )
+    }
+    observed = {
+        (match.group("endpoint"), match.group("failure"))
+        for _record, match, _time in resume_errors
+    }
+    if len(resume_errors) != len(expected) or observed != expected:
+        raise RecoveryBlocked(
+            "Recovery blocked: completed-resume SPD5118 history is incomplete or changed."
+        )
+
+    error_times = [error_time for _record, _match, error_time in resume_errors]
+    entries = [
+        event_time
+        for message, event_time in suspend_events
+        if re.search(r"PM: suspend entry", message, re.IGNORECASE)
+    ]
+    resumes = [
+        event_time
+        for message, event_time in suspend_events
+        if re.search(r"Low-level resume complete", message, re.IGNORECASE)
+    ]
+    exits = [
+        event_time
+        for message, event_time in suspend_events
+        if re.search(r"PM: suspend exit", message, re.IGNORECASE)
+    ]
+    windows = [
+        (entry, resume, exit_time)
+        for resume in resumes
+        for entry in entries
+        for exit_time in exits
+        if entry < resume
+        and resume <= min(error_times)
+        and max(error_times) <= exit_time
+        and exit_time < ready_time
+        and entry == max(item for item in entries if item < resume)
+        and exit_time == min(item for item in exits if item >= resume)
+    ]
+    if len(windows) != 1:
+        raise RecoveryBlocked(
+            "Recovery blocked: SPD5118 errors are not bound to one completed resume."
+        )
+    entry, resume, exit_time = windows[0]
+    return tuple(
+        excluded
+        + [
+            (
+                record,
+                {
+                    "classification": "completed-resume-spd5118-error",
+                    "endpoint": match.group("endpoint"),
+                    "failure": match.group("failure"),
+                    "suspend_entry_time": entry,
+                    "resume_complete_time": resume,
+                    "suspend_exit_time": exit_time,
+                    "authenticated_ready_time": ready_time,
+                },
+            )
+            for record, match, _error_time in resume_errors
+        ]
+    )
+
+
+def _verify_cleanup_refusal_service_interval(
+    service_journal: str, *, ready_time: float
+) -> None:
+    for line in service_journal.splitlines():
+        token = line.partition(" ")[0]
+        try:
+            timestamp = float(token)
+        except ValueError:
+            if OPENRGB_CRASH_HISTORY.search(
+                line
+            ) or INCOMPLETE_SHUTDOWN_UNSAFE_HISTORY.search(line):
+                raise RecoveryBlocked(
+                    "Recovery blocked: post-readiness service history is malformed."
+                )
+            continue
+        if timestamp < ready_time:
+            continue
+        if OPENRGB_CRASH_HISTORY.search(line):
+            raise RecoveryBlocked(
+                "Recovery blocked: OpenRGB crashed after authenticated readiness."
+            )
+        if INCOMPLETE_SHUTDOWN_UNSAFE_HISTORY.search(line):
+            raise RecoveryBlocked(
+                "Recovery blocked: hardware, SDK, or ownership failed after readiness."
+            )
 
 
 def _incomplete_shutdown_current_service_journal(boot_id: str) -> str:
@@ -4194,23 +4388,39 @@ def _incomplete_shutdown_current_service_journal(boot_id: str) -> str:
 def _incomplete_shutdown_current_qualification(
     config_raw: bytes,
     *,
+    incident: IncompleteShutdownIncident,
     boot_id: str,
-    journal_cursor: str | None = None,
 ) -> IncompleteShutdownCurrentQualification:
     if _current_boot_id() != boot_id:
         raise RecoveryBlocked("Recovery blocked: current boot identity changed.")
     policy = _shutdown_race_detector_policy(config_raw)
-    cursor = journal_cursor if journal_cursor is not None else _capture_kernel_cursor()
-    records = _incomplete_shutdown_current_kernel_records(boot_id)
+    cursor = _capture_kernel_cursor()
+    kernel_journal, kernel_records = _incomplete_shutdown_current_kernel_journal(
+        boot_id
+    )
+    if incident.evidence_kind == "authenticated-cleanup-refusal":
+        ready_time = _cleanup_refusal_ready_time(incident)
+        records = _cleanup_refusal_kernel_qualification(
+            kernel_records, ready_time=ready_time
+        )
+    else:
+        ready_time = None
+        records = _strict_current_kernel_records(kernel_records)
     service_journal = _incomplete_shutdown_current_service_journal(boot_id)
+    if ready_time is not None:
+        _verify_cleanup_refusal_service_interval(
+            service_journal, ready_time=ready_time
+        )
     document = {
-        "schema_version": 1,
+        "schema_version": 2,
         "category": "current-boot-incomplete-shutdown-qualification",
         "boot_id": boot_id,
         "controller_contract": SHUTDOWN_RACE_CONTROLLER_CONTRACT,
         "detector_policy": policy,
         "detector_policy_sha256": hashlib.sha256(config_raw).hexdigest(),
         "journal_cursor": cursor,
+        "authenticated_ready_time": ready_time,
+        "kernel_journal": kernel_journal,
         "excluded_kernel_records": [
             {"record": record, "transport_classification": exclusion}
             for record, exclusion in records
@@ -4221,6 +4431,45 @@ def _incomplete_shutdown_current_qualification(
         evidence_raw=(json.dumps(document, sort_keys=True) + "\n").encode(),
         journal_cursor=cursor,
     )
+
+
+def _verify_incomplete_shutdown_qualification_continuity(
+    qualification: IncompleteShutdownCurrentQualification,
+    *,
+    config_raw: bytes,
+    incident: IncompleteShutdownIncident,
+    boot_id: str,
+) -> None:
+    try:
+        evidence = json.loads(qualification.evidence_raw)
+    except json.JSONDecodeError as error:
+        raise RecoveryBlocked(
+            "Recovery blocked: current-boot qualification is unreadable."
+        ) from error
+    ready_time = (
+        _cleanup_refusal_ready_time(incident)
+        if incident.evidence_kind == "authenticated-cleanup-refusal"
+        else None
+    )
+    if (
+        not isinstance(evidence, dict)
+        or evidence.get("schema_version") != 2
+        or evidence.get("boot_id") != boot_id
+        or evidence.get("journal_cursor") != qualification.journal_cursor
+        or evidence.get("detector_policy_sha256")
+        != hashlib.sha256(config_raw).hexdigest()
+        or evidence.get("authenticated_ready_time") != ready_time
+        or not isinstance(evidence.get("kernel_journal"), str)
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: current-boot qualification changed during recovery."
+        )
+    _kernel_history_after_observation(qualification.journal_cursor)
+    if ready_time is not None:
+        _verify_cleanup_refusal_service_interval(
+            _incomplete_shutdown_current_service_journal(boot_id),
+            ready_time=ready_time,
+        )
 
 
 def _incomplete_shutdown_recovery_preflight(
@@ -4234,19 +4483,20 @@ def _incomplete_shutdown_recovery_preflight(
     config_raw = _verify_lifecycle_environment(
         incident.failure_time, check_kernel_history=False
     )
-    qualification = _incomplete_shutdown_current_qualification(
-        config_raw,
-        boot_id=current_boot_id,
-        journal_cursor=(
-            current_qualification.journal_cursor
-            if current_qualification is not None
-            else None
-        ),
-    )
-    if current_qualification is not None and qualification != current_qualification:
-        raise RecoveryBlocked(
-            "Recovery blocked: current-boot qualification changed during recovery."
+    if current_qualification is None:
+        qualification = _incomplete_shutdown_current_qualification(
+            config_raw,
+            incident=incident,
+            boot_id=current_boot_id,
         )
+    else:
+        _verify_incomplete_shutdown_qualification_continuity(
+            current_qualification,
+            config_raw=config_raw,
+            incident=incident,
+            boot_id=current_boot_id,
+        )
+        qualification = current_qualification
     _verify_four_spd_endpoints()
     if require_preference_off and _preference():
         raise RecoveryBlocked("Recovery blocked: RAM Tetris preference is not OFF.")

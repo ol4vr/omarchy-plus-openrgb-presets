@@ -644,6 +644,20 @@ reference, latch hash, or boot identity is allowlisted, and the established
 single start, post-start acceptance, bounded cleanup, and evidence-preservation
 contracts are unchanged.
 
+Version 0.4.43 narrows current-boot kernel qualification for that same legacy
+cleanup-refusal category. The complete raw boot journal is retained. Exactly
+one `-6` write and one `-6` asynchronous-resume error for each reviewed
+SPD5118 endpoint may precede a protected lifecycle record only when all eight
+fall between low-level resume completion and the corresponding completed
+suspend exit. The protected record must carry the canonical independent
+lifecycle health-validation reason, which authenticates SDK ownership, seven
+controllers, four SPD5118 endpoints, and Effects before readiness was
+published. Any protected-transport error, suspend/resume transition, SDK or
+ownership failure after that boundary remains blocking. The second preflight
+and post-start acceptance both reject relevant kernel history after the bound
+journal cursor. Other lifecycle-recovery categories retain their existing
+strict kernel policy; no incident, latch, or boot identity is allowlisted.
+
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
 The experimental orange, blue, and red Sunrise gradients are therefore stored

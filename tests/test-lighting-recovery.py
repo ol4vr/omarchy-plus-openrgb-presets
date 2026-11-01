@@ -405,6 +405,61 @@ class LightingRecoveryTests(unittest.TestCase):
         ) + "\n"
         return failure_raw, boundary_raw, journal, ""
 
+    def classified_cleanup_refusal_fixture(
+        self, *, boundary_time: float = 1_800_000_000.0
+    ) -> recovery.IncompleteShutdownIncident:
+        self.load_cleanup_refusal_fixture(boundary_time=boundary_time)
+        bundle = subprocess.CompletedProcess(
+            [],
+            0,
+            f"{recovery.LEGACY_CLEANUP_REFUSAL_REVISION} HEAD\n",
+            "",
+        )
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery, "_current_boot_id", return_value="current-boot"
+            ),
+            mock.patch.object(recovery, "_process_start", return_value=None),
+            mock.patch.object(recovery.subprocess, "run", return_value=bundle),
+        ):
+            return recovery._classify_incomplete_shutdown_incident()
+
+    def completed_resume_kernel_records(
+        self,
+        *,
+        boot_id: str,
+        ready_time: float,
+        extra: tuple[tuple[str, float], ...] = (),
+    ) -> tuple[str, tuple[dict[str, object], ...]]:
+        messages: list[tuple[str, float]] = [
+            ("PM: suspend entry (deep)", ready_time - 20),
+            ("ACPI: PM: Low-level resume complete", ready_time - 13),
+        ]
+        for index, endpoint in enumerate(recovery.TRANSIENT_SPD_ENDPOINTS):
+            timestamp = ready_time - 12 + index / 100
+            messages.extend(
+                (
+                    (f"spd5118 {endpoint}: Failed to write b = 0: -6", timestamp),
+                    (
+                        f"spd5118 {endpoint}: PM: failed to resume async: error -6",
+                        timestamp + 0.0002,
+                    ),
+                )
+            )
+        messages.extend((("PM: suspend exit", ready_time - 7), *extra))
+        records = tuple(
+            {
+                "MESSAGE": message,
+                "_BOOT_ID": boot_id.replace("-", ""),
+                "__CURSOR": f"record-{index}",
+                "__REALTIME_TIMESTAMP": str(round(timestamp * 1_000_000)),
+            }
+            for index, (message, timestamp) in enumerate(messages)
+        )
+        raw = "".join(json.dumps(record, sort_keys=True) + "\n" for record in records)
+        return raw, records
+
     def generic_incomplete_binding(
         self, fixture: str = "c21"
     ) -> recovery.IncompleteShutdownRecoveryBinding:
@@ -2588,6 +2643,151 @@ class LightingRecoveryTests(unittest.TestCase):
             ):
                 recovery._incomplete_shutdown_current_kernel_records(boot_id)
 
+    def test_cleanup_refusal_qualifies_completed_resume_and_preserves_full_journal(self):
+        incident = self.classified_cleanup_refusal_fixture()
+        ready_time = recovery._cleanup_refusal_ready_time(incident)
+        kernel_raw, _records = self.completed_resume_kernel_records(
+            boot_id=incident.old_boot_id, ready_time=ready_time
+        )
+        service_journal = (
+            f"{ready_time} hugin openrgb-lifecycle[4100]: "
+            "OpenRGB lifecycle ready\n"
+        )
+        config_raw = json.dumps(
+            {
+                "Detectors": {
+                    "detectors": {
+                        recovery.DISABLED_DETECTOR: False,
+                        recovery.REQUIRED_DETECTOR: True,
+                    }
+                }
+            },
+            sort_keys=True,
+        ).encode()
+        expected_kernel = [
+            recovery.JOURNALCTL,
+            "--boot",
+            incident.old_boot_id.replace("-", ""),
+            "-k",
+            "--output=json",
+            "--no-pager",
+        ]
+        expected_service = [
+            recovery.JOURNALCTL,
+            "--boot",
+            incident.old_boot_id.replace("-", ""),
+            "--user",
+            "--unit",
+            recovery.SERVICE_NAME,
+            "--output=short-unix",
+            "--no-pager",
+        ]
+
+        def journal(command, **_kwargs):
+            if command == expected_kernel:
+                return subprocess.CompletedProcess(command, 0, kernel_raw, "")
+            if command == expected_service:
+                return subprocess.CompletedProcess(command, 0, service_journal, "")
+            self.fail(f"unexpected command: {command}")
+
+        with (
+            mock.patch.object(
+                recovery, "_current_boot_id", return_value=incident.old_boot_id
+            ),
+            mock.patch.object(
+                recovery, "_capture_kernel_cursor", return_value="kernel-cursor"
+            ),
+            mock.patch.object(recovery.subprocess, "run", side_effect=journal) as run,
+        ):
+            qualification = recovery._incomplete_shutdown_current_qualification(
+                config_raw,
+                incident=incident,
+                boot_id=incident.old_boot_id,
+            )
+        evidence = json.loads(qualification.evidence_raw)
+        self.assertEqual(evidence["kernel_journal"], kernel_raw)
+        self.assertEqual(evidence["authenticated_ready_time"], ready_time)
+        self.assertEqual(len(evidence["excluded_kernel_records"]), 8)
+        self.assertTrue(
+            all(
+                item["transport_classification"]["classification"]
+                == "completed-resume-spd5118-error"
+                for item in evidence["excluded_kernel_records"]
+            )
+        )
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list],
+            [expected_kernel, expected_service],
+        )
+        self.assertFalse(
+            any(
+                call.args[0][:3]
+                == [recovery.SYSTEMCTL, "--user", "start"]
+                for call in run.call_args_list
+            )
+        )
+
+    def test_cleanup_refusal_resume_qualification_rejects_later_events(self):
+        incident = self.classified_cleanup_refusal_fixture()
+        ready_time = recovery._cleanup_refusal_ready_time(incident)
+        cases = (
+            ("spd5118 10-0050: Failed to write b = 0: -6", ready_time + 1),
+            ("PM: suspend entry (deep)", ready_time + 1),
+            ("i2c i2c-10: transfer timed out", ready_time + 1),
+        )
+        for message, timestamp in cases:
+            _raw, records = self.completed_resume_kernel_records(
+                boot_id=incident.old_boot_id,
+                ready_time=ready_time,
+                extra=((message, timestamp),),
+            )
+            with (
+                self.subTest(message=message),
+                self.assertRaises(recovery.RecoveryBlocked),
+            ):
+                recovery._cleanup_refusal_kernel_qualification(
+                    records, ready_time=ready_time
+                )
+
+    def test_cleanup_refusal_resume_qualification_rejects_incomplete_evidence(self):
+        incident = self.classified_cleanup_refusal_fixture()
+        ready_time = recovery._cleanup_refusal_ready_time(incident)
+        _raw, records = self.completed_resume_kernel_records(
+            boot_id=incident.old_boot_id, ready_time=ready_time
+        )
+        with self.assertRaisesRegex(recovery.RecoveryBlocked, "incomplete or changed"):
+            recovery._cleanup_refusal_kernel_qualification(
+                records[:-2], ready_time=ready_time
+            )
+
+        ownership = json.loads(incident.historical_ownership_raw)
+        ownership["lifecycle_state"]["reason"] = "untrusted readiness"
+        changed = replace(
+            incident,
+            historical_ownership_raw=(
+                json.dumps(ownership, sort_keys=True).encode() + b"\n"
+            ),
+        )
+        with self.assertRaisesRegex(recovery.RecoveryBlocked, "full healthy readiness"):
+            recovery._cleanup_refusal_ready_time(changed)
+
+        wrong_boot = tuple(
+            {**record, "_BOOT_ID": "anotherboot"} for record in records
+        )
+        with mock.patch.object(
+            recovery.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(
+                [],
+                0,
+                "".join(json.dumps(record) + "\n" for record in wrong_boot),
+                "",
+            ),
+        ), self.assertRaisesRegex(recovery.RecoveryBlocked, "another boot"):
+            recovery._incomplete_shutdown_current_kernel_journal(
+                incident.old_boot_id
+            )
+
     def test_generic_preflight_propagates_current_ownership_refusal(self):
         binding = self.generic_incomplete_binding()
         with (
@@ -3122,9 +3322,8 @@ class LightingRecoveryTests(unittest.TestCase):
             ),
             mock.patch.object(
                 recovery,
-                "_incomplete_shutdown_current_qualification",
-                return_value=binding.current_qualification,
-            ),
+                "_verify_incomplete_shutdown_qualification_continuity",
+            ) as qualification_continuity,
             mock.patch.object(
                 recovery,
                 "_verify_four_spd_endpoints",
@@ -3160,6 +3359,12 @@ class LightingRecoveryTests(unittest.TestCase):
             )
         self.assertEqual(second, binding)
         spd.assert_called_once()
+        qualification_continuity.assert_called_once_with(
+            binding.current_qualification,
+            config_raw=binding.config_raw,
+            incident=binding.incident,
+            boot_id=binding.current_boot_id,
+        )
 
         ready_raw = b'{"state":"ready"}\n'
         ready = {
