@@ -4,13 +4,11 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-readonly FDFLAGS_LOADABLE="/usr/lib/bash/fdflags"
 readonly OPENRGB_BIN="/usr/bin/openrgb"
-readonly SETPRIV_BIN="/usr/bin/setpriv"
-readonly FLOCK_BIN="${FLOCK_BIN:-/usr/bin/flock}"
+readonly OPENRGB_PACKAGE="openrgb-hugin 1.0rc3-3.2"
+readonly OPENRGB_SHA256="d0d065994b7328aec2cc0ae2b06a3c9ab8f99f4693aba35bd669e2fea406e301"
 readonly SCRIPT_DIR="$(/usr/bin/readlink -f "$(/usr/bin/dirname "${BASH_SOURCE[0]}")")"
 readonly EFFECTS_SDK="${SCRIPT_DIR}/effects-sdk"
-readonly RAM_TETRIS="${RAM_TETRIS:-${SCRIPT_DIR}/ram-tetris}"
 readonly RAM_DEVICE="Corsair Dominator Platinum RGB DDR5"
 readonly GPU_DEVICE="ASUS TUF GeForce RTX 4090 Gaming OG OC"
 readonly ST100_DEVICE="Corsair ST100 RGB"
@@ -18,81 +16,16 @@ readonly MAINBOARD_DEVICE="ASUS ROG STRIX Z790-F GAMING WIFI"
 
 readonly STATE_ROOT="${XDG_STATE_HOME:-${HOME}/.local/state}/omarchy-plus/openrgb-presets"
 readonly STATE_FILE="${STATE_ROOT}/active-preset"
+readonly RAM_STATE_FILE="${STATE_ROOT}/ram-lighting-enabled"
 readonly LAST_LOG="${STATE_ROOT}/last-openrgb.log"
 readonly LOCK_FILE="${STATE_ROOT}/apply.flock"
-readonly FAILURE_FILE="${STATE_ROOT}/ram-tetris-failure.json"
-readonly RECOVERY_OUTCOME_FILE="${STATE_ROOT}/lighting-recovery-outcome.json"
-readonly USER_ID="$(/usr/bin/id -u)"
-readonly RUNTIME_ROOT="${OPENRGB_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/run/user/${USER_ID}}/omarchy-plus/openrgb-presets}"
-readonly TETRIS_LOCK_FILE="${RUNTIME_ROOT}/ram-tetris.lock"
-readonly PRESET_OWNER_FILE="${RUNTIME_ROOT}/preset-operation.state"
-readonly RECOVERY_LOCK_FILE="${RUNTIME_ROOT}/lighting-recovery.lock"
-readonly LIFECYCLE="${SCRIPT_DIR}/openrgb-lifecycle"
 readonly PROBE_TIMEOUT="2s"
+readonly COMMAND_TIMEOUT="15s"
 readonly PROBE_ATTEMPTS=15
+readonly DEFAULT_PRESET="electric-sunrise"
+readonly -a SPD_ENDPOINTS=(10-0050 10-0051 10-0052 10-0053)
 
 dry_run=false
-restore=false
-operation_identity=''
-preset_lock_held=false
-
-if ! enable -f "${FDFLAGS_LOADABLE}" fdflags; then
-  /usr/bin/printf '%s\n' \
-    "Required Bash fdflags loadable is unavailable: ${FDFLAGS_LOADABLE}" >&2
-  exit 69
-fi
-
-set_fd_cloexec() {
-  local fd="${1:-}"
-  [[ "${fd}" =~ ^[0-9]+$ ]] || return 64
-  fdflags -s +cloexec "${fd}"
-}
-
-clear_fd_cloexec() {
-  local fd="${1:-}"
-  [[ "${fd}" =~ ^[0-9]+$ ]] || return 64
-  fdflags -s -cloexec "${fd}"
-}
-
-preset_operation_cleanup() {
-  local status="${1:-1}"
-  local recorded=''
-  local release_verified=false
-  local verify_fd=''
-
-  trap - EXIT HUP INT TERM
-  if [[ "${preset_lock_held}" == true ]]; then
-    # FD 9 is close-on-exec during the operation.  The dedicated flock
-    # unlock command is the only child allowed to receive it.
-    clear_fd_cloexec 9 || true
-    "${FLOCK_BIN}" --unlock 9 || true
-    exec 9>&-
-    preset_lock_held=false
-
-    exec {verify_fd}>"${LOCK_FILE}"
-    if "${FLOCK_BIN}" --nonblock "${verify_fd}"; then
-      release_verified=true
-    fi
-    eval "exec ${verify_fd}>&-"
-  fi
-
-  # The authenticated record remains published until the lock has been
-  # released and independently reacquired.  Never remove a replacement
-  # owner's record.
-  if [[ "${release_verified}" == true && -n "${operation_identity}" \
-    && -r "${PRESET_OWNER_FILE}" ]]; then
-    recorded="$(/usr/bin/head -n 1 "${PRESET_OWNER_FILE}" 2>/dev/null || true)"
-    if [[ "${recorded}" == "${operation_identity}" ]]; then
-      /usr/bin/rm -f -- "${PRESET_OWNER_FILE}"
-    fi
-  fi
-  exit "${status}"
-}
-
-trap 'preset_operation_cleanup "$?"' EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
 
 usage() {
   /usr/bin/printf '%s\n' \
@@ -100,6 +33,9 @@ usage() {
     '       apply-preset --restore' \
     '       apply-preset --current' \
     '       apply-preset --list' \
+    '       apply-preset --ram-on' \
+    '       apply-preset --ram-off' \
+    '       apply-preset --ram-current' \
     '       apply-preset --dry-run PRESET' \
     '' \
     'Presets:' \
@@ -140,92 +76,21 @@ is_preset() {
   esac
 }
 
-is_guarded_recovery_restore() {
-  local current_pid="${PPID}"
-  local parent_pid=''
-  local argument=''
-  local latch_sha256=''
-  local depth=0
-  local lifecycle_ancestor=false
-
-  if [[ "${restore}" != true || ! -r "${RECOVERY_OUTCOME_FILE}" \
-    || ! -e "${RECOVERY_LOCK_FILE}" ]]; then
-    return 1
-  fi
-  if ! /usr/bin/grep -Fq '"outcome":"recovery-in-progress"' \
-    "${RECOVERY_OUTCOME_FILE}"; then
-    return 1
-  fi
-  latch_sha256="$(/usr/bin/sha256sum "${FAILURE_FILE}" 2>/dev/null \
-    | /usr/bin/awk '{ print $1; exit }' || true)"
-  if [[ ! "${latch_sha256}" =~ ^[0-9a-f]{64}$ ]] \
-    || ! /usr/bin/grep -Fq "\"latch_sha256\":\"${latch_sha256}\"" \
-      "${RECOVERY_OUTCOME_FILE}"; then
-    return 1
-  fi
-
-  exec 7>"${RECOVERY_LOCK_FILE}"
-  if /usr/bin/flock --nonblock 7; then
-    /usr/bin/flock --unlock 7
-    exec 7>&-
-    return 1
-  fi
-
-  while [[ "${current_pid}" =~ ^[0-9]+$ && "${current_pid}" -gt 1 \
-    && "${depth}" -lt 8 ]]; do
-    while IFS= read -r argument; do
-      if [[ "${argument}" == "${LIFECYCLE}" ]]; then
-        lifecycle_ancestor=true
-        break 2
-      fi
-    done < <(/usr/bin/tr '\0' '\n' <"/proc/${current_pid}/cmdline" 2>/dev/null || true)
-    parent_pid="$(/usr/bin/awk '/^PPid:/ { print $2; exit }' \
-      "/proc/${current_pid}/status" 2>/dev/null || true)"
-    current_pid="${parent_pid}"
-    ((depth += 1))
-  done
-  exec 7>&-
-  [[ "${lifecycle_ancestor}" == true ]]
-}
-
-static_ram_pattern() {
-  case "${1}" in
-    deep-red) /usr/bin/printf '%s' '8B0000,8B0000,8B0000,8B0000,8B0000,8B0000,8B0000,8B0000,8B0000,8B0000,8B0000,8B0000' ;;
-    deep-blue) /usr/bin/printf '%s' '000B22,000B22,000B22,000B22,000B22,000B22,000B22,000B22,000B22,000B22,000B22,000B22' ;;
-    bright-white) /usr/bin/printf '%s' 'FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF' ;;
-    animated-rainbow|spectrum-wave) /usr/bin/printf '%s' '11FF00,11FF00,8A2BE2,8A2BE2,FFD400,FFD400,FF0040,FF0040,8A2BE2,8A2BE2,11FF00,11FF00' ;;
-    neon-rain) /usr/bin/printf '%s' '5500FF,5500FF,11FF00,11FF00,00FF8C,00FF8C,FF00F6,FF00F6,FFD400,FFD400,5500FF,5500FF' ;;
-    aurora-comet) /usr/bin/printf '%s' '95FF00,95FF00,00D4FF,00D4FF,8A2BE2,8A2BE2,8A2BE2,8A2BE2,00D4FF,00D4FF,95FF00,95FF00' ;;
-    electric-sunrise) /usr/bin/printf '%s' 'FF0040,FF0040,FF0051,FF0051,3C00FF,3C00FF,0044FF,0044FF,FF0051,FF0051,FF0040,FF0040' ;;
-    matte-black-orange) /usr/bin/printf '%s' 'FF4400,FF4400,E83B00,E83B00,C92B00,C92B00,501000,501000,E83B00,E83B00,FF4400,FF4400' ;;
-    black) /usr/bin/printf '%s' '000000,000000,000000,000000,000000,000000,000000,000000,000000,000000,000000,000000' ;;
-    horde-red) /usr/bin/printf '%s' '8B0000,8B0000,680000,680000,4A0000,4A0000,180000,180000,680000,680000,8B0000,8B0000' ;;
-    alliance-blue) /usr/bin/printf '%s' '0033AA,0033AA,002788,002788,001A66,001A66,000B22,000B22,002788,002788,0033AA,0033AA' ;;
-    *) return 64 ;;
-  esac
-}
-
 preset_label() {
   case "${1}" in
-    deep-red) /usr/bin/printf '%s' 'Static Red' ;;
-    bright-white) /usr/bin/printf '%s' 'Static White' ;;
-    deep-blue) /usr/bin/printf '%s' 'Static Blue' ;;
+    deep-red) /usr/bin/printf '%s' 'Deep Red' ;;
+    bright-white) /usr/bin/printf '%s' 'Bright White' ;;
+    deep-blue) /usr/bin/printf '%s' 'Deep Blue' ;;
     animated-rainbow) /usr/bin/printf '%s' 'Animated Rainbow' ;;
     neon-rain) /usr/bin/printf '%s' 'Neon Rain' ;;
     aurora-comet) /usr/bin/printf '%s' 'Aurora Comet' ;;
     spectrum-wave) /usr/bin/printf '%s' 'Spectrum Wave' ;;
     matte-black-orange) /usr/bin/printf '%s' 'Matte Black Orange' ;;
     electric-sunrise) /usr/bin/printf '%s' 'Electric Sunrise' ;;
-    horde-red) /usr/bin/printf '%s' 'For the Horde!' ;;
-    alliance-blue) /usr/bin/printf '%s' 'For the Alliance!' ;;
+    horde-red) /usr/bin/printf '%s' 'Horde Red' ;;
+    alliance-blue) /usr/bin/printf '%s' 'Alliance Blue' ;;
     black) /usr/bin/printf '%s' 'Black (Turn Off RGB)' ;;
   esac
-}
-
-print_effects_command() {
-  /usr/bin/printf 'DRY RUN:'
-  /usr/bin/printf ' %q' "${EFFECTS_SDK}" "$@"
-  /usr/bin/printf '\n'
 }
 
 normalize_preset() {
@@ -235,160 +100,219 @@ normalize_preset() {
   esac
 }
 
+current_preset() {
+  local preset="${DEFAULT_PRESET}"
+  if [[ -r "${STATE_FILE}" ]]; then
+    preset="$(normalize_preset "$(/usr/bin/head -n 1 "${STATE_FILE}")")"
+  fi
+  if ! is_preset "${preset}"; then
+    preset="${DEFAULT_PRESET}"
+  fi
+  /usr/bin/printf '%s' "${preset}"
+}
+
+ram_lighting_enabled() {
+  local value='on'
+  if [[ -r "${RAM_STATE_FILE}" ]]; then
+    value="$(/usr/bin/head -n 1 "${RAM_STATE_FILE}")"
+  fi
+  [[ "${value}" == 'on' ]]
+}
+
+ram_color_for_preset() {
+  case "${1}" in
+    deep-red) /usr/bin/printf '%s' '8B0000,8B0000,8B0000,8B0000,8B0000,8B0000,8B0000,8B0000,8B0000,8B0000,8B0000,8B0000' ;;
+    bright-white) /usr/bin/printf '%s' 'FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF' ;;
+    deep-blue) /usr/bin/printf '%s' '000B22,000B22,000B22,000B22,000B22,000B22,000B22,000B22,000B22,000B22,000B22,000B22' ;;
+    animated-rainbow|spectrum-wave) /usr/bin/printf '%s' '11FF00,11FF00,8A2BE2,8A2BE2,FFD400,FFD400,FF0040,FF0040,8A2BE2,8A2BE2,11FF00,11FF00' ;;
+    neon-rain) /usr/bin/printf '%s' '5500FF,5500FF,11FF00,11FF00,00FF8C,00FF8C,FF00F6,FF00F6,FFD400,FFD400,5500FF,5500FF' ;;
+    aurora-comet) /usr/bin/printf '%s' '95FF00,95FF00,00D4FF,00D4FF,8A2BE2,8A2BE2,8A2BE2,8A2BE2,00D4FF,00D4FF,95FF00,95FF00' ;;
+    electric-sunrise) /usr/bin/printf '%s' 'FF0040,FF0040,FF0051,FF0051,3C00FF,3C00FF,0044FF,0044FF,FF0051,FF0051,FF0040,FF0040' ;;
+    matte-black-orange) /usr/bin/printf '%s' 'FF4400,FF4400,E83B00,E83B00,C92B00,C92B00,501000,501000,E83B00,E83B00,FF4400,FF4400' ;;
+    horde-red) /usr/bin/printf '%s' '8B0000,8B0000,680000,680000,4A0000,4A0000,180000,180000,680000,680000,8B0000,8B0000' ;;
+    alliance-blue) /usr/bin/printf '%s' '0033AA,0033AA,002788,002788,001A66,001A66,000B22,000B22,002788,002788,0033AA,0033AA' ;;
+    black) /usr/bin/printf '%s' '000000,000000,000000,000000,000000,000000,000000,000000,000000,000000,000000,000000' ;;
+  esac
+}
+
 print_command() {
   /usr/bin/printf 'DRY RUN:'
-  /usr/bin/printf ' %q' "${OPENRGB_BIN}" --nodetect "$@"
+  /usr/bin/printf ' %q' "$@"
   /usr/bin/printf '\n'
 }
 
-wait_for_server() {
+run_child() (
+  exec 9>&-
+  exec "$@"
+)
+
+expected_server_command() {
+  /usr/bin/printf '%s' \
+    "${OPENRGB_BIN} --noautoconnect --startminimized --server --server-host 127.0.0.1 --server-port 6742"
+}
+
+listener_owner_pid() {
+  local listener=''
+  local pid=''
+  listener="$(/usr/bin/ss -H -ltnp 'sport = :6742' 2>/dev/null \
+    | /usr/bin/awk '$4 == "127.0.0.1:6742" && index($0, "users:((\"openrgb\",pid=") {print}')"
+  [[ -n "${listener}" && "${listener}" != *$'\n'* ]] || return 1
+  pid="$(/usr/bin/printf '%s\n' "${listener}" \
+    | /usr/bin/sed -nE 's/.*pid=([0-9]+).*/\1/p')"
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  /usr/bin/printf '%s' "${pid}"
+}
+
+validate_sdk_owner() {
+  local pid=''
+  local command=''
+  local executable=''
+  local uid=''
+  pid="$(listener_owner_pid)" || return 1
+  [[ -r "/proc/${pid}/cmdline" && -r "/proc/${pid}/status" ]] || return 1
+  command="$(/usr/bin/tr '\0' ' ' <"/proc/${pid}/cmdline" | /usr/bin/sed 's/ $//')"
+  executable="$(/usr/bin/readlink -f "/proc/${pid}/exe")"
+  uid="$(/usr/bin/awk '$1 == "Uid:" {print $2}' "/proc/${pid}/status")"
+  [[ "${command}" == "$(expected_server_command)" \
+    && "${executable}" == "${OPENRGB_BIN}" \
+    && "${uid}" == "$(/usr/bin/id -u)" ]] || return 1
+  [[ "$(listener_owner_pid)" == "${pid}" ]]
+}
+
+validate_package() {
+  local installed=''
+  local digest=''
+  installed="$(/usr/bin/pacman -Q openrgb-hugin 2>/dev/null || true)"
+  digest="$(/usr/bin/sha256sum "${OPENRGB_BIN}" 2>/dev/null | /usr/bin/awk '{print $1}')"
+  [[ "${installed}" == "${OPENRGB_PACKAGE}" && "${digest}" == "${OPENRGB_SHA256}" ]]
+}
+
+validate_spd() {
+  local endpoint
+  local -a matches=()
+  local value=''
+  for endpoint in "${SPD_ENDPOINTS[@]}"; do
+    matches=(/sys/bus/i2c/devices/"${endpoint}"/hwmon/hwmon*/temp1_input)
+    [[ "${#matches[@]}" -eq 1 && -r "${matches[0]}" ]] || return 1
+    value="$(/usr/bin/head -n 1 "${matches[0]}")"
+    [[ "${value}" =~ ^[0-9]+$ && "${value}" -ge 10000 && "${value}" -le 125000 ]] \
+      || return 1
+  done
+}
+
+controller_inventory() {
+  run_child /usr/bin/timeout --signal=TERM --kill-after=1s "${PROBE_TIMEOUT}" \
+    "${OPENRGB_BIN}" --nodetect --list-devices 2>&1
+}
+
+validate_controllers() {
+  local inventory="${1}"
+  [[ "$(/usr/bin/printf '%s\n' "${inventory}" | /usr/bin/grep -Ec '^[0-9]+: ')" -eq 7 \
+    && "$(/usr/bin/printf '%s\n' "${inventory}" | /usr/bin/grep -Ec '^[0-9]+: Corsair Dominator Platinum RGB DDR5$')" -eq 4 \
+    && "$(/usr/bin/printf '%s\n' "${inventory}" | /usr/bin/grep -Ec '^[0-9]+: ASUS TUF GeForce RTX 4090 Gaming OG OC$')" -eq 1 \
+    && "$(/usr/bin/printf '%s\n' "${inventory}" | /usr/bin/grep -Ec '^[0-9]+: Corsair ST100 RGB$')" -eq 1 \
+    && "$(/usr/bin/printf '%s\n' "${inventory}" | /usr/bin/grep -Ec '^[0-9]+: ASUS ROG STRIX Z790-F GAMING WIFI$')" -eq 1 ]]
+}
+
+validate_effects() {
+  run_child /usr/bin/timeout --signal=TERM --kill-after=1s "${PROBE_TIMEOUT}" \
+    "${EFFECTS_SDK}" ready >/dev/null 2>&1
+}
+
+validate_hardware() {
   local inventory=''
-  local controller_count=0
-  local ram_count=0
-  local gpu_count=0
-  local st100_count=0
-  local mainboard_count=0
   local attempt
-
+  validate_package || {
+    /usr/bin/printf '%s\n' 'OpenRGB package or executable identity is not accepted.' >&2
+    return 1
+  }
+  validate_spd || {
+    /usr/bin/printf '%s\n' 'Four healthy SPD5118 temperature endpoints are required.' >&2
+    return 1
+  }
   for ((attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++)); do
-    inventory="$(/usr/bin/timeout --signal=TERM --kill-after=1s "${PROBE_TIMEOUT}" \
-      "${OPENRGB_BIN}" --nodetect --list-devices 2>&1 || true)"
-    controller_count="$(/usr/bin/printf '%s\n' "${inventory}" | /usr/bin/grep -Ec '^[0-9]+: ' || true)"
-    ram_count="$(/usr/bin/printf '%s\n' "${inventory}" | /usr/bin/grep -Ec '^[0-9]+: Corsair Dominator Platinum RGB DDR5$' || true)"
-    gpu_count="$(/usr/bin/printf '%s\n' "${inventory}" | /usr/bin/grep -Ec '^[0-9]+: ASUS TUF GeForce RTX 4090 Gaming OG OC$' || true)"
-    st100_count="$(/usr/bin/printf '%s\n' "${inventory}" | /usr/bin/grep -Ec '^[0-9]+: Corsair ST100 RGB$' || true)"
-    mainboard_count="$(/usr/bin/printf '%s\n' "${inventory}" | /usr/bin/grep -Ec '^[0-9]+: ASUS ROG STRIX Z790-F GAMING WIFI$' || true)"
-
-    if [[ "${controller_count}" -eq 7 && "${ram_count}" -eq 4 \
-      && "${gpu_count}" -eq 1 && "${st100_count}" -eq 1 \
-      && "${mainboard_count}" -eq 1 ]]; then
+    if validate_sdk_owner \
+      && inventory="$(controller_inventory)" \
+      && validate_controllers "${inventory}" \
+      && validate_effects; then
       return 0
     fi
-
     /usr/bin/sleep 1
   done
-
   /usr/bin/printf '%s\n' "${inventory}" >"${LAST_LOG}"
-  /usr/bin/printf '%s\n' "OpenRGB SDK server did not expose the seven accepted Hugin controllers. Report: ${LAST_LOG}" >&2
+  /usr/bin/printf '%s\n' \
+    "OpenRGB SDK ownership, seven-controller inventory, or Effects readiness failed. Report: ${LAST_LOG}" >&2
   return 1
 }
 
-wait_for_effects() {
-  local output=''
-  local attempt
-
-  for ((attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++)); do
-    if output="$(/usr/bin/timeout --signal=TERM --kill-after=1s "${PROBE_TIMEOUT}" \
-      "${EFFECTS_SDK}" ready 2>&1)"; then
-      return 0
-    fi
-    /usr/bin/sleep 1
-  done
-
-  /usr/bin/printf '%s\n' "${output}" >"${LAST_LOG}"
-  /usr/bin/printf '%s\n' "OpenRGB Effects Plugin did not become ready. Report: ${LAST_LOG}" >&2
-  return 1
-}
-
-guarded_hardware_mutation() {
-  local command=("$@")
-
-  if ! "${SETPRIV_BIN}" --pdeathsig TERM "${RAM_TETRIS}" guarded-mutation \
-    -- "${command[@]}" \
-    >"${LAST_LOG}" 2>&1 9>&- 8>&-; then
-    /usr/bin/printf '%s\n' \
-      "OpenRGB hardware mutation was refused or failed. Report: ${LAST_LOG}" >&2
-    /usr/bin/tail -n 20 "${LAST_LOG}" >&2
+run_openrgb() {
+  if [[ "${dry_run}" == true ]]; then
+    print_command "${OPENRGB_BIN}" --nodetect "$@"
+    return 0
+  fi
+  validate_sdk_owner || {
+    /usr/bin/printf '%s\n' 'OpenRGB SDK ownership changed before mutation.' >&2
+    return 1
+  }
+  validate_spd || {
+    /usr/bin/printf '%s\n' 'SPD5118 health changed before mutation.' >&2
+    return 1
+  }
+  if ! run_child /usr/bin/timeout --signal=TERM --kill-after=1s "${COMMAND_TIMEOUT}" \
+    "${OPENRGB_BIN}" --nodetect "$@" >"${LAST_LOG}" 2>&1; then
+    /usr/bin/printf '%s\n' "OpenRGB failed. Report: ${LAST_LOG}" >&2
     return 1
   fi
 }
 
-stop_effects() {
+run_effects() {
   if [[ "${dry_run}" == true ]]; then
-    print_effects_command stop-all
+    print_command "${EFFECTS_SDK}" "$@"
     return 0
   fi
-
-  wait_for_server || return 1
-  wait_for_effects || return 1
-  if ! guarded_hardware_mutation "${EFFECTS_SDK}" stop-all; then
-    /usr/bin/printf '%s\n' "OpenRGB Effects Plugin failed to stop active effects. Report: ${LAST_LOG}" >&2
-    /usr/bin/tail -n 20 "${LAST_LOG}" >&2
+  validate_sdk_owner || {
+    /usr/bin/printf '%s\n' 'OpenRGB SDK ownership changed before Effects mutation.' >&2
     return 1
-  fi
-}
-
-apply_effects_profile() {
-  local profile="${1}"
-  local expected_effect="${2}"
-
-  if [[ "${dry_run}" == true ]]; then
-    print_effects_command load-profile "${profile}" "${expected_effect}"
-    return 0
-  fi
-
-  wait_for_server || return 1
-  wait_for_effects || return 1
-  if ! guarded_hardware_mutation \
-    "${EFFECTS_SDK}" load-profile "${profile}" "${expected_effect}"; then
-    /usr/bin/printf '%s\n' "OpenRGB Effects profile failed. Report: ${LAST_LOG}" >&2
-    /usr/bin/tail -n 20 "${LAST_LOG}" >&2
+  }
+  validate_spd || {
+    /usr/bin/printf '%s\n' 'SPD5118 health changed before Effects mutation.' >&2
+    return 1
+  }
+  if ! run_child /usr/bin/timeout --signal=TERM --kill-after=1s "${COMMAND_TIMEOUT}" \
+    "${EFFECTS_SDK}" "$@" >"${LAST_LOG}" 2>&1; then
+    /usr/bin/printf '%s\n' "OpenRGB Effects operation failed. Report: ${LAST_LOG}" >&2
     return 1
   fi
 }
 
 apply_ram_static() {
   local color="${1}"
-
-  run_openrgb \
-    --device "${RAM_DEVICE}" --mode direct --color "${color}"
+  run_openrgb --device "${RAM_DEVICE}" --mode direct --color "${color}"
 }
 
-apply_effects_with_static_ram() {
-  local profile="${1}"
-  local expected_effect="${2}"
-  local ram_color="${3}"
-
-  stop_effects
-  apply_effects_profile "${profile}" "${expected_effect}"
-  apply_ram_static "${ram_color}"
-}
-
-run_openrgb() {
-  if [[ "${dry_run}" == true ]]; then
-    print_command "$@"
-    return 0
-  fi
-
-  wait_for_server || return 1
-
-  if ! guarded_hardware_mutation "${OPENRGB_BIN}" --nodetect "$@"; then
-    /usr/bin/printf '%s\n' "OpenRGB failed. Report: ${LAST_LOG}" >&2
-    /usr/bin/tail -n 20 "${LAST_LOG}" >&2
-    return 1
+effective_ram_color() {
+  local preset="${1}"
+  if ram_lighting_enabled; then
+    ram_color_for_preset "${preset}"
+  else
+    /usr/bin/printf '%s' '000000'
   fi
 }
 
-apply_static() {
+apply_static_non_ram() {
   local main_color="${1}"
   local st100_base="${2}"
   local st100_logo="${3}"
   local mainboard_colors="${4}"
-  local ram_colors="${5}"
-
   run_openrgb \
-    --device "${RAM_DEVICE}" --mode direct --color "${ram_colors}" \
     --device "${GPU_DEVICE}" --mode static --color "${main_color}" \
     --device "${ST100_DEVICE}" --zone 0 --mode direct --color "${st100_base}" \
     --device "${ST100_DEVICE}" --zone 1 --mode direct --color "${st100_logo}" \
     --device "${MAINBOARD_DEVICE}" --mode direct --color "${mainboard_colors}"
 }
 
-apply_rainbow() {
-  local ram_color="${1}"
-
+apply_rainbow_non_ram() {
   run_openrgb \
-    --device "${RAM_DEVICE}" --mode direct --color "${ram_color}" \
     --device "${GPU_DEVICE}" --mode rainbow --speed 50 \
     --device "${ST100_DEVICE}" --zone 0 --mode direct \
       --color FF0000,FF7F00,FFFF00,00FF00,00FFFF,0000FF,8B00FF,FF00FF \
@@ -398,188 +322,100 @@ apply_rainbow() {
 
 apply_preset() {
   local preset="${1}"
-  local ram_colors
-  ram_colors="$(static_ram_pattern "${preset}")"
-
+  local write_ram="${2:-true}"
+  local persist_preset="${3:-true}"
+  local ram_color=''
+  ram_color="$(effective_ram_color "${preset}")"
   case "${preset}" in
-    deep-red)
-      stop_effects
-      apply_static 8B0000 A00000 A00000 8B0000 "${ram_colors}"
-      ;;
-    bright-white)
-      stop_effects
-      apply_static FFFFFF FFFFFF 2020FF FFFFFF "${ram_colors}"
-      ;;
-    deep-blue)
-      stop_effects
-      apply_static 000B22 000B22 000B22 000B22 "${ram_colors}"
-      ;;
-    animated-rainbow)
-      stop_effects
-      apply_rainbow "${ram_colors}"
-      ;;
-    neon-rain)
-      apply_effects_with_static_ram hugin-rain 'Rain' "${ram_colors}"
-      ;;
-    aurora-comet)
-      apply_effects_with_static_ram hugin-rainbow-comet 'Comet' "${ram_colors}"
-      ;;
-    spectrum-wave)
-      apply_effects_with_static_ram hugin-rainbow-wave 'Rainbow Wave' "${ram_colors}"
-      ;;
-    matte-black-orange)
-      apply_effects_with_static_ram hugin-sunrise-orange-black 'Sunrise' "${ram_colors}"
-      ;;
-    electric-sunrise)
-      apply_effects_with_static_ram hugin-sunrise-blue-red 'Sunrise' "${ram_colors}"
-      ;;
-    horde-red)
-      apply_effects_with_static_ram hugin-sunrise-red-black 'Sunrise' "${ram_colors}"
-      ;;
-    alliance-blue)
-      apply_effects_with_static_ram hugin-sunrise-blue-black 'Sunrise' "${ram_colors}"
-      ;;
-    black)
-      stop_effects
-      apply_static 000000 000000 000000 000000 "${ram_colors}"
-      ;;
+    deep-red) run_effects stop-all; apply_static_non_ram 8B0000 A00000 A00000 8B0000 ;;
+    bright-white) run_effects stop-all; apply_static_non_ram FFFFFF FFFFFF 2020FF FFFFFF ;;
+    deep-blue) run_effects stop-all; apply_static_non_ram 000B22 000B22 000B22 000B22 ;;
+    animated-rainbow) run_effects stop-all; apply_rainbow_non_ram ;;
+    neon-rain) run_effects stop-all; run_effects load-profile hugin-rain 'Rain' ;;
+    aurora-comet) run_effects stop-all; run_effects load-profile hugin-rainbow-comet 'Comet' ;;
+    spectrum-wave) run_effects stop-all; run_effects load-profile hugin-rainbow-wave 'Rainbow Wave' ;;
+    matte-black-orange) run_effects stop-all; run_effects load-profile hugin-sunrise-orange-black 'Sunrise' ;;
+    electric-sunrise) run_effects stop-all; run_effects load-profile hugin-sunrise-blue-red 'Sunrise' ;;
+    horde-red) run_effects stop-all; run_effects load-profile hugin-sunrise-red-black 'Sunrise' ;;
+    alliance-blue) run_effects stop-all; run_effects load-profile hugin-sunrise-blue-black 'Sunrise' ;;
+    black) run_effects stop-all; apply_static_non_ram 000000 000000 000000 000000 ;;
   esac
-
-  if [[ "${dry_run}" == false ]]; then
+  if [[ "${write_ram}" == true ]]; then
+    apply_ram_static "${ram_color}"
+  fi
+  if [[ "${dry_run}" == false && "${persist_preset}" == true ]]; then
     /usr/bin/printf '%s\n' "${preset}" >"${STATE_FILE}"
   fi
-
   /usr/bin/printf 'Preset: %s\nApplied: %s\n' "${preset}" "$(preset_label "${preset}")"
 }
 
-main() {
-  umask 077
-
-  if [[ "${#}" -eq 0 ]]; then
-    usage >&2
-    return 64
+set_ram_lighting() {
+  local state="${1}"
+  local color='000000'
+  if [[ "${state}" == 'on' ]]; then
+    color="$(ram_color_for_preset "$(current_preset)")"
   fi
+  apply_ram_static "${color}"
+  if [[ "${dry_run}" == false ]]; then
+    /usr/bin/printf '%s\n' "${state}" >"${RAM_STATE_FILE}"
+  fi
+  /usr/bin/printf 'RAM lighting: %s\n' "${state}"
+}
 
+acquire_mutation_lock() {
+  exec 9>"${LOCK_FILE}"
+  if ! /usr/bin/flock --nonblock 9; then
+    /usr/bin/printf '%s\n' 'Another OpenRGB operation is already running.' >&2
+    return 75
+  fi
+}
+
+main() {
+  local action='preset'
+  local preset=''
+  local write_ram=true
+  local persist_preset=true
+  umask 077
+  [[ "${#}" -gt 0 ]] || { usage >&2; return 64; }
   case "${1}" in
-    --help|-h)
-      usage
-      return 0
-      ;;
-    --list)
-      list_presets
-      return 0
-      ;;
-    --current)
-      if [[ -r "${STATE_FILE}" ]]; then
-        normalize_preset "$(/usr/bin/head -n 1 "${STATE_FILE}")"
-        /usr/bin/printf '\n'
-      else
-        /usr/bin/printf '%s\n' 'bright-white'
-      fi
+    --help|-h) usage; return 0 ;;
+    --list) list_presets; return 0 ;;
+    --current) /usr/bin/printf '%s\n' "$(current_preset)"; return 0 ;;
+    --ram-current)
+      if ram_lighting_enabled; then /usr/bin/printf '%s\n' 'on'; else /usr/bin/printf '%s\n' 'off'; fi
       return 0
       ;;
     --dry-run)
-      if [[ "${#}" -ne 2 ]] || ! is_preset "${2}"; then
-        usage >&2
-        return 64
-      fi
+      [[ "${#}" -eq 2 ]] || { usage >&2; return 64; }
       dry_run=true
-      apply_preset "${2}"
-      return 0
+      case "${2}" in
+        --ram-on) action='ram-on' ;;
+        --ram-off) action='ram-off' ;;
+        *) is_preset "${2}" || { usage >&2; return 64; }; preset="${2}" ;;
+      esac
       ;;
-    --restore)
-      restore=true
-      /usr/bin/mkdir -p "${STATE_ROOT}"
-      if [[ -r "${STATE_FILE}" ]]; then
-        preset="$(normalize_preset "$(/usr/bin/head -n 1 "${STATE_FILE}")")"
-      else
-        preset='bright-white'
-      fi
+    --restore) [[ "${#}" -eq 1 ]] || { usage >&2; return 64; }; preset="$(current_preset)" ;;
+    --restore-non-ram)
+      [[ "${#}" -eq 1 ]] || { usage >&2; return 64; }
+      preset="$(current_preset)"
+      write_ram=false
+      persist_preset=false
       ;;
+    --ram-on) [[ "${#}" -eq 1 ]] || { usage >&2; return 64; }; action='ram-on' ;;
+    --ram-off) [[ "${#}" -eq 1 ]] || { usage >&2; return 64; }; action='ram-off' ;;
     *)
-      if [[ "${#}" -ne 1 ]]; then
-        usage >&2
-        return 64
-      fi
+      [[ "${#}" -eq 1 ]] && is_preset "${1}" || { usage >&2; return 64; }
       preset="${1}"
       ;;
   esac
-
-  if ! is_preset "${preset}"; then
-    /usr/bin/printf 'Unknown preset: %s\n' "${preset}" >&2
-    return 64
-  fi
-
-  if [[ -e "${FAILURE_FILE}" || -L "${FAILURE_FILE}" ]]; then
-    # The only latch exception is the lifecycle child used by the single guarded
-    # recovery start. It must share the exclusive recovery owner and outcome.
-    if ! is_guarded_recovery_restore; then
-      /usr/bin/printf '%s\n' \
-        'Preset application blocked: an active lighting failure requires recovery review.' >&2
-      return 75
-    fi
-  fi
-
-  if [[ ! -x "${OPENRGB_BIN}" ]]; then
-    /usr/bin/printf 'OpenRGB is unavailable: %s\n' "${OPENRGB_BIN}" >&2
-    return 69
-  fi
-
-  if [[ ! -x "${SETPRIV_BIN}" ]]; then
-    /usr/bin/printf 'Process-death guard is unavailable: %s\n' "${SETPRIV_BIN}" >&2
-    return 69
-  fi
-
-  if [[ ! -x "${EFFECTS_SDK}" ]]; then
-    /usr/bin/printf 'Effects SDK helper is unavailable: %s\n' "${EFFECTS_SDK}" >&2
-    return 69
-  fi
-
-  if [[ ! -x "${RAM_TETRIS}" ]]; then
-    /usr/bin/printf 'RAM Tetris helper is unavailable: %s\n' "${RAM_TETRIS}" >&2
-    return 69
-  fi
-
   /usr/bin/mkdir -p "${STATE_ROOT}"
-
-  exec 9>"${LOCK_FILE}"
-  if ! "${FLOCK_BIN}" --nonblock 9; then
-    /usr/bin/printf '%s\n' 'Another OpenRGB preset operation is already running.' >&2
-    return 75
-  fi
-  preset_lock_held=true
-  set_fd_cloexec 9
-
-  /usr/bin/mkdir -p "${RUNTIME_ROOT}"
-  operation_pid="$$"
-  operation_start="$(/usr/bin/awk '{print $22}' "/proc/$$/stat")"
-  operation_identity="${operation_pid} ${operation_start}"
-  /usr/bin/printf '%s\n' "${operation_identity}" \
-    >"${PRESET_OWNER_FILE}.$$"
-  /usr/bin/mv -f -- "${PRESET_OWNER_FILE}.$$" "${PRESET_OWNER_FILE}"
-  "${RAM_TETRIS}" request-stop preset-change \
-    --operation-pid "${operation_pid}" \
-    --operation-start "${operation_start}"
-  exec 8>"${TETRIS_LOCK_FILE}"
-  if ! "${FLOCK_BIN}" --wait 10 8; then
-    "${RAM_TETRIS}" fail 'RAM Tetris did not quiesce before preset application'
-    /usr/bin/printf '%s\n' 'RAM Tetris did not stop safely; preset was not changed.' >&2
-    return 75
-  fi
-
-  # The writer singleton and whole-preset lock now close writer admission.  The
-  # local marker can be removed before mutation so the same final gate used by
-  # Tetris and shutdown remains authoritative.
-  if ! "${RAM_TETRIS}" clear-local-stop \
-    --operation-pid "${operation_pid}" \
-    --operation-start "${operation_start}"; then
-    /usr/bin/printf '%s\n' \
-      'Preset application refused: a newer stop intent took precedence.' >&2
-    return 75
-  fi
-  trap '"${RAM_TETRIS}" fail '\''Preset application failed while RAM Tetris was quiesced'\''' ERR
-  apply_preset "${preset}"
-  trap - ERR
+  acquire_mutation_lock
+  if [[ "${dry_run}" == false ]]; then validate_hardware; fi
+  case "${action}" in
+    ram-on) set_ram_lighting on ;;
+    ram-off) set_ram_lighting off ;;
+    preset) apply_preset "${preset}" "${write_ram}" "${persist_preset}" ;;
+  esac
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

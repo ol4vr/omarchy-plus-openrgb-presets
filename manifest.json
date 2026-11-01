@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.ol4vr.openrgb-presets",
   "name": "OpenRGB Presets",
-  "version": "0.4.45",
+  "version": "0.5.0",
   "author": "Olav Rorvik",
   "license": "MIT",
-  "description": "Choose reviewed OpenRGB presets and optional RAM Tetris lighting for Hugin from the Omarchy bar.",
+  "description": "Choose reviewed OpenRGB presets with static-only DDR5 lighting on Hugin.",
   "kinds": [
     "bar-widget"
   ],

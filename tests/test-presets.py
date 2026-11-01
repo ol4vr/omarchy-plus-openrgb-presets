@@ -1,17 +1,20 @@
-"""Focused source-only validation for OpenRGB Presets 0.4.26."""
+#!/usr/bin/env python3
+"""Focused source-only validation for OpenRGB Presets Static Edition."""
 
 from __future__ import annotations
 
 import copy
+import fcntl
 import hashlib
 import json
 import os
+from pathlib import Path
 import re
 import shlex
 import subprocess
 import tempfile
 import unittest
-from pathlib import Path
+
 
 ROOT = Path(__file__).resolve().parents[1]
 APPLY = ROOT / "apply-preset"
@@ -49,66 +52,25 @@ NEW_PROFILES = {
     },
 }
 PANEL_INDICATORS = {
-    "deep-blue": (
-        "Static Blue",
-        "STATIC",
-        "STATIC COLOR",
-        "DEEP BLUE",
-        "#7AA2F7",
-        ["#000B22"],
-    ),
+    "deep-blue": ("STATIC", "DEEP BLUE", "#000B22", ["#000B22"]),
     "matte-black-orange": (
-        "Matte Black Orange",
         "EFFECTS",
-        "SUNRISE",
         "ORANGE · RED · BURNT",
         "#FF4400",
         ["#FF4400", "#E83B00", "#C92B00"],
     ),
     "horde-red": (
-        "For the Horde!",
         "EFFECTS",
-        "SUNRISE",
         "RED · DEEP · DARK",
-        "#F7768E",
+        "#8B0000",
         ["#8B0000", "#680000", "#4A0000"],
     ),
     "alliance-blue": (
-        "For the Alliance!",
         "EFFECTS",
-        "SUNRISE",
         "BLUE · MID · DARK",
-        "#7AA2F7",
+        "#0033AA",
         ["#0033AA", "#002788", "#001A66"],
     ),
-}
-DISPLAY_LABELS = {
-    "deep-red": "Static Red",
-    "deep-blue": "Static Blue",
-    "bright-white": "Static White",
-    "animated-rainbow": "Animated Rainbow",
-    "neon-rain": "Neon Rain",
-    "aurora-comet": "Aurora Comet",
-    "spectrum-wave": "Spectrum Wave",
-    "electric-sunrise": "Electric Sunrise",
-    "matte-black-orange": "Matte Black Orange",
-    "black": "Black (Turn Off RGB)",
-    "horde-red": "For the Horde!",
-    "alliance-blue": "For the Alliance!",
-}
-DISPLAY_MODES = {
-    "deep-red": "STATIC COLOR",
-    "deep-blue": "STATIC COLOR",
-    "bright-white": "STATIC COLOR",
-    "animated-rainbow": "RAINBOW",
-    "neon-rain": "RAIN",
-    "aurora-comet": "COMET",
-    "spectrum-wave": "RAINBOW WAVE",
-    "electric-sunrise": "SUNRISE",
-    "matte-black-orange": "SUNRISE",
-    "black": "LIGHTS OFF",
-    "horde-red": "SUNRISE",
-    "alliance-blue": "SUNRISE",
 }
 VISIBLE_ORDER = [
     "deep-red",
@@ -150,75 +112,19 @@ NON_RAM_ZONES = [
     (MAINBOARD_DEVICE, 1),
     (MAINBOARD_DEVICE, 2),
 ]
-DDR5_STATIC_PAIR_PATTERNS = {
-    "deep-red": ("8B0000",) * 6,
-    "deep-blue": ("000B22",) * 6,
-    "bright-white": ("FFFFFF",) * 6,
-    "animated-rainbow": (
-        "11FF00",
-        "8A2BE2",
-        "FFD400",
-        "FF0040",
-        "8A2BE2",
-        "11FF00",
-    ),
-    "neon-rain": (
-        "5500FF",
-        "11FF00",
-        "00FF8C",
-        "FF00F6",
-        "FFD400",
-        "5500FF",
-    ),
-    "aurora-comet": (
-        "95FF00",
-        "00D4FF",
-        "8A2BE2",
-        "8A2BE2",
-        "00D4FF",
-        "95FF00",
-    ),
-    "spectrum-wave": (
-        "11FF00",
-        "8A2BE2",
-        "FFD400",
-        "FF0040",
-        "8A2BE2",
-        "11FF00",
-    ),
-    "electric-sunrise": (
-        "FF0040",
-        "FF0051",
-        "3C00FF",
-        "0044FF",
-        "FF0051",
-        "FF0040",
-    ),
-    "matte-black-orange": (
-        "FF4400",
-        "E83B00",
-        "C92B00",
-        "501000",
-        "E83B00",
-        "FF4400",
-    ),
-    "black": ("000000",) * 6,
-    "horde-red": (
-        "8B0000",
-        "680000",
-        "4A0000",
-        "180000",
-        "680000",
-        "8B0000",
-    ),
-    "alliance-blue": (
-        "0033AA",
-        "002788",
-        "001A66",
-        "000B22",
-        "002788",
-        "0033AA",
-    ),
+DDR5_STATIC_COLORS = {
+    "deep-red": "8B0000,8B0000,8B0000,8B0000,8B0000,8B0000,8B0000,8B0000,8B0000,8B0000,8B0000,8B0000",
+    "deep-blue": "000B22,000B22,000B22,000B22,000B22,000B22,000B22,000B22,000B22,000B22,000B22,000B22",
+    "bright-white": "FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF,FFFFFF",
+    "animated-rainbow": "11FF00,11FF00,8A2BE2,8A2BE2,FFD400,FFD400,FF0040,FF0040,8A2BE2,8A2BE2,11FF00,11FF00",
+    "neon-rain": "5500FF,5500FF,11FF00,11FF00,00FF8C,00FF8C,FF00F6,FF00F6,FFD400,FFD400,5500FF,5500FF",
+    "aurora-comet": "95FF00,95FF00,00D4FF,00D4FF,8A2BE2,8A2BE2,8A2BE2,8A2BE2,00D4FF,00D4FF,95FF00,95FF00",
+    "spectrum-wave": "11FF00,11FF00,8A2BE2,8A2BE2,FFD400,FFD400,FF0040,FF0040,8A2BE2,8A2BE2,11FF00,11FF00",
+    "electric-sunrise": "FF0040,FF0040,FF0051,FF0051,3C00FF,3C00FF,0044FF,0044FF,FF0051,FF0051,FF0040,FF0040",
+    "matte-black-orange": "FF4400,FF4400,E83B00,E83B00,C92B00,C92B00,501000,501000,E83B00,E83B00,FF4400,FF4400",
+    "black": "000000,000000,000000,000000,000000,000000,000000,000000,000000,000000,000000,000000",
+    "horde-red": "8B0000,8B0000,680000,680000,4A0000,4A0000,180000,180000,680000,680000,8B0000,8B0000",
+    "alliance-blue": "0033AA,0033AA,002788,002788,001A66,001A66,000B22,000B22,002788,002788,0033AA,0033AA",
 }
 EFFECT_PROFILES = {
     "neon-rain": ("hugin-rain", "Rain"),
@@ -255,74 +161,87 @@ def unpack_rgbcolor(packed_rgbcolor: int) -> str:
     return f"#{red:02X}{green:02X}{blue:02X}"
 
 
+def dry_run_commands(helper: Path, preset: str, environment: dict[str, str]) -> list[list[str]]:
+    output = subprocess.run(
+        [str(helper), "--dry-run", preset], check=True, capture_output=True,
+        text=True, env=environment,
+    ).stdout
+    return [
+        shlex.split(line.removeprefix("DRY RUN:"))
+        for line in output.splitlines() if line.startswith("DRY RUN:")
+    ]
+
+
+def without_ram_segments(commands: list[list[str]]) -> list[list[str]]:
+    normalized: list[list[str]] = []
+    for original in commands:
+        command = list(original)
+        if command[0].endswith("effects-sdk"):
+            command[0] = "effects-sdk"
+            normalized.append(command)
+            continue
+        if command[0] != "/usr/bin/openrgb":
+            normalized.append(command)
+            continue
+        device_indexes = [
+            index for index, value in enumerate(command) if value == "--device"
+        ]
+        kept = command[: device_indexes[0]] if device_indexes else command
+        for position, index in enumerate(device_indexes):
+            stop = device_indexes[position + 1] if position + 1 < len(device_indexes) else len(command)
+            if command[index + 1] != RAM_DEVICE:
+                kept.extend(command[index:stop])
+        if len(kept) > 2:
+            normalized.append(kept)
+    return normalized
+
+
 class PresetTests(unittest.TestCase):
-    def test_latched_preset_application_is_blocked_before_any_helper(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            state_home = Path(temporary) / "state"
-            state_root = state_home / "omarchy-plus/openrgb-presets"
-            state_root.mkdir(parents=True, mode=0o700)
-            latch = state_root / "ram-tetris-failure.json"
-            latch.write_text('{"message":"test latch"}\n', encoding="utf-8")
-            environment = os.environ | {"XDG_STATE_HOME": str(state_home)}
-            result = subprocess.run(
-                [APPLY, "deep-red"],
-                check=False,
-                capture_output=True,
-                text=True,
-                env=environment,
-                timeout=5,
-            )
-            self.assertEqual(result.returncode, 75)
-            self.assertIn("active lighting failure", result.stderr)
-            self.assertFalse((state_root / "active-preset").exists())
-            self.assertFalse((state_root / "apply.flock").exists())
+    def test_non_ram_behavior_matches_accepted_static_baseline(self) -> None:
+        baseline = subprocess.run(
+            ["git", "show", "da442105970eff86e669ebc6d72326e23c8e11a8:apply-preset"],
+            cwd=ROOT, check=True, capture_output=True,
+        ).stdout
+        with tempfile.TemporaryDirectory() as directory:
+            baseline_helper = Path(directory) / "apply-preset"
+            baseline_helper.write_bytes(baseline)
+            baseline_helper.chmod(0o755)
+            baseline_effects = Path(directory) / "effects-sdk"
+            baseline_effects.write_text("#!/usr/bin/bash\nexit 0\n", encoding="utf-8")
+            baseline_effects.chmod(0o755)
+            environment = os.environ | {"XDG_STATE_HOME": str(Path(directory) / "state")}
+            for preset in HELPER_ORDER:
+                expected = without_ram_segments(
+                    dry_run_commands(baseline_helper, preset, environment)
+                )
+                actual = without_ram_segments(
+                    dry_run_commands(APPLY, preset, environment)
+                )
+                self.assertEqual(actual, expected, preset)
 
-            restore = subprocess.run(
-                [APPLY, "--restore"],
-                check=False,
-                capture_output=True,
-                text=True,
-                env=environment,
-                timeout=5,
-            )
-            self.assertEqual(restore.returncode, 75)
-            self.assertIn("active lighting failure", restore.stderr)
-
-            for arguments in (("--list",), ("--current",), ("--dry-run", "deep-red")):
-                with self.subTest(arguments=arguments):
-                    read_only = subprocess.run(
-                        [APPLY, *arguments],
-                        check=False,
-                        capture_output=True,
-                        text=True,
-                        env=environment,
-                        timeout=5,
-                    )
-                    self.assertEqual(read_only.returncode, 0, read_only.stderr)
-
-    def test_panel_disables_all_preset_entry_points_while_latched(self) -> None:
-        panel = PANEL.read_text(encoding="utf-8")
-        self.assertIn(
-            "if (lightingFailure || actionProc.running || currentProc.running) return",
-            panel,
-        )
-        self.assertIn(
-            "enabled: !root.lightingFailure\n"
-            "                  && !actionProc.running && !currentProc.running",
-            panel,
-        )
-        self.assertIn("opacity: root.lightingFailure ? 0.46 : 1", panel)
-        self.assertIn('root.recoveryStatus === "partial-cleaned"', panel)
-        self.assertIn('root.recoveryStatus === "partial-active"', panel)
-        self.assertIn('root.recoveryStatus === "completed"', panel)
-        apply_source = APPLY.read_text(encoding="utf-8")
-        self.assertIn("is_guarded_recovery_restore", apply_source)
-        self.assertIn('"outcome":"recovery-in-progress"', apply_source)
-        self.assertIn(
-            r'\"latch_sha256\":\"${latch_sha256}\"', apply_source
-        )
-        self.assertIn('exec 7>"${RECOVERY_LOCK_FILE}"', apply_source)
-        self.assertIn('"${argument}" == "${LIFECYCLE}"', apply_source)
+    def test_static_ram_patterns_match_v045_exactly(self) -> None:
+        reviewed = subprocess.run(
+            ["git", "show", "388dd9c2fd118722c32b24565e41465ab2412be0:apply-preset"],
+            cwd=ROOT, check=True, capture_output=True,
+        ).stdout
+        with tempfile.TemporaryDirectory() as directory:
+            reviewed_helper = Path(directory) / "apply-preset"
+            reviewed_helper.write_bytes(reviewed)
+            reviewed_helper.chmod(0o755)
+            environment = os.environ | {"XDG_STATE_HOME": str(Path(directory) / "state")}
+            for preset, expected_color in DDR5_STATIC_COLORS.items():
+                reviewed_commands = dry_run_commands(
+                    reviewed_helper, preset, environment
+                )
+                reviewed_colors = [
+                    command[index + 1]
+                    for command in reviewed_commands
+                    for index, value in enumerate(command)
+                    if value == "--color"
+                    and index >= 4
+                    and RAM_DEVICE in command[:index]
+                ]
+                self.assertIn(expected_color, reviewed_colors, preset)
 
     def test_effects_profiles_exclude_ddr5_and_preserve_non_ram_zones(self) -> None:
         for name, expected_hash in PROFILE_HASHES.items():
@@ -358,9 +277,7 @@ class PresetTests(unittest.TestCase):
     def test_new_profiles_clone_electric_sunrise_except_for_four_colors(self) -> None:
         original = load_profile("hugin-sunrise-blue-red")
         original_effect = original["Effects"][0]
-        self.assertEqual(
-            original_effect["UserColors"], [4194559, 5308671, 16711740, 16729088]
-        )
+        self.assertEqual(original_effect["UserColors"], [4194559, 5308671, 16711740, 16729088])
 
         for name, specification in NEW_PROFILES.items():
             packed_colors = specification["packed_rgbcolor"]
@@ -374,57 +291,26 @@ class PresetTests(unittest.TestCase):
             previous_colors = specification["v044_packed_rgbcolor"]
             self.assertEqual(packed_colors[:3], previous_colors[:3], name)
             self.assertNotEqual(packed_colors[3], previous_colors[3], name)
-            self.assertEqual(
-                profile["Effects"][0]["ControllerZones"],
-                original_effect["ControllerZones"],
-                name,
-            )
+            self.assertEqual(profile["Effects"][0]["ControllerZones"], original_effect["ControllerZones"], name)
             self.assertEqual(len(profile["Effects"][0]["ControllerZones"]), 6, name)
             self.assertEqual(profile["Effects"][0]["EffectClassName"], "Sunrise", name)
-            self.assertEqual(
-                profile["Effects"][0]["CustomSettings"],
-                original_effect["CustomSettings"],
-                name,
-            )
-            self.assertEqual(
-                profile["Effects"][0]["Speed"], original_effect["Speed"], name
-            )
+            self.assertEqual(profile["Effects"][0]["CustomSettings"], original_effect["CustomSettings"], name)
+            self.assertEqual(profile["Effects"][0]["Speed"], original_effect["Speed"], name)
             self.assertEqual(profile["Effects"][0]["FPS"], original_effect["FPS"], name)
             self.assertEqual(sha256(PROFILES / name), specification["sha256"], name)
 
     def test_manifest_and_panel_order(self) -> None:
         manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "0.4.45")
+        self.assertEqual(manifest["version"], "0.5.0")
         self.assertEqual(manifest["kinds"], ["bar-widget"])
-        self.assertNotIn("service", manifest["entryPoints"])
-        self.assertFalse((ROOT / "Service.qml").exists())
-
-        unit = (ROOT / "systemd/omarchy-plus-openrgb-presets.service").read_text()
-        self.assertIn("Type=notify", unit)
-        self.assertIn("NotifyAccess=all", unit)
-        self.assertIn("ExitType=cgroup", unit)
-        self.assertIn("KillMode=mixed", unit)
-        self.assertIn("Restart=no", unit)
-        self.assertIn("TimeoutStartSec=120", unit)
-        self.assertIn("TimeoutStopSec=20", unit)
-        self.assertIn("PartOf=graphical-session.target", unit)
-        self.assertIn("ExecStopPost=", unit)
-        self.assertNotIn("NotifyAccess=main", unit)
-
-        lifecycle = (ROOT / "openrgb-lifecycle").read_text()
-        self.assertIn("readonly SHUTDOWN_BUDGET_SECONDS=15", lifecycle)
-        self.assertIn("begin_shutdown_deadline", lifecycle)
-        self.assertIn("wait_for_process_exit", lifecycle)
+        self.assertEqual(manifest["entryPoints"], {"barWidget": "BarWidget.qml"})
 
         panel = PANEL.read_text(encoding="utf-8")
-        library = panel.split("readonly property var presets: [", 1)[1].split(
-            "readonly property var activePresetData:", 1
-        )[0]
-        self.assertEqual(
-            re.findall(r'^\s+id: "([a-z0-9-]+)",$', library, re.MULTILINE),
-            VISIBLE_ORDER,
-        )
-        self.assertIn("columns: 2", panel)
+        library = panel.split(
+            "readonly property var presets: [", 1
+        )[1].split("readonly property var activePresetData:", 1)[0]
+        self.assertEqual(re.findall(r'^\s+id: "([a-z0-9-]+)",$', library, re.MULTILINE), VISIBLE_ORDER)
+        self.assertIn('columns: 2', panel)
         self.assertIn("function moveSelection(dx, dy)", panel)
         self.assertIn("var rows = Math.ceil(presets.length / columns)", panel)
         self.assertIn("while (nextIndex >= presets.length)", panel)
@@ -432,75 +318,12 @@ class PresetTests(unittest.TestCase):
         self.assertIn('id: "bright-white"', panel)
         self.assertNotIn("brightWhitePreset", panel)
 
-        for preset, (
-            label,
-            kind,
-            mode,
-            detail,
-            accent,
-            swatches,
-        ) in PANEL_INDICATORS.items():
+        for preset, (kind, detail, accent, swatches) in PANEL_INDICATORS.items():
             block = library.split(f'id: "{preset}"', 1)[1].split("\n    }", 1)[0]
-            self.assertIn(f'label: "{label}"', block, preset)
             self.assertIn(f'kind: "{kind}"', block, preset)
-            self.assertIn(f'mode: "{mode}"', block, preset)
             self.assertIn(f'detail: "{detail}"', block, preset)
             self.assertIn(f'accent: "{accent}"', block, preset)
             self.assertIn(f"swatches: {json.dumps(swatches)}", block, preset)
-
-        for preset, label in DISPLAY_LABELS.items():
-            block = library.split(f'id: "{preset}"', 1)[1].split("\n    }", 1)[0]
-            self.assertIn(f'label: "{label}"', block, preset)
-            self.assertIn(f'mode: "{DISPLAY_MODES[preset]}"', block, preset)
-        self.assertNotIn('id: "static-red"', panel)
-        self.assertNotIn('id: "static-blue"', panel)
-        self.assertNotIn('id: "static-white"', panel)
-
-        self.assertIn("height: Style.space(80)", panel)
-        self.assertIn("height: Style.space(60)", panel)
-        self.assertIn("rowSpacing: Style.space(7)", panel)
-        self.assertIn('text: "󰍛"', panel)
-        self.assertIn('? "Lighting animations stopped"', panel)
-        self.assertIn("id: compactErrorCode", panel)
-        self.assertIn("text: root.failureCode", panel)
-        self.assertIn('? "Recovery needed"', panel)
-        self.assertIn('? "Recovery blocked"', panel)
-        self.assertIn(': "Manual review required"', panel)
-        self.assertIn("parent.width - compactErrorCode.implicitWidth", panel)
-        compact_row = panel.split("id: tetrisToggle", 1)[1].split(
-            "id: diagnosticDetails", 1
-        )[0]
-        self.assertNotIn("failureDescription", compact_row)
-        self.assertIn('? "Active" : "Static lighting"', panel)
-        self.assertIn('text: root.recoveryAttemptActive ? "Working" : "Recover"', panel)
-        self.assertIn('text: "󰆏  Copy diagnostics"', panel)
-        self.assertIn('"Original reason: " + root.failureReason', panel)
-        self.assertIn('"Latest action: " + root.recoveryFeedback', panel)
-        self.assertIn("root.diagnosticsExpanded = !root.diagnosticsExpanded", panel)
-        self.assertIn("onClicked: root.beginRecovery()", panel)
-        self.assertIn('root.recoveryAction = "recover"', panel)
-        self.assertIn('"Observing four SPD sensors for 60 seconds…"', panel)
-        self.assertIn("recoveryDispatchTimer.restart()", panel)
-        self.assertIn(
-            "if (!lightingFailure || recoveryProc.running || recoveryAttemptActive)",
-            panel,
-        )
-        self.assertNotIn("recoveryConfirmationPending", panel)
-        self.assertNotIn("confirmationTimer", panel)
-        self.assertNotIn("function confirmRecovery", panel)
-        self.assertNotIn("function cancelRecovery", panel)
-        self.assertNotIn('text: "Confirm"', panel)
-        self.assertNotIn("interval: 15000", panel)
-        self.assertIn(
-            "anchors.right: tetrisToggle.failed ? recoveryControls.left : toggleTrack.left",
-            panel,
-        )
-        self.assertIn("onActivateRequested: root.applySelectedPreset()", panel)
-        self.assertNotIn("onActivateRequested: root.beginRecovery()", panel)
-        self.assertIn("root.activePresetData.mode", panel)
-        self.assertGreaterEqual(panel.count("fontSizeMode: Text.HorizontalFit"), 2)
-        self.assertIn("maximumLineCount: 1", panel)
-        self.assertNotIn("text: presetCard.modelData.detail", panel)
 
         def move(index: int, dx: int, dy: int) -> int:
             if dy == 0:
@@ -541,9 +364,7 @@ class PresetTests(unittest.TestCase):
                 "horde-red",
                 "alliance-blue",
             ):
-                (state_dir / "active-preset").write_text(
-                    preset + "\n", encoding="utf-8"
-                )
+                (state_dir / "active-preset").write_text(preset + "\n", encoding="utf-8")
                 current = subprocess.run(
                     [str(APPLY), "--current"],
                     check=True,
@@ -553,13 +374,10 @@ class PresetTests(unittest.TestCase):
                 ).stdout.strip()
                 self.assertEqual(current, preset)
 
-    def test_every_preset_applies_one_exact_static_ddr5_pattern(self) -> None:
+    def test_every_preset_applies_one_exact_static_ddr5_color(self) -> None:
         with tempfile.TemporaryDirectory() as state_home:
             environment = os.environ | {"XDG_STATE_HOME": state_home}
-            for preset, pair_pattern in DDR5_STATIC_PAIR_PATTERNS.items():
-                expected_colors = ",".join(
-                    color for color in pair_pattern for _ in range(2)
-                )
+            for preset, expected_color in DDR5_STATIC_COLORS.items():
                 output = subprocess.run(
                     [str(APPLY), "--dry-run", preset],
                     check=True,
@@ -567,7 +385,6 @@ class PresetTests(unittest.TestCase):
                     text=True,
                     env=environment,
                 ).stdout
-                self.assertIn(f"Applied: {DISPLAY_LABELS[preset]}", output, preset)
                 commands = [
                     shlex.split(line.removeprefix("DRY RUN:"))
                     for line in output.splitlines()
@@ -596,14 +413,7 @@ class PresetTests(unittest.TestCase):
                 self.assertEqual(len(ram_segments), 1, preset)
                 self.assertEqual(
                     ram_segments[0],
-                    [
-                        "--device",
-                        RAM_DEVICE,
-                        "--mode",
-                        "direct",
-                        "--color",
-                        expected_colors,
-                    ],
+                    ["--device", RAM_DEVICE, "--mode", "direct", "--color", expected_color],
                     preset,
                 )
 
@@ -655,21 +465,132 @@ class PresetTests(unittest.TestCase):
                     ]
                     self.assertEqual(
                         devices,
-                        [
-                            RAM_DEVICE,
-                            GPU_DEVICE,
-                            ST100_DEVICE,
-                            ST100_DEVICE,
-                            MAINBOARD_DEVICE,
-                        ],
+                        [GPU_DEVICE, ST100_DEVICE, ST100_DEVICE, MAINBOARD_DEVICE, RAM_DEVICE],
                         preset,
                     )
 
+    def test_defaults_and_ram_preference_are_static_and_persistent(self) -> None:
+        with tempfile.TemporaryDirectory() as state_home:
+            environment = os.environ | {"XDG_STATE_HOME": state_home}
+            state_dir = Path(state_home) / "omarchy-plus/openrgb-presets"
+
+            current = subprocess.run(
+                [str(APPLY), "--current"], check=True, capture_output=True,
+                text=True, env=environment,
+            ).stdout.strip()
+            ram_current = subprocess.run(
+                [str(APPLY), "--ram-current"], check=True, capture_output=True,
+                text=True, env=environment,
+            ).stdout.strip()
+            self.assertEqual(current, "electric-sunrise")
+            self.assertEqual(ram_current, "on")
+
+            state_dir.mkdir(parents=True)
+            (state_dir / "ram-lighting-enabled").write_text("off\n", encoding="utf-8")
+            output = subprocess.run(
+                [str(APPLY), "--dry-run", "electric-sunrise"], check=True,
+                capture_output=True, text=True, env=environment,
+            ).stdout
+            self.assertIn(
+                f"--device {shlex.quote(RAM_DEVICE)} --mode direct --color 000000",
+                output,
+            )
+            self.assertEqual(
+                subprocess.run(
+                    [str(APPLY), "--ram-current"], check=True, capture_output=True,
+                    text=True, env=environment,
+                ).stdout.strip(),
+                "off",
+            )
+
+    def test_ram_toggle_changes_only_the_four_dimm_controller(self) -> None:
+        with tempfile.TemporaryDirectory() as state_home:
+            environment = os.environ | {"XDG_STATE_HOME": state_home}
+            state_dir = Path(state_home) / "omarchy-plus/openrgb-presets"
+            state_dir.mkdir(parents=True)
+            (state_dir / "active-preset").write_text(
+                "electric-sunrise\n", encoding="utf-8"
+            )
+            for argument, color in (
+                ("--ram-off", "000000"),
+                ("--ram-on", DDR5_STATIC_COLORS["electric-sunrise"]),
+            ):
+                output = subprocess.run(
+                    [str(APPLY), "--dry-run", argument], check=True,
+                    capture_output=True, text=True, env=environment,
+                ).stdout
+                commands = [
+                    shlex.split(line.removeprefix("DRY RUN:"))
+                    for line in output.splitlines() if line.startswith("DRY RUN:")
+                ]
+                self.assertEqual(
+                    commands,
+                    [[
+                        "/usr/bin/openrgb", "--nodetect", "--device", RAM_DEVICE,
+                        "--mode", "direct", "--color", color,
+                    ]],
+                )
+
+    def test_resume_restoration_never_writes_ram(self) -> None:
+        command = f"""
+source {APPLY!s}
+dry_run=true
+apply_preset electric-sunrise false false
+"""
+        output = subprocess.run(
+            ["/usr/bin/bash", "-c", command], check=True, capture_output=True,
+            text=True,
+        ).stdout
+        commands = [
+            shlex.split(line.removeprefix("DRY RUN:"))
+            for line in output.splitlines() if line.startswith("DRY RUN:")
+        ]
+        self.assertNotIn(
+            RAM_DEVICE,
+            [value for command in commands for value in command],
+        )
+        self.assertIn(
+            [str(ROOT / "effects-sdk"), "load-profile", "hugin-sunrise-blue-red", "Sunrise"],
+            commands,
+        )
+
+    def test_single_mutation_lock_refuses_competing_operation(self) -> None:
+        with tempfile.TemporaryDirectory() as state_home:
+            environment = os.environ | {"XDG_STATE_HOME": state_home}
+            state_dir = Path(state_home) / "omarchy-plus/openrgb-presets"
+            state_dir.mkdir(parents=True)
+            lock_path = state_dir / "apply.flock"
+            with lock_path.open("w", encoding="utf-8") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                result = subprocess.run(
+                    [str(APPLY), "--dry-run", "deep-red"], capture_output=True,
+                    text=True, env=environment, check=False,
+                )
+            self.assertEqual(result.returncode, 75)
+            self.assertIn("Another OpenRGB operation", result.stderr)
+
+    def test_static_runtime_has_no_tetris_or_recovery_engine(self) -> None:
+        names = {path.relative_to(ROOT).as_posix() for path in ROOT.rglob("*") if path.is_file()}
+        forbidden_names = {
+            "ram-tetris", "ram_tetris_core.py", "lighting-recovery",
+            "openrgb-service-guard",
+        }
+        self.assertTrue(forbidden_names.isdisjoint(names))
+        runtime = (ROOT / "apply-preset").read_text(encoding="utf-8") + (
+            ROOT / "openrgb-lifecycle"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("tetris", runtime.lower())
+        self.assertNotIn("recovery", runtime.lower())
+        self.assertIn("openrgb-hugin 1.0rc3-3.2", runtime)
+        self.assertIn("d0d065994b7328aec2cc0ae2b06a3c9ab8f99f4693aba35bd669e2fea406e301", runtime)
+        for endpoint in ("10-0050", "10-0051", "10-0052", "10-0053"):
+            self.assertIn(endpoint, runtime)
+
     def test_installer_registers_all_profiles_with_exact_hashes(self) -> None:
         installer = INSTALLER.read_text(encoding="utf-8")
-        names_block = installer.split("readonly -a PROFILE_NAMES=(", 1)[1].split(
-            "\n)", 1
-        )[0]
+        names_block = installer.split(
+            "readonly -a PROFILE_NAMES=(", 1
+        )[1].split("\n)", 1)[0]
         names = re.findall(r"^\s+(hugin-[a-z0-9-]+)$", names_block, re.MULTILINE)
         expected_names = [
             "hugin-rain",

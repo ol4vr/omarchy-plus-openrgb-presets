@@ -4,55 +4,22 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-readonly FDFLAGS_LOADABLE="/usr/lib/bash/fdflags"
-readonly OPENRGB_BIN="${OPENRGB_BIN:-/usr/bin/openrgb}"
-readonly GDBUS_BIN="${GDBUS_BIN:-/usr/bin/gdbus}"
-readonly STDBUF_BIN="${STDBUF_BIN:-/usr/bin/stdbuf}"
-readonly INHIBIT_BIN="${INHIBIT_BIN:-/usr/bin/systemd-inhibit}"
-readonly INHIBIT_PROCESS_PREFIX="${INHIBIT_PROCESS_PREFIX:-${INHIBIT_BIN}}"
-readonly SETSID_BIN="${SETSID_BIN:-/usr/bin/setsid}"
-readonly SETPRIV_BIN="${SETPRIV_BIN:-/usr/bin/setpriv}"
-readonly SS_BIN="${SS_BIN:-/usr/bin/ss}"
-readonly PS_BIN="${PS_BIN:-/usr/bin/ps}"
-readonly TIMEOUT_BIN="${TIMEOUT_BIN:-/usr/bin/timeout}"
-readonly SLEEP_BIN="${SLEEP_BIN:-/usr/bin/sleep}"
-readonly CAT_BIN="${CAT_BIN:-/usr/bin/cat}"
-readonly FLOCK_BIN="${FLOCK_BIN:-/usr/bin/flock}"
-readonly MKDIR_BIN="${MKDIR_BIN:-/usr/bin/mkdir}"
-readonly MV_BIN="${MV_BIN:-/usr/bin/mv}"
-readonly TR_BIN="${TR_BIN:-/usr/bin/tr}"
-readonly SHA256SUM_BIN="${SHA256SUM_BIN:-/usr/bin/sha256sum}"
-readonly READLINK_BIN="${READLINK_BIN:-/usr/bin/readlink}"
-readonly SYSTEMD_NOTIFY_BIN="${SYSTEMD_NOTIFY_BIN:-/usr/bin/systemd-notify}"
-readonly PROC_ROOT="${PROC_ROOT:-/proc}"
-readonly SCRIPT_PATH="$(/usr/bin/readlink -f "${BASH_SOURCE[0]}")"
-readonly SCRIPT_DIR="$(/usr/bin/dirname "${SCRIPT_PATH}")"
-readonly APPLY_PRESET="${APPLY_PRESET:-${SCRIPT_DIR}/apply-preset}"
-readonly RAM_TETRIS="${RAM_TETRIS:-${SCRIPT_DIR}/ram-tetris}"
-readonly SERVICE_GUARD="${OPENRGB_SERVICE_GUARD:-${SCRIPT_DIR}/openrgb-service-guard}"
-readonly USER_ID="${OPENRGB_USER_ID:-$(/usr/bin/id -u)}"
-readonly RUNTIME_DIR="${OPENRGB_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/run/user/${USER_ID}}/omarchy-plus/openrgb-presets}"
-readonly LIFECYCLE_LOCK_FILE="${RUNTIME_DIR}/lifecycle.lock"
-readonly SERVER_LOG_FILE="${OPENRGB_SERVER_LOG:-${RUNTIME_DIR}/openrgb-server.log}"
-readonly TETRIS_LOG_FILE="${OPENRGB_TETRIS_LOG:-${RUNTIME_DIR}/ram-tetris.log}"
-readonly STATE_ROOT="${XDG_STATE_HOME:-${HOME}/.local/state}/omarchy-plus/openrgb-presets"
-readonly PRESET_OPERATION_LOCK_FILE="${STATE_ROOT}/apply.flock"
-readonly TETRIS_PREFERENCE_FILE="${STATE_ROOT}/ram-tetris-enabled"
-readonly ACTIVE_PRESET_FILE="${STATE_ROOT}/active-preset"
-readonly TETRIS_FAILURE_FILE="${STATE_ROOT}/ram-tetris-failure.json"
-readonly TETRIS_STATUS_FILE="${RUNTIME_DIR}/ram-tetris-status.json"
-readonly TETRIS_STOP_FILE="${RUNTIME_DIR}/ram-tetris.stop"
-readonly TETRIS_LOCK_FILE="${RUNTIME_DIR}/ram-tetris.lock"
-readonly HARDWARE_LOCK_FILE="${RUNTIME_DIR}/hardware-operation.lock"
-readonly PRESET_OWNER_FILE="${RUNTIME_DIR}/preset-operation.state"
-readonly USER_MANAGER_COMMAND="${USER_MANAGER_COMMAND:-/usr/lib/systemd/systemd --user}"
+readonly OPENRGB_BIN="/usr/bin/openrgb"
+readonly GDBUS_BIN="/usr/bin/gdbus"
+readonly INHIBIT_BIN="/usr/bin/systemd-inhibit"
+readonly SETPRIV_BIN="/usr/bin/setpriv"
+readonly SETSID_BIN="/usr/bin/setsid"
+readonly SS_BIN="/usr/bin/ss"
+readonly TIMEOUT_BIN="/usr/bin/timeout"
+readonly SCRIPT_DIR="$(/usr/bin/readlink -f "$(/usr/bin/dirname "${BASH_SOURCE[0]}")")"
+readonly APPLY_PRESET="${SCRIPT_DIR}/apply-preset"
+readonly USER_ID="$(/usr/bin/id -u)"
+readonly RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/${USER_ID}}/omarchy-plus/openrgb-presets-static"
+readonly LIFECYCLE_LOCK="${RUNTIME_DIR}/lifecycle.flock"
+readonly SERVER_LOG="${RUNTIME_DIR}/openrgb-server.log"
 readonly RESTORE_TIMEOUT="75s"
-readonly RESUME_DELAY="${OPENRGB_RESUME_DELAY:-3}"
-readonly SHUTDOWN_BUDGET_SECONDS=15
-readonly SHUTDOWN_TEARDOWN_RESERVE_SECONDS=6
-readonly PRESET_LOCK_DRAIN_ATTEMPTS=10
-readonly PRESET_LOCK_DRAIN_DELAY=0.05
-readonly -a OPENRGB_SERVER_ARGS=(
+readonly RESUME_DELAY="3"
+readonly -a SERVER_ARGS=(
   --noautoconnect
   --startminimized
   --server
@@ -61,1610 +28,335 @@ readonly -a OPENRGB_SERVER_ARGS=(
 )
 
 server_pid=''
-server_start_time=''
-server_origin='none'
-restore_pid=''
-restore_start_time=''
-tetris_pid=''
-tetris_start_time=''
-inhibitor_pid=''
-inhibitor_start_time=''
+server_start=''
 monitor_pid=''
-monitor_start_time=''
+monitor_start=''
 monitor_fd=''
-lifecycle_lock_fd=''
+inhibitor_pid=''
+inhibitor_start=''
+lifecycle_fd=''
 suspended=false
-shutting_down=false
-service_mode=false
-service_ready=false
-shutdown_deadline=0
-wait_exit_status=''
-listener_query_state='unreadable'
-listener_query_owner=''
-server_identity_failure_stage=''
-server_identity_observed_pid=''
-server_identity_observed_start=''
-server_identity_process_state=''
-server_identity_command_state='not-observed'
-server_identity_observed_command_sha256=''
-server_identity_expected_command_sha256=''
-server_identity_observed_command_argc=''
-server_identity_expected_command_argc=''
-server_identity_executable_state='not-observed'
-server_identity_observed_executable=''
-server_identity_observed_executable_sha256=''
-server_identity_expected_executable_sha256=''
-server_identity_ownership_state='not-observed'
-server_identity_observed_uid=''
-server_identity_observed_cgroup_sha256=''
-
-if ! enable -f "${FDFLAGS_LOADABLE}" fdflags; then
-  /usr/bin/printf '%s\n' \
-    "Required Bash fdflags loadable is unavailable: ${FDFLAGS_LOADABLE}" >&2
-  exit 69
-fi
+cleaning=false
 
 log() {
   /usr/bin/printf '%s\n' "$*"
 }
 
-is_running() {
+process_start() {
   local pid="${1:-}"
-  [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null
+  [[ "${pid}" =~ ^[1-9][0-9]*$ && -r "/proc/${pid}/stat" ]] || return 1
+  /usr/bin/awk '{print $22}' "/proc/${pid}/stat"
 }
 
-process_start_time() {
+same_process() {
   local pid="${1:-}"
-  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
-  [[ -r "${PROC_ROOT}/${pid}/stat" ]] || return 1
-  /usr/bin/awk '{print $22}' "${PROC_ROOT}/${pid}/stat"
-}
-
-is_same_process() {
-  local pid="${1:-}"
-  local expected_start="${2:-}"
-  local actual_start=''
-
-  [[ -n "${expected_start}" ]] || return 1
-  actual_start="$(process_start_time "${pid}" 2>/dev/null || true)"
-  [[ -n "${actual_start}" && "${actual_start}" == "${expected_start}" ]]
-}
-
-process_state() {
-  local pid="${1:-}"
-  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
-  [[ -r "${PROC_ROOT}/${pid}/stat" ]] || return 1
-  /usr/bin/awk '{print $3}' "${PROC_ROOT}/${pid}/stat"
-}
-
-process_has_exited() {
-  local pid="${1:-}"
-  local expected_start="${2:-}"
-  local state=''
-
-  state="$(process_state "${pid}" 2>/dev/null || true)"
-  if [[ -z "${expected_start}" ]]; then
-    [[ -z "${state}" || "${state}" == Z ]]
-    return
-  fi
-  if ! is_same_process "${pid}" "${expected_start}"; then
-    return 0
-  fi
-  [[ -z "${state}" || "${state}" == Z ]]
-}
-
-begin_shutdown_deadline() {
-  if ((shutdown_deadline == 0)); then
-    shutdown_deadline=$((SECONDS + SHUTDOWN_BUDGET_SECONDS))
-  fi
-}
-
-shutdown_time_available() {
-  ((shutdown_deadline == 0 || SECONDS < shutdown_deadline))
-}
-
-shutdown_seconds_remaining() {
-  local remaining=0
-
-  if ((shutdown_deadline == 0)); then
-    /usr/bin/printf '%s' "${SHUTDOWN_BUDGET_SECONDS}"
-    return 0
-  fi
-  remaining=$((shutdown_deadline - SECONDS))
-  ((remaining > 0)) || return 1
-  /usr/bin/printf '%s' "${remaining}"
-}
-
-preset_shutdown_time_available() {
-  local remaining=''
-
-  remaining="$(shutdown_seconds_remaining 2>/dev/null || true)"
-  [[ "${remaining}" =~ ^[0-9]+$ ]] \
-    && ((remaining > SHUTDOWN_TEARDOWN_RESERVE_SECONDS))
-}
-
-wait_for_process_exit() {
-  local pid="${1:-}"
-  local expected_start="${2:-}"
-  local attempts="${3:-1}"
-  local delay="${4:-0.1}"
-  local attempt
-
-  for ((attempt = 0; attempt < attempts; attempt++)); do
-    if process_has_exited "${pid}" "${expected_start}"; then
-      wait_exit_status=0
-      wait "${pid}" 2>/dev/null || wait_exit_status=$?
-      return 0
-    fi
-    shutdown_time_available || return 1
-    "${SLEEP_BIN}" "${delay}"
-  done
-  if process_has_exited "${pid}" "${expected_start}"; then
-    wait_exit_status=0
-    wait "${pid}" 2>/dev/null || wait_exit_status=$?
-    return 0
-  fi
-  return 1
-}
-
-wait_for_preset_process_exit() {
-  local pid="${1:-}"
-  local expected_start="${2:-}"
-  local attempts="${3:-1}"
-  local delay="${4:-0.1}"
-  local attempt
-
-  for ((attempt = 0; attempt < attempts; attempt++)); do
-    if process_has_exited "${pid}" "${expected_start}"; then
-      wait_exit_status=0
-      wait "${pid}" 2>/dev/null || wait_exit_status=$?
-      return 0
-    fi
-    preset_shutdown_time_available || return 1
-    "${SLEEP_BIN}" "${delay}"
-  done
-  if process_has_exited "${pid}" "${expected_start}"; then
-    wait_exit_status=0
-    wait "${pid}" 2>/dev/null || wait_exit_status=$?
-    return 0
-  fi
-  return 1
+  local expected="${2:-}"
+  local actual=''
+  [[ -n "${expected}" ]] || return 1
+  actual="$(process_start "${pid}" 2>/dev/null || true)"
+  [[ -n "${actual}" && "${actual}" == "${expected}" ]]
 }
 
 process_command() {
   local pid="${1:-}"
-  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
-  [[ -r "${PROC_ROOT}/${pid}/cmdline" ]] || return 1
-  "${TR_BIN}" '\0' ' ' <"${PROC_ROOT}/${pid}/cmdline" | /usr/bin/sed 's/ $//'
-}
-
-process_command_argc() {
-  local pid="${1:-}"
-  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
-  [[ -r "${PROC_ROOT}/${pid}/cmdline" ]] || return 1
-  /usr/bin/awk 'BEGIN {RS="\0"} length {count++} END {print count+0}' \
-    "${PROC_ROOT}/${pid}/cmdline"
-}
-
-process_executable() {
-  local pid="${1:-}"
-  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
-  "${READLINK_BIN}" -f -- "${PROC_ROOT}/${pid}/exe"
-}
-
-command_sha256() {
-  /usr/bin/printf '%s' "${1:-}" | "${SHA256SUM_BIN}" | /usr/bin/awk '{print $1}'
-}
-
-process_parent() {
-  local pid="${1:-}"
-  [[ -r "${PROC_ROOT}/${pid}/status" ]] || return 1
-  /usr/bin/awk '$1 == "PPid:" {print $2}' "${PROC_ROOT}/${pid}/status"
+  [[ -r "/proc/${pid}/cmdline" ]] || return 1
+  /usr/bin/tr '\0' ' ' <"/proc/${pid}/cmdline" | /usr/bin/sed 's/ $//'
 }
 
 process_uid() {
   local pid="${1:-}"
-  [[ -r "${PROC_ROOT}/${pid}/status" ]] || return 1
-  /usr/bin/awk '$1 == "Uid:" {print $2}' "${PROC_ROOT}/${pid}/status"
-}
-
-process_cgroup() {
-  local pid="${1:-}"
-  [[ -r "${PROC_ROOT}/${pid}/cgroup" ]] || return 1
-  "${CAT_BIN}" "${PROC_ROOT}/${pid}/cgroup"
+  [[ -r "/proc/${pid}/status" ]] || return 1
+  /usr/bin/awk '$1 == "Uid:" {print $2}' "/proc/${pid}/status"
 }
 
 process_group() {
-  local pid="${1:-}"
-  "${PS_BIN}" -p "${pid}" -o pgid= 2>/dev/null | /usr/bin/awk '{$1=$1; print}'
-}
-
-legacy_inhibitor_command() {
-  /usr/bin/printf '%s' "${INHIBIT_BIN} --what=sleep --who=OpenRGB Presets --why=Stop OpenRGB before system sleep --mode=delay ${SLEEP_BIN} infinity"
-}
-
-legacy_monitor_command() {
-  /usr/bin/printf '%s' "${GDBUS_BIN} monitor --system --dest org.freedesktop.login1 --object-path /org/freedesktop/login1"
-}
-
-current_inhibitor_command() {
-  /usr/bin/printf '%s' "${INHIBIT_PROCESS_PREFIX} --what=sleep --who=OpenRGB Presets --why=Stop OpenRGB before system sleep --mode=delay ${SETPRIV_BIN} --pdeathsig TERM ${SLEEP_BIN} infinity"
-}
-
-is_owned_current_inhibitor() {
-  local pid="${1:-}"
-  local start_time="${2:-}"
-  is_same_process "${pid}" "${start_time}" \
-    && [[ "$(process_command "${pid}" 2>/dev/null || true)" == "$(current_inhibitor_command)" ]] \
-    && [[ "$(process_group "${pid}" 2>/dev/null || true)" == "${pid}" ]]
-}
-
-classify_legacy_process() {
-  local candidate_pid="${1:-}"
-  local candidate_start="${2:-}"
-  local active_pid="${3:-}"
-  local active_start="${4:-}"
-  local expected_command="${5:-}"
-  local require_group_leader="${6:-false}"
-  local candidate_parent=''
-  local candidate_cgroup=''
-  local active_cgroup=''
-
-  if ! is_same_process "${candidate_pid}" "${candidate_start}" \
-    || ! is_same_process "${active_pid}" "${active_start}" \
-    || [[ "$(process_uid "${candidate_pid}" 2>/dev/null || true)" != "${USER_ID}" ]] \
-    || [[ "$(process_command "${candidate_pid}" 2>/dev/null || true)" != "${expected_command}" ]] \
-    || [[ "${require_group_leader}" == true \
-      && "$(process_group "${candidate_pid}" 2>/dev/null || true)" != "${candidate_pid}" ]]; then
-    /usr/bin/printf '%s\n' 'ineligible'
-    return 1
-  fi
-
-  candidate_cgroup="$(process_cgroup "${candidate_pid}" 2>/dev/null || true)"
-  active_cgroup="$(process_cgroup "${active_pid}" 2>/dev/null || true)"
-  if [[ -z "${candidate_cgroup}" || "${candidate_cgroup}" != "${active_cgroup}" ]]; then
-    /usr/bin/printf '%s\n' 'ineligible'
-    return 1
-  fi
-
-  candidate_parent="$(process_parent "${candidate_pid}" 2>/dev/null || true)"
-  if [[ "${candidate_parent}" == "${active_pid}" ]]; then
-    /usr/bin/printf '%s\n' 'legitimate'
-    return 0
-  fi
-  if [[ "$(process_command "${candidate_parent}" 2>/dev/null || true)" == "${USER_MANAGER_COMMAND}" ]]; then
-    /usr/bin/printf '%s\n' 'stale-legacy'
-    return 0
-  fi
-
-  /usr/bin/printf '%s\n' 'ineligible'
-  return 1
-}
-
-classify_legacy_inhibitor() {
-  classify_legacy_process "${1:-}" "${2:-}" "${3:-}" "${4:-}" \
-    "$(legacy_inhibitor_command)" true
-}
-
-classify_legacy_monitor() {
-  local monitor_pid="${1:-}"
-  local monitor_start="${2:-}"
-  local active_pid="${3:-}"
-  local active_start="${4:-}"
-  local inhibitor_candidate_pid="${5:-}"
-  local inhibitor_candidate_start="${6:-}"
-  local monitor_class=''
-  local inhibitor_class=''
-
-  monitor_class="$(classify_legacy_process \
-    "${monitor_pid}" "${monitor_start}" "${active_pid}" "${active_start}" \
-    "$(legacy_monitor_command)" false 2>/dev/null || true)"
-  inhibitor_class="$(classify_legacy_inhibitor \
-    "${inhibitor_candidate_pid}" "${inhibitor_candidate_start}" \
-    "${active_pid}" "${active_start}" 2>/dev/null || true)"
-
-  if [[ "${monitor_class}" != "${inhibitor_class}" \
-    || "${monitor_class}" != @(legitimate|stale-legacy) \
-    || ! "${monitor_start}" =~ ^[0-9]+$ \
-    || ! "${inhibitor_candidate_start}" =~ ^[0-9]+$ \
-    || "${monitor_start}" -lt "${inhibitor_candidate_start}" \
-    || $((monitor_start - inhibitor_candidate_start)) -gt 500 ]]; then
-    /usr/bin/printf '%s\n' 'ineligible'
-    return 1
-  fi
-
-  /usr/bin/printf '%s\n' "${monitor_class}"
-}
-
-close_fd() {
-  local fd="${1:-}"
-  [[ "${fd}" =~ ^[0-9]+$ ]] || return 0
-  eval "exec ${fd}>&-"
-}
-
-set_fd_cloexec() {
-  local fd="${1:-}"
-  [[ "${fd}" =~ ^[0-9]+$ ]] || return 64
-  fdflags -s +cloexec "${fd}"
-}
-
-close_lock_for_child() {
-  close_fd "${lifecycle_lock_fd}"
-}
-
-mark_service_state() {
-  local state="${1}"
-  local reason="${2:-}"
-  local lifecycle_start=''
-  local -a command
-
-  [[ "${service_mode}" == true ]] || return 0
-  lifecycle_start="$(process_start_time $$)"
-  command=(
-    "${SERVICE_GUARD}" mark "${state}"
-    --lifecycle-pid "$$"
-    --lifecycle-start "${lifecycle_start}"
-  )
-  if [[ -n "${server_pid}" && -n "${server_start_time}" ]]; then
-    command+=(--server-pid "${server_pid}" --server-start "${server_start_time}")
-  fi
-  if [[ -n "${reason}" ]]; then
-    command+=(--reason "${reason}")
-  fi
-  "${command[@]}"
-}
-
-notify_service_status() {
-  [[ "${service_mode}" == true ]] || return 0
-  "${SYSTEMD_NOTIFY_BIN}" --status="$*"
-}
-
-verify_tetris_lock_released() {
-  local verify_fd=''
-  local old_umask=''
-
-  old_umask="$(umask)"
-  umask 077
-  exec {verify_fd}>"${TETRIS_LOCK_FILE}"
-  umask "${old_umask}"
-  if ! "${FLOCK_BIN}" -n "${verify_fd}"; then
-    close_fd "${verify_fd}"
-    return 1
-  fi
-  close_fd "${verify_fd}"
-}
-
-exclusive_lock_released() {
-  local path="${1}"
-  local verify_fd=''
-  local old_umask=''
-
-  old_umask="$(umask)"
-  umask 077
-  "${MKDIR_BIN}" -p -- "$(/usr/bin/dirname "${path}")"
-  exec {verify_fd}>"${path}"
-  umask "${old_umask}"
-  if ! "${FLOCK_BIN}" -n "${verify_fd}"; then
-    close_fd "${verify_fd}"
-    return 1
-  fi
-  close_fd "${verify_fd}"
-}
-
-verify_exclusive_lock_released() {
-  local path="${1}"
-  local label="${2}"
-
-  if ! exclusive_lock_released "${path}"; then
-    log "${label} is still owned"
-    return 1
-  fi
-}
-
-wait_for_preset_lock_release() {
-  local attempt
-
-  for ((attempt = 0; attempt < PRESET_LOCK_DRAIN_ATTEMPTS; attempt++)); do
-    if exclusive_lock_released "${PRESET_OPERATION_LOCK_FILE}"; then
-      return 0
-    fi
-    preset_shutdown_time_available || return 1
-    "${SLEEP_BIN}" "${PRESET_LOCK_DRAIN_DELAY}"
-  done
-  log 'preset-operation lock is still owned after authenticated drain'
-  return 1
-}
-
-remove_preset_owner_if_unchanged() {
-  local expected="${1:-}"
-  local observed=''
-
-  [[ -n "${expected}" && -r "${PRESET_OWNER_FILE}" ]] || return 0
-  observed="$(/usr/bin/head -n 1 "${PRESET_OWNER_FILE}" 2>/dev/null || true)"
-  if [[ "${observed}" == "${expected}" ]]; then
-    /usr/bin/rm -f -- "${PRESET_OWNER_FILE}"
-  fi
-}
-
-is_preset_operation_process() {
-  local pid="${1:-}"
-  local start_time="${2:-}"
-  local command=''
-
-  is_same_process "${pid}" "${start_time}" || return 1
-  [[ "$(process_uid "${pid}" 2>/dev/null || true)" == "${USER_ID}" ]] || return 1
-  command="$(process_command "${pid}" 2>/dev/null || true)"
-  [[ "${command}" == "/usr/bin/bash ${APPLY_PRESET} "* \
-    || "${command}" == "/usr/bin/bash ${APPLY_PRESET}" ]]
-}
-
-stop_preset_operation() {
-  local pid=''
-  local start_time=''
-  local recorded=''
-
-  if [[ -r "${PRESET_OWNER_FILE}" ]]; then
-    recorded="$(/usr/bin/head -n 1 "${PRESET_OWNER_FILE}" 2>/dev/null || true)"
-    read -r pid start_time <<<"${recorded}"
-  fi
-  if [[ -z "${pid}" ]]; then
-    verify_exclusive_lock_released \
-      "${PRESET_OPERATION_LOCK_FILE}" 'preset-operation lock'
-    return
-  fi
-  if process_has_exited "${pid}" "${start_time}"; then
-    if ! wait_for_preset_lock_release; then
-      log "Authenticated preset-operation record exited but its lock did not drain"
-      return 1
-    fi
-    remove_preset_owner_if_unchanged "${recorded}"
-    return 0
-  elif ! is_preset_operation_process "${pid}" "${start_time}"; then
-    if process_has_exited "${pid}" "${start_time}"; then
-      if ! wait_for_preset_lock_release; then
-        log "Changed preset-operation identity exited but its lock did not drain"
-        return 1
-      fi
-      remove_preset_owner_if_unchanged "${recorded}"
-      return 0
-    fi
-    log "Refusing to signal unauthenticated preset operation PID ${pid}"
-    return 1
-  else
-    if ! wait_for_preset_process_exit "${pid}" "${start_time}" 40 0.05; then
-      preset_shutdown_time_available || {
-        log "Preset operation did not exit before the teardown reserve"
-        return 1
-      }
-      is_preset_operation_process "${pid}" "${start_time}" || {
-        log "Preset operation identity changed before SIGTERM"
-        return 1
-      }
-      kill -TERM "${pid}" 2>/dev/null || true
-      if ! wait_for_preset_process_exit "${pid}" "${start_time}" 20 0.05; then
-        preset_shutdown_time_available || {
-          log "Preset operation did not exit before the teardown reserve"
-          return 1
-        }
-        is_preset_operation_process "${pid}" "${start_time}" || {
-          log "Preset operation identity changed before SIGKILL"
-          return 1
-        }
-        kill -KILL "${pid}" 2>/dev/null || true
-        if ! wait_for_preset_process_exit "${pid}" "${start_time}" 20 0.05; then
-          log "Authenticated preset operation did not exit before shutdown deadline"
-          return 1
-        fi
-      fi
-    fi
-  fi
-  if ! wait_for_preset_lock_release; then
-    log "Authenticated preset operation exited but its lock did not drain"
-    return 1
-  fi
-  remove_preset_owner_if_unchanged "${recorded}"
-}
-
-verify_hardware_clients_quiesced() {
-  verify_tetris_lock_released \
-    && verify_exclusive_lock_released \
-      "${PRESET_OPERATION_LOCK_FILE}" 'preset-operation lock' \
-    && verify_exclusive_lock_released \
-      "${HARDWARE_LOCK_FILE}" 'hardware-operation lock'
-}
-
-acquire_lifecycle_lock() {
-  local old_umask
-  old_umask="$(umask)"
-  umask 077
-  "${MKDIR_BIN}" -p -- "${RUNTIME_DIR}"
-  exec {lifecycle_lock_fd}>"${LIFECYCLE_LOCK_FILE}"
-  umask "${old_umask}"
-  "${FLOCK_BIN}" -n "${lifecycle_lock_fd}"
-}
-
-stop_process() {
-  local pid="${1:-}"
-  local start_time="${2:-}"
-  local name="${3}"
-
-  if process_has_exited "${pid}" "${start_time}"; then
-    wait "${pid}" 2>/dev/null || true
-    return 0
-  fi
-  if ! is_same_process "${pid}" "${start_time}"; then
-    log "Refusing to signal changed ${name} PID ${pid}"
-    return 1
-  fi
-
-  kill -TERM "${pid}" 2>/dev/null || true
-  if wait_for_process_exit "${pid}" "${start_time}" 20 0.1; then
-    log "${name} stopped"
-    return 0
-  fi
-
-  is_same_process "${pid}" "${start_time}" || return 0
-  kill -KILL "${pid}" 2>/dev/null || true
-  if wait_for_process_exit "${pid}" "${start_time}" 20 0.1; then
-    log "${name} required SIGKILL"
-    return 0
-  fi
-  log "${name} did not exit before the lifecycle shutdown deadline"
-  return 1
-}
-
-stop_restore() {
-  if [[ -n "${restore_pid}" ]] \
-    && ! process_has_exited "${restore_pid}" "${restore_start_time}"; then
-    stop_process "${restore_pid}" "${restore_start_time}" "Preset restore" || return 1
-  elif [[ -n "${restore_pid}" ]]; then
-    wait "${restore_pid}" 2>/dev/null || true
-  fi
-  restore_pid=''
-  restore_start_time=''
-}
-
-is_tetris_process() {
-  local pid="${1:-}"
-  local start_time="${2:-}"
-  local command=''
-
-  is_same_process "${pid}" "${start_time}" || return 1
-  command="$(process_command "${pid}" 2>/dev/null || true)"
-  [[ "${command}" == "/usr/bin/python3 ${RAM_TETRIS} run --server-pid ${server_pid} --server-start ${server_start_time} --lifecycle-pid $$ --lifecycle-start $(process_start_time $$)" ]]
-}
-
-tetris_preference_enabled() {
-  [[ -r "${TETRIS_PREFERENCE_FILE}" ]] \
-    && [[ "$(/usr/bin/head -n 1 "${TETRIS_PREFERENCE_FILE}")" == on ]]
-}
-
-tetris_selected_preset() {
-  if [[ -r "${ACTIVE_PRESET_FILE}" ]]; then
-    /usr/bin/head -n 1 "${ACTIVE_PRESET_FILE}"
-  else
-    /usr/bin/printf '%s' bright-white
-  fi
-}
-
-clear_tetris_identity() {
-  tetris_pid=''
-  tetris_start_time=''
-}
-
-tetris_completed_local_stop() {
-  local pid="${1}"
-  local start_time="${2}"
-  local reason=''
-
-  reason="$("${RAM_TETRIS}" completed-local-stop \
-    --pid "${pid}" --start "${start_time}" 2>/dev/null || true)"
-  [[ "${reason}" == @(user-off|preset-change) ]]
-}
-
-tetris_writer_started() {
-  local pid="${1}"
-  local start_time="${2}"
-
-  "${RAM_TETRIS}" writer-started \
-    --pid "${pid}" --start "${start_time}" >/dev/null 2>&1
-}
-
-record_tetris_exit_failure() {
-  local status="${1}"
-  local message=''
-  local signal_number=''
-
-  if [[ "${status}" -eq 0 ]]; then
-    message='RAM Tetris writer exited unexpectedly; static restoration was not attempted'
-  elif [[ "${status}" -eq 75 ]]; then
-    message='RAM Tetris writer refused the singleton lock (exit status 75); static restoration was not attempted'
-  elif [[ "${status}" -gt 128 ]]; then
-    signal_number=$((status - 128))
-    message="RAM Tetris writer terminated by signal ${signal_number} (wait status ${status}); static restoration was not attempted"
-  else
-    message="RAM Tetris writer exited unexpectedly with status ${status}; static restoration was not attempted"
-  fi
-  log "${message}"
-  if [[ ! -e "${TETRIS_FAILURE_FILE}" ]]; then
-    "${RAM_TETRIS}" fail "${message}" >/dev/null 2>&1 || true
-  fi
-}
-
-reap_tetris() {
-  wait_exit_status=0
-  wait "${tetris_pid}" 2>/dev/null || wait_exit_status=$?
-  clear_tetris_identity
-}
-
-start_tetris_locked() {
-  local attempt
-  local exited_pid=''
-  local exited_start_time=''
-  local lifecycle_start=''
-
-  # Any marker, including one that is malformed or left behind by an
-  # interrupted operation, blocks startup.  Only the owning operation may
-  # remove it; ambiguous state remains fail closed.
-  [[ ! -e "${TETRIS_STOP_FILE}" ]] || return 0
-  [[ "${suspended}" == false ]] || return 0
-  tetris_preference_enabled || return 0
-  [[ "$(tetris_selected_preset)" != black ]] || return 0
-  [[ ! -e "${TETRIS_FAILURE_FILE}" ]] || return 0
-  is_server_listener "${server_pid}" "${server_start_time}" || return 1
-  if is_tetris_process "${tetris_pid}" "${tetris_start_time}"; then
-    return 0
-  fi
-  clear_tetris_identity
-  lifecycle_start="$(process_start_time $$)"
-  (
-    close_lock_for_child
-    close_fd "${operation_lock_fd}"
-    exec "${SETPRIV_BIN}" --pdeathsig TERM "${RAM_TETRIS}" run \
-      --server-pid "${server_pid}" \
-      --server-start "${server_start_time}" \
-      --lifecycle-pid "$$" \
-      --lifecycle-start "${lifecycle_start}" >>"${TETRIS_LOG_FILE}" 2>&1
-  ) &
-  tetris_pid=$!
-  tetris_start_time=''
-  for attempt in {1..20}; do
-    tetris_start_time="$(process_start_time "${tetris_pid}" 2>/dev/null || true)"
-    if is_tetris_process "${tetris_pid}" "${tetris_start_time}" \
-      && tetris_writer_started "${tetris_pid}" "${tetris_start_time}"; then
-      log "RAM Tetris started as PID ${tetris_pid} (start ${tetris_start_time})"
-      return 0
-    fi
-    if ! is_running "${tetris_pid}"; then
-      break
-    fi
-    "${SLEEP_BIN}" 0.05
-  done
-  if process_has_exited "${tetris_pid}" "${tetris_start_time}"; then
-    exited_pid="${tetris_pid}"
-    exited_start_time="${tetris_start_time}"
-    reap_tetris
-    if [[ "${wait_exit_status}" -eq 0 ]] \
-      && tetris_completed_local_stop "${exited_pid}" "${exited_start_time}"; then
-      log 'RAM Tetris completed a valid local stop before startup confirmation'
-    else
-      record_tetris_exit_failure "${wait_exit_status}"
-    fi
-  else
-    log "Refusing to wait without a verified RAM Tetris child identity"
-    clear_tetris_identity
-  fi
-  return 1
-}
-
-start_tetris() {
-  local operation_lock_fd=''
-  local old_umask=''
-  local result=0
-
-  old_umask="$(umask)"
-  umask 077
-  exec {operation_lock_fd}>"${PRESET_OPERATION_LOCK_FILE}"
-  umask "${old_umask}"
-  if ! "${FLOCK_BIN}" -n "${operation_lock_fd}"; then
-    close_fd "${operation_lock_fd}"
-    return 0
-  fi
-  if ! set_fd_cloexec "${operation_lock_fd}"; then
-    close_fd "${operation_lock_fd}"
-    return 1
-  fi
-  start_tetris_locked || result=$?
-  close_fd "${operation_lock_fd}"
-  return "${result}"
-}
-
-stop_tetris() {
-  local reason="${1:-handoff}"
-  local exit_status=''
-  local lifecycle_start=''
-
-  if [[ "${reason}" == @(handoff|suspend|shutdown) ]]; then
-    lifecycle_start="$(process_start_time $$)"
-    is_server_listener "${server_pid}" "${server_start_time}" || return 1
-    if ! "${RAM_TETRIS}" request-stop "${reason}" \
-      --lifecycle-pid "$$" \
-      --lifecycle-start "${lifecycle_start}" \
-      --server-pid "${server_pid}" \
-      --server-start "${server_start_time}" >/dev/null 2>&1; then
-      log "Failed to establish authenticated RAM Tetris ${reason} intent"
-      return 1
-    fi
-  elif ! "${RAM_TETRIS}" request-stop "${reason}" >/dev/null 2>&1; then
-    log "Failed to establish RAM Tetris ${reason} stop"
-    return 1
-  fi
-
-  if [[ -z "${tetris_pid}" ]]; then
-    return 0
-  fi
-  if ! is_tetris_process "${tetris_pid}" "${tetris_start_time}"; then
-    log "Refusing stop request for changed RAM Tetris PID ${tetris_pid}"
-    return 1
-  fi
-
-  if wait_for_process_exit "${tetris_pid}" "${tetris_start_time}" 100 0.05; then
-    exit_status="${wait_exit_status}"
-    clear_tetris_identity
-    if [[ "${exit_status}" -ne 0 ]]; then
-      record_tetris_exit_failure "${exit_status}"
-      return 1
-    fi
-    log "RAM Tetris completed authenticated ${reason} stop"
-    return 0
-  fi
-  if is_tetris_process "${tetris_pid}" "${tetris_start_time}"; then
-    kill -TERM "${tetris_pid}" 2>/dev/null || true
-    if ! wait_for_process_exit "${tetris_pid}" "${tetris_start_time}" 20 0.1; then
-      if ! is_tetris_process "${tetris_pid}" "${tetris_start_time}"; then
-        log "Refusing SIGKILL for changed RAM Tetris PID ${tetris_pid}"
-        return 1
-      fi
-      kill -KILL "${tetris_pid}" 2>/dev/null || true
-      if ! wait_for_process_exit "${tetris_pid}" "${tetris_start_time}" 20 0.1; then
-        log "RAM Tetris did not exit before the lifecycle shutdown deadline"
-        return 1
-      fi
-    fi
-    exit_status="${wait_exit_status}"
-    if [[ "${exit_status}" -ne 0 ]]; then
-      log "RAM Tetris required authenticated signal escalation for ${reason}"
-    fi
-  else
-    log "Refusing to signal changed RAM Tetris PID ${tetris_pid}"
-    return 1
-  fi
-  clear_tetris_identity
-}
-
-reconcile_tetris() {
-  local exited_pid=''
-  local exited_start_time=''
-  local exit_status=''
-
-  if [[ -n "${tetris_pid}" ]] \
-    && process_has_exited "${tetris_pid}" "${tetris_start_time}"; then
-    exited_pid="${tetris_pid}"
-    exited_start_time="${tetris_start_time}"
-    reap_tetris
-    exit_status="${wait_exit_status}"
-    if [[ "${exit_status}" -eq 0 ]] \
-      && tetris_completed_local_stop "${exited_pid}" "${exited_start_time}"; then
-      log 'RAM Tetris completed a valid local stop'
-    else
-      record_tetris_exit_failure "${exit_status}"
-    fi
-  fi
-  if ! tetris_preference_enabled; then
-    [[ -z "${tetris_pid}" ]] || stop_tetris user-off
-    return 0
-  fi
-  if [[ "$(tetris_selected_preset)" == black ]]; then
-    [[ -z "${tetris_pid}" ]] || stop_tetris preset-change
-    return 0
-  fi
-  [[ -n "${restore_pid}" ]] || start_tetris
+  /usr/bin/ps -p "${1:-}" -o pgid= 2>/dev/null | /usr/bin/awk '{$1=$1; print}'
 }
 
 expected_server_command() {
-  /usr/bin/printf '%s' "${OPENRGB_BIN} ${OPENRGB_SERVER_ARGS[*]}"
+  /usr/bin/printf '%s' "${OPENRGB_BIN} ${SERVER_ARGS[*]}"
 }
 
 listener_owner_pid() {
-  query_listener_owner || return 1
-  /usr/bin/printf '%s' "${listener_query_owner}"
-}
-
-query_listener_owner() {
   local listener=''
   local pid=''
-
-  listener_query_state='unreadable'
-  listener_query_owner=''
-  if ! listener="$("${SS_BIN}" -H -ltnp 'sport = :6742' 2>/dev/null)"; then
-    return 1
-  fi
-  listener="$(/usr/bin/printf '%s\n' "${listener}" \
+  listener="$("${SS_BIN}" -H -ltnp 'sport = :6742' 2>/dev/null \
     | /usr/bin/awk '$4 == "127.0.0.1:6742" && index($0, "users:((\"openrgb\",pid=") {print}')"
-  if [[ -z "${listener}" ]]; then
-    listener_query_state='absent'
-    return 1
-  fi
-  if [[ "${listener}" == *$'\n'* ]]; then
-    return 1
-  fi
-
+  [[ -n "${listener}" && "${listener}" != *$'\n'* ]] || return 1
   pid="$(/usr/bin/printf '%s\n' "${listener}" \
     | /usr/bin/sed -nE 's/.*pid=([0-9]+).*/\1/p')"
-  if [[ -z "${pid}" ]]; then
-    return 1
-  fi
-
-  listener_query_state='present'
-  listener_query_owner="${pid}"
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  /usr/bin/printf '%s' "${pid}"
 }
 
 is_server_process() {
   local pid="${1:-}"
-  local start_time="${2:-}"
-
-  classify_server_process_identity "${pid}" "${start_time}"
+  local start="${2:-}"
+  same_process "${pid}" "${start}" \
+    && [[ "$(process_command "${pid}" 2>/dev/null || true)" == "$(expected_server_command)" ]] \
+    && [[ "$(/usr/bin/readlink -f "/proc/${pid}/exe" 2>/dev/null || true)" == "${OPENRGB_BIN}" ]] \
+    && [[ "$(process_uid "${pid}" 2>/dev/null || true)" == "${USER_ID}" ]]
 }
 
-is_server_listener() {
-  classify_server_listener_identity "$@"
+expected_inhibitor_command() {
+  /usr/bin/printf '%s' \
+    "${INHIBIT_BIN} --what=sleep --who=OpenRGB Presets Static --why=Stop the owned OpenRGB SDK before sleep --mode=delay ${SETPRIV_BIN} --pdeathsig TERM /usr/bin/sleep infinity"
 }
 
-classify_server_listener_identity() {
-  local pid="${1:-}"
-  local start_time="${2:-}"
-  local first_owner=''
-
-  listener_query_state='not-queried'
-  listener_query_owner=''
-  classify_server_process_identity "${pid}" "${start_time}" || return 1
-
-  if ! query_listener_owner; then
-    if [[ "${listener_query_state}" == absent ]]; then
-      server_identity_failure_stage='listener-absent'
-    else
-      server_identity_failure_stage='listener-query-unreadable'
-    fi
-    return 1
-  fi
-  first_owner="${listener_query_owner}"
-  if [[ "${first_owner}" != "${pid}" ]]; then
-    server_identity_failure_stage='listener-owner-unexpected'
-    return 1
-  fi
-
-  if ! classify_server_process_identity "${pid}" "${start_time}"; then
-    return 1
-  fi
-
-  if ! query_listener_owner \
-    || [[ "${listener_query_state}" != present ]] \
-    || [[ "${listener_query_owner}" != "${first_owner}" ]] \
-    || [[ "${listener_query_owner}" != "${pid}" ]]; then
-    server_identity_failure_stage='identity-changed-during-verification'
-    return 1
-  fi
+is_inhibitor() {
+  same_process "${inhibitor_pid}" "${inhibitor_start}" \
+    && [[ "$(process_command "${inhibitor_pid}" 2>/dev/null || true)" == "$(expected_inhibitor_command)" ]] \
+    && [[ "$(process_uid "${inhibitor_pid}" 2>/dev/null || true)" == "${USER_ID}" ]] \
+    && [[ "$(process_group "${inhibitor_pid}" 2>/dev/null || true)" == "${inhibitor_pid}" ]]
 }
 
-classify_server_process_identity() {
-  local pid="${1:-}"
-  local start_time="${2:-}"
-  local command=''
-  local expected_command=''
-  local expected_executable=''
-  local lifecycle_cgroup=''
-
-  server_identity_failure_stage=''
-  server_identity_observed_pid=''
-  server_identity_observed_start="$(process_start_time "${pid}" 2>/dev/null || true)"
-  server_identity_process_state="$(process_state "${pid}" 2>/dev/null || true)"
-  server_identity_command_state='not-observed'
-  server_identity_observed_command_sha256=''
-  server_identity_expected_command_sha256=''
-  server_identity_observed_command_argc=''
-  server_identity_expected_command_argc=''
-  server_identity_executable_state='not-observed'
-  server_identity_observed_executable=''
-  server_identity_observed_executable_sha256=''
-  server_identity_expected_executable_sha256=''
-  server_identity_ownership_state='not-observed'
-  server_identity_observed_uid=''
-  server_identity_observed_cgroup_sha256=''
-  if [[ -n "${server_identity_observed_start}" ]]; then
-    server_identity_observed_pid="${pid}"
-  fi
-
-  if [[ -z "${server_identity_observed_start}" ]]; then
-    server_identity_failure_stage='process-absent'
-    return 1
-  fi
-  if [[ "${server_identity_observed_start}" != "${start_time}" ]]; then
-    server_identity_failure_stage='process-start-mismatch'
-    return 1
-  fi
-  if [[ "${server_identity_process_state}" == Z ]]; then
-    server_identity_failure_stage='process-zombie'
-    return 1
-  fi
-
-  expected_command="$(expected_server_command)"
-  server_identity_expected_command_sha256="$(command_sha256 "${expected_command}")"
-  server_identity_expected_command_argc=$((${#OPENRGB_SERVER_ARGS[@]} + 1))
-  if [[ ! -r "${PROC_ROOT}/${pid}/cmdline" ]] \
-    || ! command="$(process_command "${pid}" 2>/dev/null)"; then
-    server_identity_command_state='unreadable'
-    server_identity_failure_stage='cmdline-unreadable'
-    return 1
-  fi
-  if [[ -z "${command}" ]]; then
-    server_identity_command_state='empty'
-    server_identity_failure_stage='cmdline-empty'
-    return 1
-  fi
-  server_identity_observed_command_sha256="$(command_sha256 "${command}")"
-  server_identity_observed_command_argc="$(process_command_argc "${pid}" 2>/dev/null || true)"
-  if [[ "${command}" != "${expected_command}" ]]; then
-    server_identity_command_state='mismatch'
-    server_identity_failure_stage='command-line-mismatch'
-    return 1
-  fi
-  server_identity_command_state='match'
-
-  expected_executable="$("${READLINK_BIN}" -f -- "${OPENRGB_BIN}" 2>/dev/null || true)"
-  server_identity_observed_executable="$(process_executable "${pid}" 2>/dev/null || true)"
-  if [[ -n "${expected_executable}" ]]; then
-    server_identity_expected_executable_sha256="$(command_sha256 "${expected_executable}")"
-  fi
-  if [[ -n "${server_identity_observed_executable}" ]]; then
-    server_identity_observed_executable_sha256="$(command_sha256 "${server_identity_observed_executable}")"
-  fi
-  if [[ -z "${expected_executable}" || -z "${server_identity_observed_executable}" ]]; then
-    server_identity_executable_state='unreadable'
-    server_identity_failure_stage='executable-unreadable'
-    return 1
-  fi
-  if [[ "${server_identity_observed_executable}" != "${expected_executable}" ]]; then
-    server_identity_executable_state='mismatch'
-    server_identity_failure_stage='executable-mismatch'
-    return 1
-  fi
-  server_identity_executable_state='match'
-
-  server_identity_observed_uid="$(process_uid "${pid}" 2>/dev/null || true)"
-  lifecycle_cgroup="$(process_cgroup $$ 2>/dev/null || true)"
-  command="$(process_cgroup "${pid}" 2>/dev/null || true)"
-  if [[ -z "${server_identity_observed_uid}" \
-    || -z "${lifecycle_cgroup}" || -z "${command}" ]]; then
-    server_identity_ownership_state='unreadable'
-    server_identity_failure_stage='ownership-unreadable'
-    return 1
-  fi
-  server_identity_observed_cgroup_sha256="$(command_sha256 "${command}")"
-  if [[ "${server_identity_observed_uid}" != "${USER_ID}" \
-    || "${command}" != "${lifecycle_cgroup}" ]]; then
-    server_identity_ownership_state='mismatch'
-    server_identity_failure_stage='ownership-mismatch'
-    return 1
-  fi
-  server_identity_ownership_state='match'
+expected_monitor_command() {
+  /usr/bin/printf '%s' \
+    "${GDBUS_BIN} monitor --system --dest org.freedesktop.login1 --object-path /org/freedesktop/login1"
 }
 
-record_shutdown_identity_refusal() {
-  local cleanup_stage="${1}"
-  local reason="${2}"
-  local boundary_reason="${reason}"
-  local -a command
-
-  if [[ "${reason}" == 'deliberate lifecycle shutdown' ]]; then
-    boundary_reason=deliberate
-  fi
-  command=(
-    "${SERVICE_GUARD}" mark stopping
-    --lifecycle-pid "$$"
-    --lifecycle-start "$(process_start_time $$)"
-    --server-pid "${server_pid}"
-    --server-start "${server_start_time}"
-    --reason "${boundary_reason}"
-    --cleanup-stage "${cleanup_stage}"
-    --identity-failure-stage "${server_identity_failure_stage}"
-    --listener-query-state "${listener_query_state}"
-    --process-state "${server_identity_process_state:-unavailable}"
-    --cmdline-state "${server_identity_command_state}"
-    --executable-state "${server_identity_executable_state}"
-    --ownership-state "${server_identity_ownership_state}"
-  )
-
-  if [[ -n "${server_identity_observed_pid}" ]]; then
-    command+=(--observed-server-pid "${server_identity_observed_pid}")
-  fi
-  if [[ -n "${server_identity_observed_start}" ]]; then
-    command+=(--observed-server-start "${server_identity_observed_start}")
-  fi
-  if [[ -n "${listener_query_owner}" ]]; then
-    command+=(--observed-listener-owner "${listener_query_owner}")
-  fi
-  if [[ -n "${server_identity_observed_command_sha256}" ]]; then
-    command+=(--observed-command-sha256 "${server_identity_observed_command_sha256}")
-  fi
-  if [[ -n "${server_identity_expected_command_sha256}" ]]; then
-    command+=(--expected-command-sha256 "${server_identity_expected_command_sha256}")
-  fi
-  if [[ -n "${server_identity_observed_command_argc}" ]]; then
-    command+=(--observed-command-argc "${server_identity_observed_command_argc}")
-  fi
-  if [[ -n "${server_identity_expected_command_argc}" ]]; then
-    command+=(--expected-command-argc "${server_identity_expected_command_argc}")
-  fi
-  if [[ -n "${server_identity_observed_executable_sha256}" ]]; then
-    command+=(--observed-executable-sha256 "${server_identity_observed_executable_sha256}")
-  fi
-  if [[ -n "${server_identity_expected_executable_sha256}" ]]; then
-    command+=(--expected-executable-sha256 "${server_identity_expected_executable_sha256}")
-  fi
-  if [[ -n "${server_identity_observed_uid}" ]]; then
-    command+=(--observed-uid "${server_identity_observed_uid}")
-  fi
-  if [[ -n "${server_identity_observed_cgroup_sha256}" ]]; then
-    command+=(--observed-cgroup-sha256 "${server_identity_observed_cgroup_sha256}")
-  fi
-  "${command[@]}" || true
-  log "OpenRGB SDK shutdown authentication refused: cleanup_stage=${cleanup_stage} failure_stage=${server_identity_failure_stage} expected_pid=${server_pid} expected_start=${server_start_time} observed_pid=${server_identity_observed_pid:-none} observed_start=${server_identity_observed_start:-none} process_state=${server_identity_process_state:-unavailable} cmdline_state=${server_identity_command_state} command_sha256=${server_identity_observed_command_sha256:-none} executable_state=${server_identity_executable_state} ownership_state=${server_identity_ownership_state} listener_state=${listener_query_state} listener_owner=${listener_query_owner:-none} reason=${reason}"
+is_monitor() {
+  same_process "${monitor_pid}" "${monitor_start}" \
+    && [[ "$(process_command "${monitor_pid}" 2>/dev/null || true)" == "$(expected_monitor_command)" ]] \
+    && [[ "$(process_uid "${monitor_pid}" 2>/dev/null || true)" == "${USER_ID}" ]]
 }
 
-find_existing_server() {
-  local pid=''
-  local start_time=''
-
-  pid="$(listener_owner_pid 2>/dev/null || true)"
-  [[ -n "${pid}" ]] || return 1
-  start_time="$(process_start_time "${pid}" 2>/dev/null || true)"
-  [[ -n "${start_time}" ]] || return 1
-  is_server_listener "${pid}" "${start_time}" || return 1
-
-  /usr/bin/printf '%s %s\n' "${pid}" "${start_time}"
+is_server_ready() {
+  is_server_process "${server_pid}" "${server_start}" \
+    && [[ "$(listener_owner_pid 2>/dev/null || true)" == "${server_pid}" ]]
 }
 
-clear_server_identity() {
-  server_pid=''
-  server_start_time=''
-  server_origin='none'
+acquire_lifecycle() {
+  /usr/bin/mkdir -p "${RUNTIME_DIR}"
+  exec {lifecycle_fd}>"${LIFECYCLE_LOCK}"
+  /usr/bin/flock --nonblock "${lifecycle_fd}"
+}
+
+close_lifecycle_for_child() {
+  if [[ "${lifecycle_fd}" =~ ^[0-9]+$ ]]; then
+    eval "exec ${lifecycle_fd}>&-"
+  fi
 }
 
 launch_server() {
   local attempt
-
+  if [[ -n "$(listener_owner_pid 2>/dev/null || true)" ]]; then
+    /usr/bin/printf '%s\n' 'Port 6742 already has an owner; refusing to launch another SDK.' >&2
+    return 1
+  fi
   (
-    close_lock_for_child
-    exec "${SETPRIV_BIN}" --pdeathsig TERM \
-      "${OPENRGB_BIN}" "${OPENRGB_SERVER_ARGS[@]}" >>"${SERVER_LOG_FILE}" 2>&1
+    close_lifecycle_for_child
+    exec "${OPENRGB_BIN}" "${SERVER_ARGS[@]}" >>"${SERVER_LOG}" 2>&1
   ) &
   server_pid=$!
-  server_start_time=''
-  server_origin='launched'
-
   for attempt in {1..20}; do
-    server_start_time="$(process_start_time "${server_pid}" 2>/dev/null || true)"
-    if [[ -n "${server_start_time}" ]]; then
-      log "OpenRGB server started as PID ${server_pid} (start ${server_start_time})"
+    server_start="$(process_start "${server_pid}" 2>/dev/null || true)"
+    [[ -n "${server_start}" ]] && break
+    /usr/bin/sleep 0.05
+  done
+  [[ -n "${server_start}" ]] || return 1
+  for attempt in {1..50}; do
+    if is_server_ready; then
+      log "OpenRGB SDK ready as PID ${server_pid}"
       return 0
     fi
-    "${SLEEP_BIN}" 0.05
+    is_server_process "${server_pid}" "${server_start}" || return 1
+    /usr/bin/sleep 0.1
   done
-
-  if is_running "${server_pid}"; then
-    log "Refusing to track OpenRGB PID ${server_pid} without a start-time identity"
-  fi
-  clear_server_identity
+  /usr/bin/printf '%s\n' 'OpenRGB SDK did not acquire its authenticated loopback listener.' >&2
   return 1
 }
 
-start_restore() {
-  local lifecycle_start=''
-
-  lifecycle_start="$(process_start_time $$)"
-  if ! "${RAM_TETRIS}" validate-hardware \
-    --server-pid "${server_pid}" \
-    --server-start "${server_start_time}" \
-    --lifecycle-pid "$$" \
-    --lifecycle-start "${lifecycle_start}" >/dev/null; then
-    /usr/bin/printf '%s\n' 'Pre-restore hardware health validation failed; refusing preset write' >&2
-    return 1
-  fi
-  (
-    close_lock_for_child
-    export OPENRGB_LIFECYCLE_PID="$$"
-    export OPENRGB_LIFECYCLE_START="${lifecycle_start}"
-    export OPENRGB_SERVER_PID="${server_pid}"
-    export OPENRGB_SERVER_START="${server_start_time}"
-    exec "${SETPRIV_BIN}" --pdeathsig TERM \
-      "${TIMEOUT_BIN}" --signal=TERM --kill-after=2s "${RESTORE_TIMEOUT}" \
-      "${APPLY_PRESET}" --restore
-  ) &
-  restore_pid=$!
-  restore_start_time="$(process_start_time "${restore_pid}" 2>/dev/null || true)"
-}
-
-start_server() {
-  local existing_pid=''
-  local existing_start_time=''
-
-  if is_server_listener "${server_pid}" "${server_start_time}"; then
-    return 0
-  fi
-
-  if is_server_process "${server_pid}" "${server_start_time}"; then
-    log "Refusing to replace tracked OpenRGB PID ${server_pid}: listener ownership is not verified"
-    return 1
-  fi
-  clear_server_identity
-
-  if read -r existing_pid existing_start_time < <(find_existing_server); then
-    server_pid="${existing_pid}"
-    server_start_time="${existing_start_time}"
-    server_origin='adopted'
-    log "Reusing OpenRGB SDK server PID ${server_pid} (start ${server_start_time})"
-  else
-    launch_server
-  fi
-
-  start_restore
-}
-
-detach_server() {
-  stop_restore
-  if is_server_process "${server_pid}" "${server_start_time}"; then
-    log "Leaving ${server_origin} OpenRGB SDK server PID ${server_pid} running for lifecycle handoff"
-  fi
-  clear_server_identity
-}
-
 stop_server() {
-  local reason="${1:-deliberate shutdown}"
-  local listener_owner=''
-  local observed_state=''
-
-  stop_restore || return 1
+  local attempt
   if [[ -z "${server_pid}" ]]; then
-    clear_server_identity
     return 0
   fi
-
-  observed_state="$(process_state "${server_pid}" 2>/dev/null || true)"
-  if ! is_same_process "${server_pid}" "${server_start_time}" \
-    || [[ "${observed_state}" == Z ]]; then
-    classify_server_process_identity "${server_pid}" "${server_start_time}" || true
-    if query_listener_owner || [[ "${listener_query_state}" != absent ]]; then
-      record_shutdown_identity_refusal sdk-term-authentication "${reason}"
-      return 1
-    fi
-    if [[ "${observed_state}" == Z ]]; then
+  if ! same_process "${server_pid}" "${server_start}"; then
+    server_pid=''
+    server_start=''
+    return 0
+  fi
+  if ! is_server_process "${server_pid}" "${server_start}"; then
+    /usr/bin/printf '%s\n' 'Tracked SDK identity changed; refusing to signal it.' >&2
+    return 1
+  fi
+  kill -TERM "${server_pid}"
+  for attempt in {1..20}; do
+    if ! same_process "${server_pid}" "${server_start}"; then
       wait "${server_pid}" 2>/dev/null || true
+      server_pid=''
+      server_start=''
+      log 'OpenRGB SDK stopped'
+      return 0
     fi
-    log "Tracked OpenRGB PID ${server_pid} requires no signal: failure_stage=${server_identity_failure_stage} observed_start=${server_identity_observed_start:-none} listener_state=absent"
-    clear_server_identity
-    return 0
-  fi
-  if ! is_server_listener "${server_pid}" "${server_start_time}"; then
-    record_shutdown_identity_refusal sdk-term-authentication "${reason}"
+    /usr/bin/sleep 0.1
+  done
+  is_server_process "${server_pid}" "${server_start}" || {
+    /usr/bin/printf '%s\n' 'SDK identity changed before escalation; refusing SIGKILL.' >&2
     return 1
-  fi
-  log "OpenRGB SDK shutdown authentication succeeded: pid=${server_pid} start=${server_start_time} process_state=${server_identity_process_state} cmdline_state=${server_identity_command_state} command_sha256=${server_identity_observed_command_sha256} executable_state=${server_identity_executable_state} ownership_state=${server_identity_ownership_state} listener_state=${listener_query_state}"
+  }
+  kill -KILL "${server_pid}"
+  wait "${server_pid}" 2>/dev/null || true
+  server_pid=''
+  server_start=''
+  log 'OpenRGB SDK required bounded SIGKILL'
+}
 
-  kill -TERM "${server_pid}" 2>/dev/null || true
-  if wait_for_process_exit "${server_pid}" "${server_start_time}" 20 0.1; then
-    listener_owner="$(listener_owner_pid 2>/dev/null || true)"
-    if [[ -n "${listener_owner}" ]]; then
-      log "OpenRGB SDK PID ${server_pid} exited but listener 127.0.0.1:6742 remained owned by PID ${listener_owner}"
-      return 1
-    fi
-    log "OpenRGB server stopped for ${reason}"
-    clear_server_identity
-    return 0
+restore_preset() {
+  local mode="${1:-full}"
+  local argument='--restore'
+  if [[ "${mode}" == 'non-ram' ]]; then
+    argument='--restore-non-ram'
   fi
-
-  if ! is_server_listener "${server_pid}" "${server_start_time}"; then
-    record_shutdown_identity_refusal sdk-kill-authentication "${reason}"
-    return 1
-  fi
-  kill -KILL "${server_pid}" 2>/dev/null || true
-  if ! wait_for_process_exit "${server_pid}" "${server_start_time}" 20 0.1; then
-    log "OpenRGB server did not exit before the lifecycle shutdown deadline"
-    return 1
-  fi
-  listener_owner="$(listener_owner_pid 2>/dev/null || true)"
-  if [[ -n "${listener_owner}" ]]; then
-    log "OpenRGB SDK PID ${server_pid} exited after SIGKILL but listener 127.0.0.1:6742 remained owned by PID ${listener_owner}"
-    return 1
-  fi
-  log "OpenRGB server required SIGKILL for ${reason}"
-  clear_server_identity
+  "${TIMEOUT_BIN}" --signal=TERM --kill-after=2s "${RESTORE_TIMEOUT}" \
+    "${APPLY_PRESET}" "${argument}"
 }
 
 start_inhibitor() {
   local attempt
-
-  if is_owned_current_inhibitor "${inhibitor_pid}" "${inhibitor_start_time}"; then
-    return 0
-  fi
-
-  inhibitor_pid=''
-  inhibitor_start_time=''
-
   (
-    close_lock_for_child
+    close_lifecycle_for_child
     exec "${SETPRIV_BIN}" --pdeathsig TERM "${SETSID_BIN}" "${INHIBIT_BIN}" \
       --what=sleep \
-      --who='OpenRGB Presets' \
-      --why='Stop OpenRGB before system sleep' \
+      --who='OpenRGB Presets Static' \
+      --why='Stop the owned OpenRGB SDK before sleep' \
       --mode=delay \
-      "${SETPRIV_BIN}" --pdeathsig TERM "${SLEEP_BIN}" infinity
+      "${SETPRIV_BIN}" --pdeathsig TERM /usr/bin/sleep infinity
   ) &
   inhibitor_pid=$!
-  inhibitor_start_time="$(process_start_time "${inhibitor_pid}")"
+  inhibitor_start="$(process_start "${inhibitor_pid}")"
   for attempt in {1..20}; do
-    if is_owned_current_inhibitor "${inhibitor_pid}" "${inhibitor_start_time}"; then
-      log "Sleep delay inhibitor started as process group ${inhibitor_pid}"
-      return 0
-    fi
-    if ! is_same_process "${inhibitor_pid}" "${inhibitor_start_time}"; then
-      break
-    fi
-    "${SLEEP_BIN}" 0.05
+    is_inhibitor && return 0
+    same_process "${inhibitor_pid}" "${inhibitor_start}" || break
+    /usr/bin/sleep 0.05
   done
-
-  if is_same_process "${inhibitor_pid}" "${inhibitor_start_time}"; then
-    stop_process "${inhibitor_pid}" "${inhibitor_start_time}" "Unrecognized inhibitor"
-  else
-    wait "${inhibitor_pid}" 2>/dev/null || true
-  fi
-  inhibitor_pid=''
-  inhibitor_start_time=''
-  /usr/bin/printf '%s\n' 'Sleep delay inhibitor failed to start with the expected identity' >&2
+  /usr/bin/printf '%s\n' 'Sleep inhibitor failed exact identity validation.' >&2
   return 1
 }
 
 release_inhibitor() {
-  if ! is_owned_current_inhibitor "${inhibitor_pid}" "${inhibitor_start_time}"; then
-    if is_same_process "${inhibitor_pid}" "${inhibitor_start_time}"; then
-      log "Refusing to signal unrecognized inhibitor PID ${inhibitor_pid}"
-    fi
-    inhibitor_pid=''
-    inhibitor_start_time=''
-    return 0
-  fi
-
-  if is_owned_current_inhibitor "${inhibitor_pid}" "${inhibitor_start_time}"; then
+  if is_inhibitor; then
     kill -TERM -- "-${inhibitor_pid}" 2>/dev/null || true
-    if ! wait_for_process_exit "${inhibitor_pid}" "${inhibitor_start_time}" 20 0.1; then
-      if is_owned_current_inhibitor "${inhibitor_pid}" "${inhibitor_start_time}"; then
-        kill -KILL -- "-${inhibitor_pid}" 2>/dev/null || true
-      fi
-      if ! wait_for_process_exit "${inhibitor_pid}" "${inhibitor_start_time}" 20 0.1; then
-        log "Sleep delay inhibitor did not exit before the lifecycle shutdown deadline"
-        return 1
-      fi
-    fi
-  else
-    log "Refusing to signal changed inhibitor PID ${inhibitor_pid}"
+    wait "${inhibitor_pid}" 2>/dev/null || true
+  elif same_process "${inhibitor_pid}" "${inhibitor_start}"; then
+    /usr/bin/printf '%s\n' 'Inhibitor identity changed; refusing to signal it.' >&2
   fi
-  log "Sleep delay inhibitor released"
   inhibitor_pid=''
-  inhibitor_start_time=''
+  inhibitor_start=''
 }
 
 start_monitor() {
+  local attempt
   coproc SLEEP_MONITOR {
-    close_lock_for_child
-    exec "${SETPRIV_BIN}" --pdeathsig TERM "${STDBUF_BIN}" -oL \
-      "${GDBUS_BIN}" monitor \
-      --system \
+    close_lifecycle_for_child
+    exec "${SETPRIV_BIN}" --pdeathsig TERM /usr/bin/stdbuf -oL \
+      "${GDBUS_BIN}" monitor --system \
       --dest org.freedesktop.login1 \
       --object-path /org/freedesktop/login1
   }
   monitor_pid="${SLEEP_MONITOR_PID}"
-  monitor_start_time="$(process_start_time "${monitor_pid}")"
+  monitor_start="$(process_start "${monitor_pid}")"
   monitor_fd="${SLEEP_MONITOR[0]}"
-  log "logind sleep monitor started as PID ${monitor_pid}"
+  for attempt in {1..20}; do
+    is_monitor && return 0
+    same_process "${monitor_pid}" "${monitor_start}" || break
+    /usr/bin/sleep 0.05
+  done
+  /usr/bin/printf '%s\n' 'logind monitor failed exact identity validation.' >&2
+  return 1
 }
 
 stop_monitor() {
-  if is_same_process "${monitor_pid}" "${monitor_start_time}"; then
-    stop_process "${monitor_pid}" "${monitor_start_time}" "logind sleep monitor" || return 1
+  if is_monitor; then
+    kill -TERM "${monitor_pid}" 2>/dev/null || true
+    wait "${monitor_pid}" 2>/dev/null || true
+  elif same_process "${monitor_pid}" "${monitor_start}"; then
+    /usr/bin/printf '%s\n' 'Monitor identity changed; refusing to signal it.' >&2
   fi
   monitor_pid=''
-  monitor_start_time=''
+  monitor_start=''
   monitor_fd=''
 }
 
-handle_sleep_signal() {
-  local sleeping="${1}"
+prepare_sleep() {
+  [[ "${suspended}" == false ]] || return 0
+  suspended=true
+  stop_server
+  release_inhibitor
+}
 
-  if [[ "${sleeping}" == true ]]; then
-    if [[ "${suspended}" == true ]]; then
-      return 0
-    fi
-    suspended=true
-    log "PrepareForSleep(true): stopping OpenRGB"
-    if ! stop_tetris suspend \
-      || ! stop_preset_operation \
-      || ! verify_hardware_clients_quiesced; then
-      /usr/bin/printf '%s\n' 'RAM Tetris could not be stopped safely before sleep' >&2
-      /usr/bin/printf '%s\n' 'OpenRGB SDK teardown skipped because RAM Tetris still owns shutdown state' >&2
-    elif ! stop_server 'suspend'; then
-      /usr/bin/printf '%s\n' 'OpenRGB could not be stopped safely before sleep' >&2
-    fi
-    release_inhibitor
-    return 0
-  fi
-
-  if [[ "${suspended}" == false ]]; then
-    return 0
-  fi
+resume_from_sleep() {
+  [[ "${suspended}" == true ]] || return 0
   suspended=false
-  log "PrepareForSleep(false): scheduling OpenRGB restart"
   start_inhibitor
-  "${SLEEP_BIN}" "${RESUME_DELAY}"
-  start_server
-}
-
-validate_service_health() {
-  local lifecycle_start=''
-
-  [[ "${service_mode}" == true ]] || return 0
-  lifecycle_start="$(process_start_time $$)"
-  is_server_listener "${server_pid}" "${server_start_time}" || return 1
-  is_owned_current_inhibitor "${inhibitor_pid}" "${inhibitor_start_time}" || return 1
-  is_same_process "${monitor_pid}" "${monitor_start_time}" || return 1
-  "${RAM_TETRIS}" validate-health \
-    --server-pid "${server_pid}" \
-    --server-start "${server_start_time}" \
-    --lifecycle-pid "$$" \
-    --lifecycle-start "${lifecycle_start}" >/dev/null
-}
-
-notify_service_ready() {
-  [[ "${service_mode}" == true ]] || return 0
-  validate_service_health || return 1
-  if tetris_preference_enabled \
-    && [[ "$(tetris_selected_preset)" != black ]] \
-    && [[ ! -e "${TETRIS_FAILURE_FILE}" ]]; then
-    is_tetris_process "${tetris_pid}" "${tetris_start_time}" || return 1
-  elif [[ -n "${tetris_pid}" ]]; then
-    return 1
-  fi
-  mark_service_state ready 'independent lifecycle health validation complete'
-  "${SYSTEMD_NOTIFY_BIN}" --ready \
-    --status="OpenRGB lifecycle ready: SDK ${server_pid}/${server_start_time}"
-  service_ready=true
+  /usr/bin/sleep "${RESUME_DELAY}"
+  launch_server
+  restore_preset non-ram
 }
 
 cleanup() {
-  local mode="${1:-handoff}"
-  local tetris_reason='handoff'
-  local failed=false
-  local tetris_quiesced=true
-
-  if [[ "${shutting_down}" == true ]]; then
-    return 0
-  fi
-  shutting_down=true
-  begin_shutdown_deadline
-  if [[ "${mode}" == deliberate ]]; then
-    tetris_reason='shutdown'
-  fi
-  mark_service_state stopping "${mode}" || failed=true
-  notify_service_status "Stopping OpenRGB lifecycle (${mode})" || true
-
-  if ! stop_tetris "${tetris_reason}"; then
-    failed=true
-    tetris_quiesced=false
-  fi
-  stop_restore || {
-    failed=true
-    tetris_quiesced=false
-  }
-  if ! stop_preset_operation; then
-    failed=true
-    tetris_quiesced=false
-  fi
-  if ! verify_hardware_clients_quiesced; then
-    failed=true
-    tetris_quiesced=false
-  fi
-
-  case "${mode}" in
-    handoff)
-      if [[ "${tetris_quiesced}" == true ]]; then
-        detach_server || failed=true
-      fi
-      ;;
-    deliberate)
-      if [[ "${tetris_quiesced}" == true ]]; then
-        stop_server 'deliberate lifecycle shutdown' || failed=true
-      else
-        log 'OpenRGB SDK teardown skipped because RAM Tetris did not quiesce'
-      fi
-      ;;
-    *)
-      /usr/bin/printf 'Unknown cleanup mode: %s\n' "${mode}" >&2
-      return 64
-      ;;
-  esac
-  release_inhibitor || failed=true
-  stop_monitor || failed=true
-  if [[ "${failed}" == true ]]; then
-    return 1
-  fi
-  mark_service_state clean-stopped "${mode}"
+  local result=0
+  [[ "${cleaning}" == false ]] || return 0
+  cleaning=true
+  stop_server || result=1
+  release_inhibitor
+  stop_monitor
+  return "${result}"
 }
 
 request_shutdown() {
-  local mode='handoff'
-
-  if [[ "${service_mode}" == true ]]; then
-    mode='deliberate'
-  fi
-  if cleanup "${mode}"; then
-    exit 0
-  fi
-  exit 1
-}
-
-request_handoff() {
-  if cleanup handoff; then
-    exit 0
-  fi
-  exit 1
-}
-
-exit_cleanup() {
-  local exit_status=$?
-  local mode='handoff'
-
-  trap - EXIT
-  if [[ "${service_mode}" == true ]]; then
-    mode='deliberate'
-  fi
-  if ! cleanup "${mode}"; then
-    exit_status=1
-  fi
-  exit "${exit_status}"
+  cleanup
+  exit $?
 }
 
 check_dependencies() {
   local dependency
-  local failed=false
-
   for dependency in \
-    "${OPENRGB_BIN}" "${GDBUS_BIN}" "${STDBUF_BIN}" "${INHIBIT_BIN}" \
-    "${SETSID_BIN}" "${SETPRIV_BIN}" "${SS_BIN}" "${PS_BIN}" "${TIMEOUT_BIN}" \
-    "${SLEEP_BIN}" "${CAT_BIN}" "${FLOCK_BIN}" "${MKDIR_BIN}" "${MV_BIN}" \
-      "${TR_BIN}" "${APPLY_PRESET}" "${SERVICE_GUARD}" "${SYSTEMD_NOTIFY_BIN}"; do
-    if [[ ! -x "${dependency}" ]]; then
+    "${OPENRGB_BIN}" "${GDBUS_BIN}" "${INHIBIT_BIN}" "${SETPRIV_BIN}" \
+    "${SETSID_BIN}" "${SS_BIN}" "${TIMEOUT_BIN}" "${APPLY_PRESET}"; do
+    [[ -x "${dependency}" ]] || {
       /usr/bin/printf 'Missing executable: %s\n' "${dependency}" >&2
-      failed=true
-    fi
+      return 69
+    }
   done
-
-  if [[ ! -x "${RAM_TETRIS}" ]]; then
-    /usr/bin/printf 'Missing executable: %s\n' "${RAM_TETRIS}" >&2
-    failed=true
-  fi
-
-  if [[ "${failed}" == true ]]; then
-    return 69
-  fi
-  log 'OpenRGB lifecycle dependencies: ready'
 }
 
 main() {
-  if [[ "${1:-}" == '--classify-legacy-monitor' ]]; then
-    if [[ "${#}" -ne 7 ]]; then
-      /usr/bin/printf '%s\n' \
-        'Usage: openrgb-lifecycle --classify-legacy-monitor PID START_TIME ACTIVE_PID ACTIVE_START_TIME INHIBITOR_PID INHIBITOR_START_TIME' >&2
-      return 64
-    fi
-    classify_legacy_monitor "${2}" "${3}" "${4}" "${5}" "${6}" "${7}"
-    return
-  fi
-  if [[ "${1:-}" == '--classify-legacy-inhibitor' ]]; then
-    if [[ "${#}" -ne 5 ]]; then
-      /usr/bin/printf '%s\n' \
-        'Usage: openrgb-lifecycle --classify-legacy-inhibitor PID START_TIME ACTIVE_PID ACTIVE_START_TIME' >&2
-      return 64
-    fi
-    classify_legacy_inhibitor "${2}" "${3}" "${4}" "${5}"
-    return
-  fi
-  if [[ "${1:-}" == '--check' ]]; then
+  local line=''
+  umask 077
+  if [[ "${1:-}" == '--check' && "${#}" -eq 1 ]]; then
     check_dependencies
     return 0
   fi
-  if [[ "${1:-}" == '--service' && "${#}" -eq 1 ]]; then
-    service_mode=true
-  elif [[ "${#}" -ne 0 ]]; then
-    /usr/bin/printf '%s\n' 'Usage: openrgb-lifecycle [--check|--service]' >&2
+  [[ "${#}" -eq 0 ]] || {
+    /usr/bin/printf '%s\n' 'Usage: openrgb-lifecycle [--check]' >&2
     return 64
-  elif [[ "${#}" -eq 0 ]]; then
-    /usr/bin/printf '%s\n' 'Direct startup refused; use the supervised user service' >&2
-    return 64
-  fi
-
-  check_dependencies >/dev/null
-  if ! acquire_lifecycle_lock; then
-    log 'Another OpenRGB lifecycle owns the runtime lock; retrying through the service supervisor'
+  }
+  check_dependencies
+  acquire_lifecycle || {
+    /usr/bin/printf '%s\n' 'Another static OpenRGB lifecycle owns the lock.' >&2
     return 75
-  fi
-  trap exit_cleanup EXIT
+  }
+  trap cleanup EXIT
   trap request_shutdown INT TERM HUP
-  trap request_handoff USR1
-  mark_service_state starting 'acquired lifecycle singleton'
-  notify_service_status 'Starting OpenRGB lifecycle'
-
   start_inhibitor
-  start_server
-
+  launch_server
+  restore_preset
   start_monitor
-
   while true; do
     line=''
     if IFS= read -r -t 1 line <&"${monitor_fd}"; then
       case "${line}" in
-        *'org.freedesktop.login1.Manager.PrepareForSleep (true,)'*)
-          handle_sleep_signal true
-          ;;
-        *'org.freedesktop.login1.Manager.PrepareForSleep (false,)'*)
-          handle_sleep_signal false
-          ;;
+        *'org.freedesktop.login1.Manager.PrepareForSleep (true,)'*) prepare_sleep ;;
+        *'org.freedesktop.login1.Manager.PrepareForSleep (false,)'*) resume_from_sleep ;;
       esac
-    elif ! is_running "${monitor_pid}"; then
-      /usr/bin/printf '%s\n' 'logind sleep monitor exited unexpectedly' >&2
+    elif ! is_monitor; then
+      /usr/bin/printf '%s\n' 'logind sleep monitor exited.' >&2
       return 1
     fi
-
-    if [[ -n "${restore_pid}" ]] && ! is_running "${restore_pid}"; then
-      if wait "${restore_pid}"; then
-        restore_pid=''
-        restore_start_time=''
-        if ! reconcile_tetris; then
-          /usr/bin/printf '%s\n' 'RAM Tetris reconciliation failed during lifecycle startup' >&2
-          return 1
-        fi
-        if ! notify_service_ready; then
-          /usr/bin/printf '%s\n' 'Independent lifecycle health validation failed' >&2
-          return 1
-        fi
-      else
-        "${RAM_TETRIS}" fail 'Saved preset restoration failed; RAM Tetris was not started' >/dev/null 2>&1 || true
-        return 1
-      fi
-      restore_pid=''
-      restore_start_time=''
-    fi
-
-    if [[ "${suspended}" == false ]]; then
-      reconcile_tetris || true
-    fi
-
-    if [[ "${suspended}" == false ]] \
-      && ! is_owned_current_inhibitor "${inhibitor_pid}" "${inhibitor_start_time}"; then
-      /usr/bin/printf '%s\n' 'Sleep delay inhibitor exited unexpectedly; refusing automatic recovery' >&2
-      return 1
-    fi
-
-    if [[ "${suspended}" == false ]] \
-      && ! is_server_listener "${server_pid}" "${server_start_time}"; then
-      /usr/bin/printf '%s\n' 'OpenRGB server identity changed unexpectedly; refusing automatic replacement' >&2
+    if [[ "${suspended}" == false ]] && ! is_server_process "${server_pid}" "${server_start}"; then
+      /usr/bin/printf '%s\n' 'Owned OpenRGB SDK exited; refusing automatic restart.' >&2
       return 1
     fi
   done

@@ -1,0 +1,41 @@
+#!/usr/bin/bash
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+readonly UNIT_NAME="omarchy-plus-openrgb-presets.service"
+readonly SCRIPT_DIR="$(/usr/bin/readlink -f "$(/usr/bin/dirname "${BASH_SOURCE[0]}")")"
+readonly SOURCE_UNIT="${SCRIPT_DIR}/systemd/${UNIT_NAME}"
+readonly TARGET_UNIT="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user/${UNIT_NAME}"
+
+usage() {
+  /usr/bin/printf '%s\n' \
+    'Usage: reconcile-static-service install' \
+    '       reconcile-static-service check'
+}
+
+main() {
+  [[ "${#}" -eq 1 ]] || { usage >&2; return 64; }
+  [[ -f "${SOURCE_UNIT}" && ! -L "${SOURCE_UNIT}" ]] || {
+    /usr/bin/printf 'Static service source is missing or unsafe: %s\n' "${SOURCE_UNIT}" >&2
+    return 69
+  }
+  case "${1}" in
+    install)
+      /usr/bin/install -D -m 0644 -- "${SOURCE_UNIT}" "${TARGET_UNIT}"
+      /usr/bin/systemctl --user daemon-reload
+      /usr/bin/systemctl --user enable "${UNIT_NAME}"
+      ;;
+    check)
+      /usr/bin/cmp --silent -- "${SOURCE_UNIT}" "${TARGET_UNIT}" || {
+        /usr/bin/printf '%s\n' 'Installed static service unit differs from source.' >&2
+        return 1
+      }
+      /usr/bin/systemctl --user is-enabled --quiet "${UNIT_NAME}"
+      ;;
+    *) usage >&2; return 64 ;;
+  esac
+}
+
+main "$@"
