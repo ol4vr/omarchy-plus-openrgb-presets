@@ -679,6 +679,30 @@ existing double preflight, Tetris-OFF, single-start, acceptance, evidence, and
 bounded-cleanup contracts can run. No incident reference, latch hash, or boot
 identity grants eligibility.
 
+Version 0.4.45 restores the single-refresh checkpoint-expiration correction at
+the final Stage 2 mutation-admission boundary. Stage 2 moved the complete
+health checkpoint ahead of `hardware-operation.lock` and added a second
+freshness check after acquiring that lock; the v0.4.31 handler surrounded only
+the earlier check, so an otherwise healthy checkpoint that crossed 250 ms
+while waiting for final admission failed without using its one allowed
+refresh. The writer now treats `checkpoint-expired` from either pre-admission
+or final admission identically: it releases the hardware lock, performs at
+most one complete health checkpoint, and then repeats the stop, latch,
+ownership, SDK, controller, preset, preference, and freshness gates before
+reacquiring the lock for one mutation. A failed refresh, changed safety state,
+or second expiry fails closed without a write. Hardware failures and lock
+timeouts are never retried. The 250 ms freshness requirement, two-second
+checkpoint deadline, frame schedule, and write-rate limits are unchanged.
+
+The reusable corrected-software-interruption classifier recognizes this
+failure only through the exact reviewed Stage 2 source revision, source path,
+source checksum, and complete `checkpoint-expired` evidence schema. It also
+requires a clean checkout containing the exact v0.4.45 correction before
+qualification. The legacy v0.4.30 source-provenance family remains supported;
+hardware, kernel, SDK, ownership, Effects, malformed, and unknown failures
+remain ineligible. No incident reference, latch checksum, or boot identity is
+allowlisted, and qualification does not authorize live latch clearance.
+
 Human-facing colors in this documentation use `#RRGGBB`. Effects Plugin
 `UserColors` store OpenRGB `RGBColor` integers in packed `0x00BBGGRR` order.
 The experimental orange, blue, and red Sunrise gradients are therefore stored
@@ -1275,6 +1299,16 @@ the legacy ambiguous refusal and therefore cannot itself restore the service.
 If a guarded recovery start occurred, use only its persisted completed or
 bounded-cleanup disposition before considering rollback; do not start, stop,
 or retry the service as part of source rollback.
+
+## Roll back the 0.4.45 checkpoint-admission correction
+
+Redeploy exact published v0.4.44 commit only through a separately reviewed
+stopped-service deployment. This restores the demonstrated Stage 2 final-gate
+expiration defect and removes recovery eligibility for incidents produced by
+that defect, so it is not a restoration procedure. Preserve the raw latch,
+boundary, source provenance, journals, current preset, and Tetris preference.
+Rollback does not authorize a service operation, latch clearance, recovery,
+preset mutation, or RGB write.
 
 ## Remove
 

@@ -35,7 +35,7 @@ core = importlib.import_module("ram_tetris_core")
 
 HOST = "127.0.0.1"
 PORT = 6742
-SOURCE_VERSION = "0.4.41"
+SOURCE_VERSION = "0.4.45"
 SOURCE_PATH = "ram-tetris"
 EXPECTED_CONTROLLER_COUNT = 7
 HARDWARE_GATE_ATTEMPTS = 15
@@ -1365,14 +1365,59 @@ class TetrisWriter:
             return False
         self._lightweight_gate(require_fresh_checkpoint=False)
         checkpoint, refreshed = self._ensure_health_checkpoint()
-        if self._validated_stop_request() is not None:
-            return False
-        try:
-            self._lightweight_gate(require_fresh_checkpoint=True)
-        except SafetyStop as error:
-            if refreshed or error.evidence.get("failure_kind") != "checkpoint-expired":
-                raise
-            trigger_age = error.evidence.get("checkpoint_age_ms")
+        refresh_attempts = 0
+        refresh_trigger_age: object | None = None
+        while True:
+            if self._validated_stop_request() is not None:
+                return False
+            expiration: SafetyStop | None = None
+            try:
+                self._lightweight_gate(require_fresh_checkpoint=True)
+            except SafetyStop as error:
+                if error.evidence.get("failure_kind") != "checkpoint-expired":
+                    raise
+                expiration = error
+
+            if expiration is None:
+                # Full health work never owns this lock. Only final admission
+                # plus the SDK mutation is serialized.
+                with self._hardware_operation():
+                    if self._validated_stop_request() is not None:
+                        return False
+                    try:
+                        self._lightweight_gate(require_fresh_checkpoint=True)
+                    except SafetyStop as error:
+                        if (
+                            error.evidence.get("failure_kind")
+                            != "checkpoint-expired"
+                        ):
+                            raise
+                        expiration = error
+                    if expiration is None:
+                        if colors == self.expected[identity]:
+                            raise SafetyStop("scheduler produced a redundant frame")
+                        self.sdk.update_leds(
+                            checkpoint.controllers[identity].index, colors
+                        )
+                if expiration is None:
+                    break
+
+            if refresh_attempts == 1:
+                self.checkpoint_failed = True
+                raise SafetyStop(
+                    str(expiration),
+                    evidence={
+                        **expiration.evidence,
+                        "checkpoint_refresh_attempts": 1,
+                        "checkpoint_refresh_result": "refreshed-checkpoint-expired",
+                        "checkpoint_refresh_trigger_age_ms": refresh_trigger_age,
+                        "refreshed_checkpoint_age_ms": expiration.evidence.get(
+                            "checkpoint_age_ms"
+                        ),
+                    },
+                ) from expiration
+
+            refresh_trigger_age = expiration.evidence.get("checkpoint_age_ms")
             try:
                 checkpoint = self._full_health_checkpoint()
             except SafetyStop as refresh_error:
@@ -1382,39 +1427,11 @@ class TetrisWriter:
                         **refresh_error.evidence,
                         "checkpoint_refresh_attempts": 1,
                         "checkpoint_refresh_result": "health-check-failed",
-                        "checkpoint_refresh_trigger_age_ms": trigger_age,
+                        "checkpoint_refresh_trigger_age_ms": refresh_trigger_age,
                     },
                 ) from refresh_error
             refreshed = True
-            if self._validated_stop_request() is not None:
-                return False
-            try:
-                self._lightweight_gate(require_fresh_checkpoint=True)
-            except SafetyStop as refresh_error:
-                result = "post-refresh-gate-failed"
-                evidence = {
-                    **refresh_error.evidence,
-                    "checkpoint_refresh_attempts": 1,
-                    "checkpoint_refresh_trigger_age_ms": trigger_age,
-                }
-                if refresh_error.evidence.get("failure_kind") == "checkpoint-expired":
-                    self.checkpoint_failed = True
-                    result = "refreshed-checkpoint-expired"
-                    evidence["refreshed_checkpoint_age_ms"] = (
-                        refresh_error.evidence.get("checkpoint_age_ms")
-                    )
-                evidence["checkpoint_refresh_result"] = result
-                raise SafetyStop(str(refresh_error), evidence=evidence) from refresh_error
-
-        # The health/SPD/journal/controller/Effects work above never owns this
-        # lock.  Only final qualification plus the SDK mutation is serialized.
-        with self._hardware_operation():
-            if self._validated_stop_request() is not None:
-                return False
-            self._lightweight_gate(require_fresh_checkpoint=True)
-            if colors == self.expected[identity]:
-                raise SafetyStop("scheduler produced a redundant frame")
-            self.sdk.update_leds(checkpoint.controllers[identity].index, colors)
+            refresh_attempts = 1
         now = time.monotonic()
         self.last_global_write = now
         self.last_dimm_write[identity] = now

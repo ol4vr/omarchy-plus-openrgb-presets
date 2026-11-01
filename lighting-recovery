@@ -130,6 +130,34 @@ CORRECTED_CHECKPOINT_SOURCE_SHA256: Final = (
 CORRECTED_CHECKPOINT_MINIMUM_REVISION: Final = (
     "b20e8ac456c11e2d0389dbc1a596956b51aab6ae"
 )
+STAGE2_CHECKPOINT_SOURCE_REVISION: Final = (
+    "aaaf63b49f5bb259923f5af984e60d3255c3a134"
+)
+STAGE2_CHECKPOINT_SOURCE_SHA256: Final = (
+    "9962b1bf8ef932ab2b8efae99ead191692cf3976b65d1e1f801d107dd9b2e66c"
+)
+STAGE2_CHECKPOINT_SOURCE_VERSION: Final = "0.4.41"
+CHECKPOINT_ADMISSION_CORRECTED_VERSION: Final = "0.4.45"
+CHECKPOINT_ADMISSION_CORRECTED_RAM_TETRIS_SHA256: Final = (
+    "0cf652a4ca23db5a36ee96b38ae474e2affe2fc73f5c1af3b8d3558aa99ece49"
+)
+CHECKPOINT_ADMISSION_MINIMUM_REVISION: Final = STAGE2_CHECKPOINT_SOURCE_REVISION
+CORRECTED_CHECKPOINT_SOURCE_PROVENANCE: Final = frozenset(
+    {
+        (
+            CORRECTED_CHECKPOINT_SOURCE_REVISION,
+            CORRECTED_CHECKPOINT_SOURCE_PATH,
+            CORRECTED_CHECKPOINT_SOURCE_SHA256,
+            "0.4.30",
+        ),
+        (
+            STAGE2_CHECKPOINT_SOURCE_REVISION,
+            CORRECTED_CHECKPOINT_SOURCE_PATH,
+            STAGE2_CHECKPOINT_SOURCE_SHA256,
+            STAGE2_CHECKPOINT_SOURCE_VERSION,
+        ),
+    }
+)
 SHUTDOWN_RACE_REFERENCE: Final = "LR-D9EEF3E29A1F07C9"
 SHUTDOWN_RACE_LATCH_SHA256: Final = (
     "d9eef3e29a1f07c9ebe819d05b576f9b7d01e57234b9bb117621abd95413488d"
@@ -148,12 +176,12 @@ SHUTDOWN_RACE_SERVER_START: Final = "85366961"
 SHUTDOWN_RACE_WRITER_PID: Final = 394561
 SHUTDOWN_RACE_BOUNDARY_TIME: Final = 1793310621.0151148
 SHUTDOWN_RACE_FAILURE_TIME: Final = 1793310623.257292
-SHUTDOWN_RACE_CORRECTED_VERSION: Final = "0.4.44"
+SHUTDOWN_RACE_CORRECTED_VERSION: Final = "0.4.45"
 SHUTDOWN_RACE_CORRECTED_LIFECYCLE_SHA256: Final = (
     "7d42efa358802e8219a3c6d157581df445124375d5084a9f26fdcec46303ebf0"
 )
 SHUTDOWN_RACE_CORRECTED_RAM_TETRIS_SHA256: Final = (
-    "9962b1bf8ef932ab2b8efae99ead191692cf3976b65d1e1f801d107dd9b2e66c"
+    "0cf652a4ca23db5a36ee96b38ae474e2affe2fc73f5c1af3b8d3558aa99ece49"
 )
 SHUTDOWN_RACE_CORRECTED_APPLY_PRESET_SHA256: Final = (
     "694119835f96ce5894e092b092a5e9f9c3543ccce6225195128d0eb734a1684e"
@@ -981,6 +1009,38 @@ def _source_blob_sha256(revision: str, source_path: str) -> str:
     return hashlib.sha256(source.stdout).hexdigest()
 
 
+def _verify_checkpoint_interruption_corrected_source(
+    source_revision: str,
+) -> str:
+    if source_revision != STAGE2_CHECKPOINT_SOURCE_REVISION:
+        return _verify_corrected_source_revision(
+            CORRECTED_CHECKPOINT_MINIMUM_REVISION
+        )
+    current = _verify_corrected_source_revision(
+        CHECKPOINT_ADMISSION_MINIMUM_REVISION
+    )
+    try:
+        manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
+        ram_tetris_sha256 = hashlib.sha256(
+            (ROOT / "ram-tetris").read_bytes()
+        ).hexdigest()
+    except (OSError, json.JSONDecodeError) as error:
+        raise RecoveryBlocked(
+            "Recovery blocked: corrected checkpoint-admission source is unreadable."
+        ) from error
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("version") != CHECKPOINT_ADMISSION_CORRECTED_VERSION
+        or ram_tetris_sha256
+        != CHECKPOINT_ADMISSION_CORRECTED_RAM_TETRIS_SHA256
+    ):
+        raise RecoveryBlocked(
+            "Recovery blocked: the reviewed checkpoint-admission correction "
+            "is not installed."
+        )
+    return current
+
+
 def _number(value: object) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
@@ -1016,14 +1076,16 @@ def _classify_corrected_software_interruption() -> CorrectedSoftwareInterruption
         or not isinstance(details, dict)
         or set(details) != CORRECTED_CHECKPOINT_DETAIL_FIELDS
         or not isinstance(source, dict)
-        or source
-        != {
-            "component": "ram-tetris",
-            "path": CORRECTED_CHECKPOINT_SOURCE_PATH,
-            "revision": CORRECTED_CHECKPOINT_SOURCE_REVISION,
-            "sha256": CORRECTED_CHECKPOINT_SOURCE_SHA256,
-            "version": "0.4.30",
-        }
+        or set(source)
+        != {"component", "path", "revision", "sha256", "version"}
+        or source.get("component") != "ram-tetris"
+        or (
+            source.get("revision"),
+            source.get("path"),
+            source.get("sha256"),
+            source.get("version"),
+        )
+        not in CORRECTED_CHECKPOINT_SOURCE_PROVENANCE
     ):
         raise RecoveryBlocked(
             "Recovery blocked: the latch is not an eligible corrected software "
@@ -1076,26 +1138,23 @@ def _classify_corrected_software_interruption() -> CorrectedSoftwareInterruption
             "software failure."
         )
 
-    if (
-        _source_blob_sha256(
-            CORRECTED_CHECKPOINT_SOURCE_REVISION,
-            CORRECTED_CHECKPOINT_SOURCE_PATH,
-        )
-        != CORRECTED_CHECKPOINT_SOURCE_SHA256
-    ):
+    source_revision = str(source["revision"])
+    source_path = str(source["path"])
+    source_sha256 = str(source["sha256"])
+    if _source_blob_sha256(source_revision, source_path) != source_sha256:
         raise RecoveryBlocked(
             "Recovery blocked: corrected software source provenance changed."
         )
-    _verify_corrected_source_revision(CORRECTED_CHECKPOINT_MINIMUM_REVISION)
+    _verify_checkpoint_interruption_corrected_source(source_revision)
     return CorrectedSoftwareInterruption(
         failure_raw=failure_raw,
         incident_reference=_incident_reference(failure_raw),
         latch_sha256=hashlib.sha256(failure_raw).hexdigest(),
         original_reason=message,
         failure_time=failure_time,
-        source_revision=CORRECTED_CHECKPOINT_SOURCE_REVISION,
-        source_path=CORRECTED_CHECKPOINT_SOURCE_PATH,
-        source_sha256=CORRECTED_CHECKPOINT_SOURCE_SHA256,
+        source_revision=source_revision,
+        source_path=source_path,
+        source_sha256=source_sha256,
     )
 
 
@@ -5079,8 +5138,8 @@ def _corrected_software_interruption_preflight(
     incident = _corrected_software_interruption_authorization(
         incident_reference, latch_sha256, error_code, original_reason
     )
-    installed_source_revision = _verify_corrected_source_revision(
-        CORRECTED_CHECKPOINT_MINIMUM_REVISION
+    installed_source_revision = _verify_checkpoint_interruption_corrected_source(
+        incident.source_revision
     )
     current_state_path = state_root() / "lifecycle-service-state.json"
     current_state_raw = _read_protected_bytes(
@@ -5137,7 +5196,9 @@ def _verify_corrected_software_interruption_continuity(
     binding: SoftwareInterruptionClearanceBinding,
 ) -> None:
     if (
-        _verify_corrected_source_revision(CORRECTED_CHECKPOINT_MINIMUM_REVISION)
+        _verify_checkpoint_interruption_corrected_source(
+            binding.incident.source_revision
+        )
         != binding.installed_source_revision
     ):
         raise RecoveryBlocked(

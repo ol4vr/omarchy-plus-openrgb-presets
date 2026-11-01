@@ -19,7 +19,7 @@ import tempfile
 import threading
 import unittest
 from collections import Counter
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
@@ -661,18 +661,124 @@ class CheckpointTests(unittest.TestCase):
 
     @mock.patch.object(runtime, "_preference", return_value=True)
     @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
-    def test_checkpoint_expiry_before_dispatch_blocks_the_write(
+    def test_stage2_admission_expiry_at_250_054_ms_refreshes_once(
         self, _preset, _preference
     ):
-        writer, sdk, _health, _control = self.writer()
+        writer, sdk, health, control = self.writer(checkpoint_timeout=2.0)
+        _seed_checkpoint(writer, sdk)
+        clock = [0.249999]
+        admissions = 0
+
+        @contextmanager
+        def delayed_admission():
+            nonlocal admissions
+            admissions += 1
+            if admissions == 1:
+                clock[0] = 0.250054
+            yield
+
         with (
             mock.patch.object(
-                runtime.time, "monotonic", side_effect=(0.0, 0.0, 0.0, 0.30)
+                runtime.time, "monotonic", side_effect=lambda: clock[0]
             ),
-            self.assertRaisesRegex(runtime.SafetyStop, "checkpoint is expired"),
+            mock.patch.object(
+                writer, "_hardware_operation", side_effect=delayed_admission
+            ),
+        ):
+            self.assertTrue(writer._write(core.VERIFIED_DIMMS[0], self.color(0)))
+
+        self.assertEqual(admissions, 2)
+        self.assertEqual(len(sdk.writes), 1)
+        self.assertEqual(health.temperature_checks, 1)
+        self.assertEqual(health.kernel_checks, 1)
+        self.assertEqual(sdk.inventory_calls, 1)
+        self.assertEqual(sdk.effects_calls, 1)
+        self.assertEqual(control.states, ["running"])
+        self.assertFalse(writer.checkpoint_failed)
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_stage2_admission_second_250_054_ms_expiry_fails_closed(
+        self, _preset, _preference
+    ):
+        writer, sdk, health, _control = self.writer(checkpoint_timeout=2.0)
+        _seed_checkpoint(writer, sdk)
+        clock = [0.249999]
+        admissions = 0
+
+        @contextmanager
+        def delayed_admission():
+            nonlocal admissions
+            admissions += 1
+            clock[0] = 0.250054 if admissions == 1 else 0.500108
+            yield
+
+        with (
+            mock.patch.object(
+                runtime.time, "monotonic", side_effect=lambda: clock[0]
+            ),
+            mock.patch.object(
+                writer, "_hardware_operation", side_effect=delayed_admission
+            ),
+            self.assertRaisesRegex(
+                runtime.SafetyStop, "checkpoint is expired"
+            ) as raised,
         ):
             writer._write(core.VERIFIED_DIMMS[0], self.color(0))
+
+        self.assertEqual(admissions, 2)
         self.assertEqual(sdk.writes, [])
+        self.assertEqual(health.temperature_checks, 1)
+        self.assertTrue(writer.checkpoint_failed)
+        self.assertEqual(raised.exception.evidence["checkpoint_refresh_attempts"], 1)
+        self.assertEqual(
+            raised.exception.evidence["checkpoint_refresh_result"],
+            "refreshed-checkpoint-expired",
+        )
+        self.assertEqual(
+            raised.exception.evidence["checkpoint_refresh_trigger_age_ms"], 250.054
+        )
+        self.assertEqual(
+            raised.exception.evidence["refreshed_checkpoint_age_ms"], 250.054
+        )
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_stage2_admission_refresh_failure_never_writes(
+        self, _preset, _preference
+    ):
+        writer, sdk, health, _control = self.writer(
+            health=FakeHealth(fail_spd=True), checkpoint_timeout=2.0
+        )
+        _seed_checkpoint(writer, sdk)
+        clock = [0.249999]
+
+        @contextmanager
+        def delayed_admission():
+            clock[0] = 0.250054
+            yield
+
+        with (
+            mock.patch.object(
+                runtime.time, "monotonic", side_effect=lambda: clock[0]
+            ),
+            mock.patch.object(
+                writer, "_hardware_operation", side_effect=delayed_admission
+            ),
+            self.assertRaisesRegex(runtime.SafetyStop, "temperature") as raised,
+        ):
+            writer._write(core.VERIFIED_DIMMS[0], self.color(0))
+
+        self.assertEqual(sdk.writes, [])
+        self.assertEqual(health.temperature_checks, 1)
+        self.assertTrue(writer.checkpoint_failed)
+        self.assertEqual(
+            raised.exception.evidence["checkpoint_refresh_result"],
+            "health-check-failed",
+        )
+        self.assertEqual(
+            raised.exception.evidence["checkpoint_refresh_trigger_age_ms"], 250.054
+        )
 
     @mock.patch.object(runtime, "_preference", return_value=True)
     @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
@@ -852,6 +958,50 @@ class CheckpointTests(unittest.TestCase):
         self.assertEqual(sdk.writes, [])
         self.assertEqual(health.temperature_checks, 1)
         self.assertEqual(writer.requested_stop, "preset-change")
+
+    @mock.patch.object(runtime, "_preference", return_value=True)
+    @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")
+    def test_ownership_change_during_boundary_refresh_never_writes(
+        self, _preset, _preference
+    ):
+        class OwnershipControl(FakeControl):
+            changed = False
+
+            def verify_runtime_ownership(
+                inner_self, writer_lock_fd, hardware_lock_fd
+            ):
+                super().verify_runtime_ownership(
+                    writer_lock_fd, hardware_lock_fd
+                )
+                if inner_self.changed:
+                    raise runtime.SafetyStop("writer singleton ownership changed")
+
+        control = OwnershipControl(None)
+
+        class RefreshOwnershipChange(FakeHealth):
+            def temperatures(inner_self):
+                temperatures = super().temperatures()
+                control.changed = True
+                return temperatures
+
+        writer, sdk, health, _control = self.writer(
+            health=RefreshOwnershipChange(),
+            control=control,
+            checkpoint_timeout=2.0,
+        )
+        _seed_checkpoint(writer, sdk)
+        monotonic_samples = iter((0.249999, 0.250016, 0.250020, 0.304761))
+
+        with (
+            mock.patch.object(
+                runtime.time, "monotonic", side_effect=monotonic_samples
+            ),
+            self.assertRaisesRegex(runtime.SafetyStop, "ownership changed"),
+        ):
+            writer._write(core.VERIFIED_DIMMS[0], self.color(0))
+
+        self.assertEqual(sdk.writes, [])
+        self.assertEqual(health.temperature_checks, 1)
 
     @mock.patch.object(runtime, "_preference", return_value=True)
     @mock.patch.object(runtime, "_selected_preset", return_value="horde-red")

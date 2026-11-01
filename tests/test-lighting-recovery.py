@@ -4754,6 +4754,121 @@ class LightingRecoveryTests(unittest.TestCase):
         self.assertEqual(parsed.action, "clear-reviewed-software-interruption")
         self.assertTrue(parsed.acknowledge_reviewed_software_interruption)
 
+    def test_stage2_checkpoint_incident_qualifies_by_source_provenance(self):
+        fixture = (
+            ROOT
+            / "tests/fixtures/checkpoint-expiration/stage2/failure.json"
+        )
+        raw = fixture.read_bytes()
+        self.assertEqual(
+            hashlib.sha256(raw).hexdigest(),
+            "9845f46b583ca2c126f40e04582e1dd0c9288e51583431c92758046520efe0f5",
+        )
+        self.failure.parent.mkdir(parents=True, exist_ok=True)
+        self.failure.parent.chmod(0o700)
+        self.failure.write_bytes(raw)
+        self.failure.chmod(0o600)
+
+        with (
+            self.patched_environment(),
+            mock.patch.object(
+                recovery,
+                "_verify_checkpoint_interruption_corrected_source",
+                return_value="f" * 40,
+            ) as corrected_source,
+        ):
+            incident = recovery._classify_corrected_software_interruption()
+
+        self.assertEqual(incident.incident_reference, "LR-9845F46B583CA2C1")
+        self.assertEqual(incident.latch_sha256, hashlib.sha256(raw).hexdigest())
+        self.assertEqual(
+            incident.source_revision,
+            recovery.STAGE2_CHECKPOINT_SOURCE_REVISION,
+        )
+        self.assertEqual(
+            incident.source_sha256,
+            recovery.STAGE2_CHECKPOINT_SOURCE_SHA256,
+        )
+        corrected_source.assert_called_once_with(
+            recovery.STAGE2_CHECKPOINT_SOURCE_REVISION
+        )
+
+    def test_stage2_checkpoint_category_rejects_unrelated_failures(self):
+        fixture = (
+            ROOT
+            / "tests/fixtures/checkpoint-expiration/stage2/failure.json"
+        )
+        document = json.loads(fixture.read_bytes())
+        cases = (
+            (
+                lambda value: value["details"].update(
+                    failure_kind="hardware-lock-timeout"
+                ),
+                "checkpoint evidence",
+            ),
+            (
+                lambda value: value["source"].update(sha256="0" * 64),
+                "not an eligible",
+            ),
+            (
+                lambda value: value.update(
+                    message="hardware-operation lock acquisition timed out"
+                ),
+                "not an eligible",
+            ),
+        )
+        for mutate, message in cases:
+            with self.subTest(message=message):
+                candidate = json.loads(json.dumps(document))
+                mutate(candidate)
+                self.failure.parent.mkdir(parents=True, exist_ok=True)
+                self.failure.parent.chmod(0o700)
+                self.failure.write_text(
+                    json.dumps(candidate, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                self.failure.chmod(0o600)
+                with (
+                    self.patched_environment(),
+                    self.assertRaisesRegex(recovery.RecoveryBlocked, message),
+                ):
+                    recovery._classify_corrected_software_interruption()
+
+    def test_stage2_checkpoint_clearance_requires_corrected_writer_source(self):
+        with mock.patch.object(
+            recovery,
+            "_verify_corrected_source_revision",
+            return_value="f" * 40,
+        ) as revision:
+            self.assertEqual(
+                recovery._verify_checkpoint_interruption_corrected_source(
+                    recovery.STAGE2_CHECKPOINT_SOURCE_REVISION
+                ),
+                "f" * 40,
+            )
+        revision.assert_called_once_with(
+            recovery.CHECKPOINT_ADMISSION_MINIMUM_REVISION
+        )
+
+        with (
+            mock.patch.object(
+                recovery,
+                "_verify_corrected_source_revision",
+                return_value="f" * 40,
+            ),
+            mock.patch.object(
+                recovery,
+                "CHECKPOINT_ADMISSION_CORRECTED_RAM_TETRIS_SHA256",
+                "0" * 64,
+            ),
+            self.assertRaisesRegex(
+                recovery.RecoveryBlocked, "correction is not installed"
+            ),
+        ):
+            recovery._verify_checkpoint_interruption_corrected_source(
+                recovery.STAGE2_CHECKPOINT_SOURCE_REVISION
+            )
+
     def test_corrected_software_interruption_accepts_multiple_derived_references(self):
         references = set()
         with (
